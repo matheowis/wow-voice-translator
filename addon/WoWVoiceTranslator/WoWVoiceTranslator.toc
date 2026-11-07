@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: WoW Voice Translator
+## Notes: Najedz myszka na wiadomosc czatu, aby zobaczyc tlumaczenie PL (wymaga aplikacji WoW Voice Translator).
+## Author: WoW Voice Translator
+## Version: 0.1.0
+## SavedVariables: WoWVoiceTranslatorDB
+
+Protocol.lua
+Core.lua

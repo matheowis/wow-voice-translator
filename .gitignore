@@ -1,0 +1,11 @@
+.venv/
+.cache/
+__pycache__/
+*.pyc
+models/
+runtime/
+logs/
+config.json
+config.tmp
+tests/audio/
+.pytest_cache/

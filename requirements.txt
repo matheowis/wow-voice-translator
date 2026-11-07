@@ -1,0 +1,11 @@
+# runtime
+onnx-asr[gpu,hub]==0.12.0          # Parakeet TDT 0.6B v3 (ONNX) loader
+onnxruntime-gpu[cuda,cudnn]==1.31.1  # CUDA EP + CUDA/cuDNN DLLs from NVIDIA wheels (not 1.24.1/1.25.x - onnx-asr issues)
+numpy
+sounddevice                        # microphone (PortAudio)
+PySide6-Essentials                 # tray, settings window, overlays (QtCore/QtGui/QtWidgets only)
+httpx                              # talks to the local llama.cpp server on 127.0.0.1
+nvidia-ml-py                       # VRAM readings for logs/diagnostics
+# tests
+pytest
+lupa                               # runs the addon's Lua 5.1 code in tests
