@@ -68,4 +68,4 @@ Aplikacja nie czyta pamięci gry, niczego do niej nie wstrzykuje i nigdy nie wys
 
 Jak to działa, pomiary, wybór modeli i konfiguracja: [docs/SZCZEGOLY.md](docs/SZCZEGOLY.md).
 
-Modele pobiera instalator (nie ma ich w repozytorium): NVIDIA Parakeet TDT 0.6B v3 (CC‑BY‑4.0), NVIDIA Nemotron 3.5 Bolt E4B (OpenMDW‑1.1), llama.cpp (MIT).
+Licencja kodu: MIT (plik [LICENSE](LICENSE)). Modele pobiera instalator (nie ma ich w repozytorium) i mają własne licencje: NVIDIA Parakeet TDT 0.6B v3 (CC‑BY‑4.0), NVIDIA Nemotron 3.5 Bolt E4B (OpenMDW‑1.1), llama.cpp (MIT).
