@@ -129,6 +129,17 @@ def test_rules(rules, src, expected):
     assert rules.normalize(src).text == expected
 
 
+@pytest.mark.parametrize("src,expected", [
+    ("Nie pulluj bez komendy!", "Nie puluj bez komendy!"),
+    ("Szukamy healera, potem pullujemy", "Szukamy hilera, potem pulujemy"),
+    ("Znowu wipe'a, odnówcie buffy", "Znowu wajpa, odnówcie bafy"),
+    ("Pull za 5", "Pul za 5"),
+    ("Dzięki za grupę", "Dzięki za grupę"),
+])
+def test_polish_respelling_of_game_words(rules, src, expected):
+    assert rules.respell_pl(src) == expected
+
+
 def test_plain_english_is_bypassed(rules):
     out = rules.normalize("Hello everyone!")
     assert out.text == "Hello everyone!" and out.mode == "bypass"
@@ -260,7 +271,8 @@ def test_polish_mode_translates_and_own_lines_follow_the_mode(mgr):
     m, tts, _, tr = mgr
     m.on_packet(_pkt(text="r u rdy? pull in 5", kind=3, flags=P.VFLAG_LANG_PL))
     assert _wait(lambda: m.stats["spoken"] == 1)
-    assert tr.calls == [("r u rdy? pull in 5", "en-pl")] and tts.calls[0][1:] == ("Gotowi? Pullujemy za 5", "pl")
+    # translated, then respelled for the Polish voice ("pullujemy" -> "pulujemy")
+    assert tr.calls == [("r u rdy? pull in 5", "en-pl")] and tts.calls[0][1:] == ("Gotowi? Pulujemy za 5", "pl")
     assert m.on_packet(_pkt(text="my own line", flags=P.VFLAG_SELF | P.VFLAG_LANG_PL)) == "own"
     assert m.on_packet(_pkt(text="my own line", flags=P.VFLAG_SELF, distance=0.0)) is None  # EN: my character repeats it
     assert _wait(lambda: m.stats["spoken"] == 2)
@@ -384,3 +396,33 @@ def test_voice_packets_are_passed_on_once():
     p = _pkt()
     assert d.is_new(p) and not d.is_new(p)
     assert d.is_new(_pkt(text="other"))
+
+
+# --------------------------------------------------------------------------- voice design briefs
+
+def test_every_slot_brief_differs_in_many_ways():
+    from wvt.voice.archetypes import RACES, describe, preview_line
+    from wvt.voice.races import GENDERS, POOL_RACES
+
+    assert set(POOL_RACES) == set(RACES)
+    for race in RACES:
+        for gender in GENDERS:
+            briefs = [describe(race, gender, s) for s in range(1, 6)]
+            assert len(set(briefs)) == 5
+            for a in range(5):
+                for b in range(a + 1, 5):  # different register, accent, pace and attitude in every pair
+                    wa, wb = set(briefs[a].split()), set(briefs[b].split())
+                    assert len(wa ^ wb) >= 12, (race, gender, a + 1, b + 1)
+    for s in range(1, 6):
+        assert 100 <= len(preview_line(s)) <= 1000  # Voice Design preview text limits
+
+
+def test_replaced_voice_moves_players_unless_set_by_hand(tmp_path):
+    store = _store(tmp_path)
+    r = VoiceResolver(store)
+    a = r.resolve("Grom", "Orc", 2)
+    r.resolve("Pinned", "Orc", 2)
+    store.update_player("Forever", "pinned", {"voiceId": a.voice_id, "manuallyOverridden": True})
+    assert store.reassign_voice(a.voice_id, "new-voice") == 1
+    assert store.get_player("Forever", "grom")["voiceId"] == "new-voice"
+    assert store.get_player("Forever", "pinned")["voiceId"] == a.voice_id

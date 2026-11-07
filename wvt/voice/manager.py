@@ -219,7 +219,7 @@ class VoiceManager:
             try:
                 res = self.translator.translate(text, "en-pl")
                 if res.text:
-                    return res.text, "pl", "translated"
+                    return self.normalizer.respell_pl(res.text), "pl", "translated"
             except Exception as exc:
                 log.info("PL translation for voice failed (%s) - speaking English", type(exc).__name__)
         norm = self.normalizer.normalize(text)

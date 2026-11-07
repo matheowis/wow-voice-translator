@@ -69,6 +69,7 @@ def _load_rules(path: Optional[str]) -> dict:
         "words": {k.lower(): v for k, v in data.get("words", {}).items()},
         "case_words": dict(data.get("case_sensitive_words", {})),
         "ambiguous": {w.lower() for w in data.get("ambiguous", [])},
+        "pl_respell": [(re.compile(re.escape(a), re.I), b) for a, b in data.get("pl_respell", [])],
     }
 
 
@@ -88,6 +89,13 @@ class TTSNormalizer:
         self.cache = LRU(int(cfg.get("cache_size", 500)))
 
     # ------------------------------------------------------------------ public
+    def respell_pl(self, text: str) -> str:
+        """Polish voice mode: game anglicisms spelled as Polish players say them (pulluj -> puluj)."""
+        out = self._clean(text)
+        for pattern, spoken in self.rules["pl_respell"]:
+            out = pattern.sub(lambda m: spoken.capitalize() if m.group(0)[0].isupper() else spoken, out)
+        return out
+
     def normalize(self, text: str) -> NormalizedText:
         t0 = time.perf_counter()
         base = self._clean(text)

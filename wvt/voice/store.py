@@ -91,6 +91,16 @@ class MongoVoiceStore:
         return self.players.find_one_and_update(flt, {"$set": fields}, return_document=ReturnDocument.AFTER,
                                                 projection={"_id": 0})
 
+    def reassign_voice(self, old_voice_id: str, new_voice_id: str) -> int:
+        """Characters on a replaced voice move to its successor (hand-set assignments stay)."""
+        from datetime import datetime, timezone
+
+        res = self.players.update_many(
+            {"voiceId": old_voice_id, "manuallyOverridden": {"$ne": True}},
+            {"$set": {"voiceId": new_voice_id, "updatedAt": datetime.now(timezone.utc).isoformat()},
+             "$inc": {"assignmentVersion": 1}})
+        return int(res.modified_count)
+
     def close(self) -> None:
         self._client.close()
 
@@ -162,6 +172,21 @@ class JsonVoiceStore:
             d.update(fields)
             self._write(self._players_path, self._players)
             return dict(d)
+
+    def reassign_voice(self, old_voice_id: str, new_voice_id: str) -> int:
+        from datetime import datetime, timezone
+
+        with self._lock:
+            moved = 0
+            for d in self._players.values():
+                if d.get("voiceId") == old_voice_id and not d.get("manuallyOverridden"):
+                    d["voiceId"] = new_voice_id
+                    d["assignmentVersion"] = int(d.get("assignmentVersion", 1)) + 1
+                    d["updatedAt"] = datetime.now(timezone.utc).isoformat()
+                    moved += 1
+            if moved:
+                self._write(self._players_path, self._players)
+            return moved
 
     def close(self) -> None:
         pass

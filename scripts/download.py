@@ -104,8 +104,19 @@ def main() -> int:
     ap.add_argument("--llm", default="nemotron-bolt-e4b", choices=sorted(LLMS))
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--skip-llama-cpp", action="store_true")
+    ap.add_argument("--speaker-model", action="store_true",
+                    help="WeSpeaker ResNet34 (26 MB) - only needed to design voices (python -m wvt.voice.design)")
     args = ap.parse_args()
     ok = True
+
+    if args.speaker_model:
+        repo, fname = "Wespeaker/wespeaker-voxceleb-resnet34", "voxceleb_resnet34.onnx"
+        print("WeSpeaker ResNet34 (podobieństwo głosów):")
+        meta = hf_meta(repo)
+        dest = ROOT / "models" / "speaker" / fname
+        if not args.verify:
+            download(f"https://huggingface.co/{repo}/resolve/main/{fname}", dest, meta[fname]["size"])
+        ok &= check(dest, meta[fname])
 
     print("Parakeet TDT 0.6B v3 (ONNX):")
     meta = hf_meta(PARAKEET_REPO)

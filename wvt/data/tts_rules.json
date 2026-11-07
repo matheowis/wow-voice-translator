@@ -125,5 +125,44 @@
     "st",
     "strat",
     "wc"
+  ],
+  "_comment_pl_respell": "PL voice mode: English game words inside Polish text are respelled the way Polish players say them, so the Polish voice pronounces them right (pulluj -> puluj, healera -> hilera). Pairs [text, spoken], matched inside words, case-insensitive. Add your own.",
+  "pl_respell": [
+    [
+      "wipe'",
+      "wajp"
+    ],
+    [
+      "wipe",
+      "wajp"
+    ],
+    [
+      "pull",
+      "pul"
+    ],
+    [
+      "heal",
+      "hil"
+    ],
+    [
+      "buff",
+      "baf"
+    ],
+    [
+      "aggro",
+      "agro"
+    ],
+    [
+      "loot",
+      "lut"
+    ],
+    [
+      "need",
+      "nid"
+    ],
+    [
+      "greed",
+      "grid"
+    ]
   ]
 }
