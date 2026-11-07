@@ -36,6 +36,7 @@ def test_unknown_distance_policies():
 
 def test_race_pools_and_sex():
     assert pool_race("Scourge") == "Undead" and pool_race("NightElf") == "NightElf"
+    assert pool_race("Skyborne") == "Skyborne"  # WoW Forever's new race, both flavours share the model
     assert pool_race("BloodElf") == "NightElf" and pool_race("") == UNKNOWN and pool_race("Vulpera") == UNKNOWN
     assert pool_race("Goblin", {"Goblin": "Gnome"}) == "Gnome"
     assert (gender_of(2), gender_of(3), gender_of(1), gender_of(0)) == ("Male", "Female", UNKNOWN, UNKNOWN)

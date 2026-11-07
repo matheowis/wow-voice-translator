@@ -138,11 +138,11 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
 - W „chat lockdown” (zasady Midnight: instancje, walki z bossami) treść, nadawca i GUID są *secret* – addon wtedy nic nie wysyła.
 - Odległość jest znana tylko, gdy nadawca ma token jednostki: cel, mouseover, fokus, członek drużyny/rajdu albo widoczna tabliczka z imieniem. Kolejność: `UnitDistanceSquared` (dokładnie, zwykle drużyna) → `UnitPosition` (ta sama instancja) → `CheckInteractDistance` (≤10 / ≤11 / ≤28 jardów → 8 / 11 / 20) → sama tabliczka → 35 jardów. Bez tokenu: odległość nieznana → `voice.unknown_distance` (domyślnie ciszej).
 - Wiadomości w języku drugiej frakcji (`C_ChatInfo.CanPlayerSpeakLanguage` = false) są pomijane, bo przychodzą jako bełkot.
-- Listy grywalnych ras WoW Forever nie da się ustalić z plików klienta. Pule są więc dla 8 klasycznych ras + „Unknown”, a inne tokeny ras trafiają do najbliższej puli (`wvt/voice/races.py`, `voice.race_aliases`).
+- WoW Forever (premiera 4.11.2026) ma 10 grywalnych ras: 8 klasycznych oraz nowych **Skyborne** w dwóch odmianach – High Order (Przymierze) i Windshaper (Horda). Obie odmiany mają w kliencie jeden model (`SkyborneMale`/`SkyborneFemale`), więc gra podaje ten sam token rasy i dzielą jedną pulę głosów. Pule: 9 ras + „Unknown”; tokeny ras z innych wersji WoW trafiają do najbliższej puli (`wvt/voice/races.py`, `voice.race_aliases`).
 - Sprawdzenie w grze: `/wvt voicedebug on` wypisuje przy każdej wiadomości rasę, płeć, odległość i metodę pomiaru; `/wvt voice` – podsumowanie.
 
 **Głosy i przypisania**
-- `python -m wvt.voice.design` tworzy przez Voice Design (`eleven_ttv_v3`) po 5 głosów na pulę (9 × 2 płcie = 90), każdy z innym wariantem opisu (wiek, charakter), nazwy `WVT <Rasa> <Płeć> <slot>`. Ponowne uruchomienie uzupełnia tylko brakujące sloty; `--dry-run` pokazuje opisy.
+- `python -m wvt.voice.design` tworzy przez Voice Design (`eleven_ttv_v3`) po 5 głosów na pulę (10 pul × 2 płcie = 100), każdy z innym wariantem opisu (wiek, charakter), nazwy `WVT <Rasa> <Płeć> <slot>`. Ponowne uruchomienie uzupełnia tylko brakujące sloty; `--dry-run` pokazuje opisy.
 - MongoDB, baza `wow_voice_translator`: `voice_profiles` (unikalne rasa + płeć + slot oraz `voiceId`) i `player_voices` (unikalne realm + nazwa). Przypisanie: istniejące → slot wybrany deterministycznie z SHA‑256 (`realm|nazwa|rasa|płeć`) → zapis atomowy (`$setOnInsert`). Postać przypisana przy nieznanej rasie/płci jest raz przenoszona do właściwej puli, chyba że ma `manuallyOverridden: true`. Ręczna zmiana: w `player_voices` ustaw `voiceId` i `manuallyOverridden: true`. Bez MongoDB to samo trafia do plików w `data/` (poza repozytorium).
 - Treść czatu nie jest nigdzie zapisywana (chyba że włączysz `privacy.log_texts`).
 

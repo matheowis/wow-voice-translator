@@ -51,7 +51,7 @@ Klawisze, mikrofon i inne ustawienia zmienisz w oknie aplikacji (dwuklik ikony p
 ## Głosy postaci (opcjonalne, ElevenLabs)
 
 1. Skopiuj plik `.env.example` jako `.env` i wpisz w nim swój klucz: `ELEVENLABS_API_KEY=...`. Plik `.env` nigdy nie trafia do repozytorium.
-2. Raz utwórz głosy (90 głosów: 9 ras × 2 płcie × 5, w Twoim koncie ElevenLabs):
+2. Raz utwórz głosy (100 głosów w Twoim koncie ElevenLabs: 9 ras WoW Forever, w tym Skyborne z jedną pulą na obie odmiany, plus pula dla nieznanej rasy; po 5 na każdą płeć):
 
    ```
    .venv\Scripts\python -m wvt.voice.design

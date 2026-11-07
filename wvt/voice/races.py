@@ -1,10 +1,14 @@
 """Race and sex vocabulary of the voice pools.
 
 The addon sends the ``englishRace`` token of GetPlayerInfoByGUID (e.g. "NightElf",
-"Scourge" for Undead) and WoW's sex code (2 male, 3 female, 1/0 unknown).  Voice pools
-exist for the eight original races plus an "Unknown" pool; the playable races of WoW
-Forever could not be confirmed from the client files, so other races borrow the closest
-pool and anything unrecognised uses "Unknown" (configurable with ``voice.race_aliases``).
+"Scourge" for Undead) and WoW's sex code (2 male, 3 female, 1/0 unknown).
+
+WoW Forever (launched 4 Nov 2026) has 10 playable races: the eight original ones plus the
+new Skyborne in two flavours, High Order (Alliance) and Windshaper (Horde).  Both flavours
+use one race model - the client's model table is keyed "SkyborneMale"/"SkyborneFemale" -
+so they arrive as the single token "Skyborne" and share one voice pool.  Races of other
+WoW versions borrow the closest pool; anything unrecognised uses "Unknown"
+(configurable with ``voice.race_aliases``).
 """
 
 from __future__ import annotations
@@ -13,13 +17,15 @@ UNKNOWN = "Unknown"
 MALE, FEMALE = "Male", "Female"
 GENDERS = (MALE, FEMALE)
 
-CORE_RACES = ("Human", "Dwarf", "NightElf", "Gnome", "Orc", "Undead", "Tauren", "Troll")
+CORE_RACES = ("Human", "Dwarf", "NightElf", "Gnome", "Orc", "Undead", "Tauren", "Troll", "Skyborne")
 POOL_RACES = CORE_RACES + (UNKNOWN,)
 
 # englishRace token -> pool race (tokens of later expansions map to the nearest original race)
 RACE_ALIASES = {
     "Scourge": "Undead",
     "Forsaken": "Undead",
+    "HighOrderSkyborne": "Skyborne",
+    "WindshaperSkyborne": "Skyborne",
     "Night Elf": "NightElf",
     "BloodElf": "NightElf",
     "VoidElf": "NightElf",

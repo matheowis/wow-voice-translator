@@ -34,6 +34,8 @@ RACE_TRAITS = {
     "Undead": "undead revenant, with a raspy, hollow, dry and sardonic voice",
     "Tauren": "massive, gentle bull-like tauren, with a very deep, slow, warm and resonant voice",
     "Troll": "lanky jungle troll, with a laid-back, rhythmic voice and a Caribbean-style lilt",
+    "Skyborne": "Skyborne elf from a floating island in the sky, descended from ancient arcane nobility and bound "
+                "to the wind spirits, with a light, airy, refined voice and an elegant, slightly ethereal accent",
     "Unknown": "adventurer in a fantasy world, with a natural, friendly and clear voice",
 }
 VARIANTS = (
