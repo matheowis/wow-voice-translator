@@ -121,6 +121,38 @@ Słownik `wvt/data/glossary.json` zna skróty, którymi pisze się w WoW, i jest
 
 Własne skróty dopisz w `glossary.json` (zmiana działa po restarcie aplikacji).
 
+## Głosy postaci (/say, /party → ElevenLabs)
+
+```
+WoW:  CHAT_MSG_SAY / CHAT_MSG_PARTY(_LEADER) → addon (tylko kanały włączone w panelu / komendą)
+      → nadawca: GUID → GetPlayerInfoByGUID → englishRace + płeć
+      → /say: odległość (UnitDistanceSquared / UnitPosition → CheckInteractDistance → tabliczka)
+      → pakiet TYPE_VOICE na drugiej siatce (34 komórki w prawo od pierwszej), ~0,2 s na wiadomość
+App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) → kolejka
+      → głos postaci (MongoDB player_voices) → tekst (EN: normalizacja, PL: tłumaczenie lokalne)
+      → ElevenLabs eleven_v4_turbo, streaming PCM 24 kHz → mikser (głośność wg kanału / odległości)
+```
+
+**Co addon wie o nadawcy** (sprawdzone w dokumentacji API klienta 1.60.1):
+- `CHAT_MSG_SAY` niesie GUID nadawcy (12. argument); `GetPlayerInfoByGUID` zwraca `englishRace` i płeć (2 = M, 3 = K).
+- W „chat lockdown” (zasady Midnight: instancje, walki z bossami) treść, nadawca i GUID są *secret* – addon wtedy nic nie wysyła.
+- Odległość jest znana tylko, gdy nadawca ma token jednostki: cel, mouseover, fokus, członek drużyny/rajdu albo widoczna tabliczka z imieniem. Kolejność: `UnitDistanceSquared` (dokładnie, zwykle drużyna) → `UnitPosition` (ta sama instancja) → `CheckInteractDistance` (≤10 / ≤11 / ≤28 jardów → 8 / 11 / 20) → sama tabliczka → 35 jardów. Bez tokenu: odległość nieznana → `voice.unknown_distance` (domyślnie ciszej).
+- Wiadomości w języku drugiej frakcji (`C_ChatInfo.CanPlayerSpeakLanguage` = false) są pomijane, bo przychodzą jako bełkot.
+- Listy grywalnych ras WoW Forever nie da się ustalić z plików klienta. Pule są więc dla 8 klasycznych ras + „Unknown”, a inne tokeny ras trafiają do najbliższej puli (`wvt/voice/races.py`, `voice.race_aliases`).
+- Sprawdzenie w grze: `/wvt voicedebug on` wypisuje przy każdej wiadomości rasę, płeć, odległość i metodę pomiaru; `/wvt voice` – podsumowanie.
+
+**Głosy i przypisania**
+- `python -m wvt.voice.design` tworzy przez Voice Design (`eleven_ttv_v3`) po 5 głosów na pulę (9 × 2 płcie = 90), każdy z innym wariantem opisu (wiek, charakter), nazwy `WVT <Rasa> <Płeć> <slot>`. Ponowne uruchomienie uzupełnia tylko brakujące sloty; `--dry-run` pokazuje opisy.
+- MongoDB, baza `wow_voice_translator`: `voice_profiles` (unikalne rasa + płeć + slot oraz `voiceId`) i `player_voices` (unikalne realm + nazwa). Przypisanie: istniejące → slot wybrany deterministycznie z SHA‑256 (`realm|nazwa|rasa|płeć`) → zapis atomowy (`$setOnInsert`). Postać przypisana przy nieznanej rasie/płci jest raz przenoszona do właściwej puli, chyba że ma `manuallyOverridden: true`. Ręczna zmiana: w `player_voices` ustaw `voiceId` i `manuallyOverridden: true`. Bez MongoDB to samo trafia do plików w `data/` (poza repozytorium).
+- Treść czatu nie jest nigdzie zapisywana (chyba że włączysz `privacy.log_texts`).
+
+**Koszty i limity**
+- `eleven_v4_turbo`: 0,5 kredytu za znak (nagłówek `character-cost`); pierwszy dźwięk 150–380 ms (pomiar 7.11.2026, także dla zaprojektowanych głosów); tylko pierwsze zdanie danego głosu trwa 2–3 s, bo ElevenLabs go wtedy przygotowuje.
+- Kanały wyłączone w grze nic nie kosztują; `/say` dalej niż koniec krzywej (30 jardów) w ogóle nie jest syntezowany; te same wiadomości w ciągu 15 s są czytane raz; dzienny limit znaków (`voice.daily_char_budget`, licznik w `data/voice_usage.json`); najwyżej 2 wypowiedzi naraz i jedna na postać; kolejka 6, wiadomości starsze niż 20 s są pomijane.
+- 429/5xx/timeout: do 2 ponowień przed pierwszym bajtem dźwięku, potem wiadomość jest pomijana – ani gra, ani tłumaczenie nie czekają.
+
+**Normalizacja tekstu (tryb EN)** – `wvt/voice/normalizer.py`, tryby `off` / `rules` / `hybrid`. Reguły z `wvt/data/tts_rules.json` (brb → be right back, oom → out of mana, LFM → looking for more, SM GY → Scarlet Monastery Graveyard…; skróty wielkimi literami, np. IF/SW, tylko gdy wiadomość nie jest krzykiem). Niejednoznaczne skróty (mb, wc, dm, r, cc…) w trybie `hybrid` idą do lokalnego LLM z limitem 500 ms; jego odpowiedź jest sprawdzana (długość, brak komentarzy), inaczej mówione jest to, co dały reguły. Tryb PL używa zwykłego tłumaczenia EN→PL (ze slangiem).
+
 ## Konfiguracja (`config.json`, tworzony przy pierwszym starcie)
 
 | Klucz | Domyślnie | Opis |
@@ -137,6 +169,15 @@ Własne skróty dopisz w `glossary.json` (zmiana działa po restarcie aplikacji)
 | `llm.model_path` | Nemotron 3.5 Bolt E4B | plik GGUF; `llm.mode: "external"` + `llm.base_url` = własny serwer OpenAI‑compatible |
 | `hover.enabled` | `true` | tłumaczenie po najechaniu |
 | `privacy.log_texts` | `false` | czy zapisywać treść wypowiedzi/tłumaczeń w `logs/wvt.log` |
+| `voice.enabled` | `true` | wyłącznik głosów po stronie aplikacji (kanały wybiera się w grze) |
+| `voice.model_id` | `eleven_v4_turbo` | model ElevenLabs; klucz w `.env` (`ELEVENLABS_API_KEY`) |
+| `voice.distance_curve` | 0–5 jd 100 %, 10 → 75 %, 15 → 50 %, 20 → 25 %, 30 → 0 % | głośność `/say` od odległości (interpolacja) |
+| `voice.unknown_distance` | `play_quiet` | `play_normal` / `play_quiet` (`quiet_gain` 0,35) / `mute` |
+| `voice.volume_say`, `voice.volume_party` | `1.0`, `0.9` | głośność kanałów |
+| `voice.daily_char_budget` | `30000` | znaków dziennie do ElevenLabs (0 = bez limitu) |
+| `voice.speak_own_messages` | `true` | tryb EN: Twoja postać powtarza Twoją wiadomość |
+| `voice.store.*` | lokalny MongoDB | `MONGODB_URI` w `.env` zmienia serwer; bez MongoDB pliki w `data/` |
+| `normalizer.mode` | `hybrid` | `off` / `rules` / `hybrid`; `normalizer.timeout_ms` 500 |
 
 ## Bezpieczeństwo konta i prywatność
 
@@ -186,7 +227,9 @@ Modele i llama.cpp pobiera instalator – nie ma ich w repozytorium.
 addon/WoWVoiceTranslator/   addon (Protocol.lua – koder sygnału, Core.lua – najechanie, /wvt)
 wvt/                        aplikacja (app.py GUI+tray, pipeline.py PTT, hotkeys.py, audio.py, stt.py,
                             llm.py, translator.py, chat_insert.py, signal_reader.py, overlay.py, protocol.py)
-wvt/data/                   słownik terminów, zdania benchmarku
+wvt/voice/                  głosy postaci (races, distance, store, resolver, elevenlabs, mixer,
+                            normalizer, budget, manager, design, ui)
+wvt/data/                   słownik terminów, reguły wymowy (tts_rules.json), zdania benchmarku
 scripts/                    setup.ps1, run.bat, download.py, make_test_audio.ps1
 tests/                      pytest
 docs/                       ten plik

@@ -16,7 +16,8 @@ except ImportError:  # pragma: no cover
     from lupa import LuaRuntime
 
 MOCK = r"""
-local mock = { time = 100, prints = {}, secret = {}, mouseLine = 2, frames = {} }
+local mock = { time = 100, prints = {}, secret = {}, mouseLine = 2, frames = {},
+               units = { player = "Player-1-ME" }, players = {}, dist2 = {}, interact = {}, languages = {} }
 _G.WVT_MOCK = mock
 
 function GetTime() return mock.time end
@@ -25,10 +26,34 @@ function issecretvalue(v) return mock.secret[v] == true end
 function issecrettable(v) return false end
 strmatch = string.match
 strlower = string.lower
+strupper = string.upper
 SlashCmdList = {}
 
+-- unit / player info used by the voice relay
+function UnitGUID(unit) return mock.units[unit] end
+function GetPlayerInfoByGUID(guid)
+  local p = mock.players[guid]
+  if p then return "Wojownik", "WARRIOR", "LocRace", p.race, p.sex, p.name, "Forever" end
+end
+function UnitDistanceSquared(unit)
+  local d = mock.dist2[unit]
+  if d then return d, true end
+  return 0, false
+end
+function UnitPosition(unit) return nil end
+function CheckInteractDistance(unit, idx)
+  local t = mock.interact[unit]
+  return t ~= nil and t[idx] == true
+end
+C_ChatInfo = { CanPlayerSpeakLanguage = function(id) return mock.languages[id] ~= false end }
+function IsShiftKeyDown() return false end
+
+-- any frame/region method the tests do not care about is a no-op
+local noop = function() end
+local fallback = { __index = function() return noop end }
+
 local function Region()
-  local r = { shown = true, points = {}, w = 0, h = 0, scale = 1 }
+  local r = setmetatable({ shown = true, points = {}, w = 0, h = 0, scale = 1 }, fallback)
   function r:SetPoint(...) self.points[#self.points + 1] = { ... } end
   function r:ClearAllPoints() self.points = {} end
   function r:SetSize(w, h) self.w, self.h = w, h end
@@ -53,11 +78,16 @@ function CreateFrame(kind, name, parent)
   function f:RegisterEvent(ev) self.events[ev] = true end
   function f:CreateTexture()
     local t = Region()
-    t.color = nil
     function t:SetColorTexture(r, g, b) self.color = { r, g, b } end
     self.textures[#self.textures + 1] = t
     return t
   end
+  function f:CreateFontString()
+    local fs = Region()
+    function fs:SetText(t) self.text = t end
+    return fs
+  end
+  f.kind = kind
   if name then _G[name] = f end
   mock.frames[#mock.frames + 1] = f
   return f
@@ -65,6 +95,7 @@ end
 
 UIParent = Region()
 WorldFrame = Region()
+GameTooltip = Region()
 
 local function Line(i, msg, body, event, sender, secretBody)
   local l = Region()
@@ -123,8 +154,8 @@ def driver_tick(mock, seconds=0.06):
             upd(f, seconds)
 
 
-def grab_cells(g):
-    signal = g.WoWVoiceTranslatorSignal
+def grab_cells(g, frame_name="WoWVoiceTranslatorSignal"):
+    signal = g[frame_name]
     if not signal.shown:
         return None
     cells = []
@@ -227,3 +258,167 @@ def test_strip_markup_and_split(lua):
     prefix, body = lp.SplitPrefix(stripped, "grats on [Thunderfury] {skull} |")
     assert prefix == "[Guild] [Kai]: " and body == "grats on [Thunderfury] {skull} |"
     assert lp.Utf8Truncate("żż", 3) == "ż"
+
+
+
+# --------------------------------------------------------------------------- voice relay
+
+def voice_packet(g):
+    cells = grab_cells(g, "WoWVoiceTranslatorVoiceSignal")
+    return None if cells is None else P.decode_image(P.render_cells(cells))
+
+
+def fire(mock, event, *args):
+    for f in mock.frames.values():
+        if f.events[event]:
+            f.scripts["OnEvent"](f, event, *args)
+
+
+def say_args(text, sender, guid, language_id=7):
+    # CHAT_MSG_SAY payload: text, playerName, languageName, channelName, playerName2, specialFlags,
+    # zoneChannelID, channelIndex, channelBaseName, languageID, lineID, guid
+    return (text, sender, "Common", "", "", "", 0, 0, "", language_id, 123, guid)
+
+
+@pytest.fixture()
+def voice(lua):
+    rt, g, mock = lua
+
+    def add_player(guid, name, race, sex):
+        mock.players[guid] = rt.table_from({"race": race, "sex": sex, "name": name})
+
+    def slash(cmd):
+        g.SlashCmdList["WOWVOICETRANSLATOR"](cmd)
+
+    return rt, g, mock, add_player, slash
+
+
+def test_voice_is_off_by_default(voice):
+    _, g, mock, add_player, _ = voice
+    add_player("Player-1-ORC", "Thrall", "Orc", 2)
+    fire(mock, "CHAT_MSG_SAY", *say_args("lok tar", "Thrall", "Player-1-ORC"))
+    driver_tick(mock)
+    assert voice_packet(g) is None  # nothing sent, nothing spent
+
+
+def test_say_packet_with_race_sex_and_exact_distance(voice):
+    _, g, mock, add_player, slash = voice
+    slash("say on")
+    add_player("Player-1-ORC", "Thrall", "Orc", 2)
+    mock.units["target"] = "Player-1-ORC"
+    mock.dist2["target"] = 144  # 12 yards
+    fire(mock, "CHAT_MSG_SAY",
+         *say_args("Ready? |cff1eff00|Hitem:2589|h[Linen Cloth]|h|r for sale", "Thrall-Forever", "Player-1-ORC"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.type == P.TYPE_VOICE and pkt.chat_kind_name == "SAY"
+    assert (pkt.sender, pkt.race, pkt.sex) == ("Thrall-Forever", "Orc", 2)
+    assert pkt.distance == pytest.approx(12.0) and pkt.dist_method == P.DIST_EXACT
+    assert pkt.text == "Ready? [Linen Cloth] for sale"
+    assert not pkt.is_self and not pkt.lang_pl
+    assert grab_cells(g) is None  # the hover grid is untouched by voice packets
+
+
+def test_say_distance_falls_back_to_ranges_and_nameplates(voice):
+    rt, g, mock, add_player, slash = voice
+    slash("say on")
+    add_player("Player-1-GNOME", "Fizz", "Gnome", 3)
+    mock.units["nameplate3"] = "Player-1-GNOME"
+    fire(mock, "CHAT_MSG_SAY", *say_args("far away", "Fizz", "Player-1-GNOME"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.distance == pytest.approx(35.0) and pkt.dist_method == P.DIST_NAMEPLATE
+    driver_tick(mock, 0.3)
+    mock.interact["nameplate3"] = rt.table_from({4: True})  # within follow range (~28 yd)
+    fire(mock, "CHAT_MSG_SAY", *say_args("closer", "Fizz", "Player-1-GNOME"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.distance == pytest.approx(20.0) and pkt.dist_method == P.DIST_RANGE
+    driver_tick(mock, 0.3)
+    fire(mock, "CHAT_MSG_SAY", *say_args("who am I?", "Ghost", "Player-1-UNSEEN"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.distance is None and pkt.dist_method == P.DIST_NONE
+
+
+def test_party_in_polish_mode_has_no_distance(voice):
+    _, g, mock, add_player, slash = voice
+    slash("party on")
+    slash("lang pl")
+    add_player("Player-1-DWARF", "Brann", "Dwarf", 2)
+    mock.units["party2"] = "Player-1-DWARF"
+    mock.dist2["party2"] = 100
+    fire(mock, "CHAT_MSG_PARTY_LEADER", *say_args("mb, then pull", "Brann", "Player-1-DWARF"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.chat_kind_name == "PARTY_LEADER" and pkt.lang_pl
+    assert pkt.distance is None and pkt.dist_method == P.DIST_NONE
+
+
+def test_own_message_is_spoken_in_english_mode_only(voice):
+    _, g, mock, add_player, slash = voice
+    slash("say on")
+    add_player("Player-1-ME", "Me", "NightElf", 3)
+    fire(mock, "CHAT_MSG_SAY", *say_args("Hello everyone!", "Me", "Player-1-ME"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.is_self and pkt.distance == 0 and pkt.dist_method == P.DIST_SELF and pkt.race == "NightElf"
+    driver_tick(mock, 0.3)  # packet expires, queue empty -> grid hidden
+    assert voice_packet(g) is None
+    slash("lang pl")
+    fire(mock, "CHAT_MSG_SAY", *say_args("Hello again!", "Me", "Player-1-ME"))
+    driver_tick(mock)
+    assert voice_packet(g) is None
+
+
+def test_other_faction_language_and_secret_text_are_skipped(voice):
+    _, g, mock, _, slash = voice
+    slash("say on")
+    mock.languages[1] = False  # Orcish, not understood -> garbled text
+    fire(mock, "CHAT_MSG_SAY", *say_args("Kek zug lok", "Grunt", "Player-1-ORC", language_id=1))
+    mock.secret["boss secret"] = True
+    fire(mock, "CHAT_MSG_SAY", *say_args("boss secret", "Grunt", "Player-1-ORC"))
+    driver_tick(mock)
+    assert voice_packet(g) is None
+
+
+def test_voice_queue_shows_packets_one_after_another(voice):
+    _, g, mock, _, slash = voice
+    slash("party on")
+    fire(mock, "CHAT_MSG_PARTY", *say_args("first", "Anna", "Player-1-A"))
+    fire(mock, "CHAT_MSG_PARTY", *say_args("second", "Bob", "Player-1-B"))
+    driver_tick(mock, 0.05)
+    first = voice_packet(g)
+    driver_tick(mock, 0.1)
+    assert voice_packet(g).text == "first"  # still shown (0.2 s per packet)
+    driver_tick(mock, 0.12)
+    second = voice_packet(g)
+    assert (first.text, second.text) == ("first", "second") and second.seq == first.seq + 1
+    assert first.race == "" and first.sex == 0  # unknown player: the app uses the "unknown" voices
+    driver_tick(mock, 0.25)
+    assert voice_packet(g) is None
+
+
+def test_panel_buttons_toggle_the_saved_options(voice):
+    _, g, mock, _, _ = voice
+    db = g.WoWVoiceTranslatorDB
+    assert db.voiceSay is False and db.voiceParty is False and db.voiceLang == "en"
+    buttons = [f for f in mock.frames.values() if f.kind == "Button" and f.scripts["OnClick"]]
+    assert len(buttons) == 3
+    for b in buttons:
+        b.scripts["OnClick"](b)
+    assert db.voiceSay is True and db.voiceParty is True and db.voiceLang == "pl"
+
+
+def test_lua_voice_encoder_matches_python(lua):
+    rt, _, _ = lua
+    lp = _lua_protocol(rt)
+    for dist in (17.25, None, 0):
+        fields = {"type": 4, "seq": 300, "flags": 8 + 4, "kind": 3, "sex": 2, "distMethod": 1,
+                  "race": "Scourge", "sender": "Zo\u00eb-Forever", "text": "r u ready? \u017c" * 40}
+        if dist is not None:
+            fields["distance"] = dist
+        lua_bytes = bytes(int(v) for v in lp.EncodePacket(rt.table_from(fields)).values())
+        py = P.Packet(type=4, seq=300, flags=12, chat_kind=3, sex=2, distance=dist, dist_method=1,
+                      race="Scourge", sender="Zo\u00eb-Forever", text="r u ready? \u017c" * 40)
+        assert lua_bytes == P.encode_packet(py)

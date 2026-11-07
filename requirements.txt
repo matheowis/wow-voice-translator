@@ -6,6 +6,7 @@ sounddevice                        # microphone (PortAudio)
 PySide6-Essentials                 # tray, settings window, overlays (QtCore/QtGui/QtWidgets only)
 httpx                              # talks to the local llama.cpp server on 127.0.0.1
 nvidia-ml-py                       # VRAM readings for logs/diagnostics
+pymongo>=4.8,<5                    # voice assignments in a local MongoDB (JSON fallback without it)
 # tests
 pytest
 lupa                               # runs the addon's Lua 5.1 code in tests

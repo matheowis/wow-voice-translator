@@ -85,6 +85,7 @@ class Bridge(QObject):
     hover_text = Signal(object, str, str)
     models = Signal(str, bool)
     key_captured = Signal(object)
+    voice_event = Signal(object)
 
 
 class QtPipelineUI:
@@ -105,9 +106,13 @@ class MainWindow(QWidget):
         self.setWindowTitle(f"WoW Voice Translator {__version__}")
         self.setWindowIcon(make_icon())
         self.resize(760, 560)
+        from .voice.ui import VoiceTab
+
         tabs = QTabWidget()
         tabs.addTab(self._build_translate_tab(), "Tłumacz")
         tabs.addTab(self._build_settings_tab(), "Ustawienia")
+        self.voice_tab = VoiceTab(app)
+        tabs.addTab(self.voice_tab, "Głosy")
         tabs.addTab(self._build_diag_tab(), "Diagnostyka")
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
@@ -443,6 +448,7 @@ class MainWindow(QWidget):
             f"VRAM:        {v['used']:.0f} / {v['total']:.0f} MB ({v['name']})" if v else "VRAM:        brak danych NVML",
             f"WoW:         {'aktywny' if a.tracker.foreground_is_wow() else 'nieaktywny / nie znaleziono'}",
             f"Addon:       ostatni sygnał {time.strftime('%H:%M:%S', time.localtime(sig)) if sig else 'jeszcze nie odebrano (w grze: /wvt test)'}",
+            f"Głosy:       {a.voice_status}",
             f"Ostatnie PTT: {a.pipeline.last_timings if a.pipeline else {}}",
             "",
             "Hotkeye:",
@@ -468,6 +474,8 @@ class TranslatorApp:
         self.pipeline: Optional[PushToTalkPipeline] = None
         self.hotkeys: Optional[HotkeyManager] = None
         self.reader: Optional[SignalReader] = None
+        self.voice = None  # VoiceManager, built in _init_voice
+        self.voice_status = "uruchamianie…"
         self.model_state = "ładowanie…"
         self.hover_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wvt-hover")
         self._hover_current = None
@@ -495,6 +503,7 @@ class TranslatorApp:
         b.hover_text.connect(self._on_hover_text)
         b.models.connect(self._on_models)
         b.key_captured.connect(self.window.on_key_captured)
+        b.voice_event.connect(self.window.voice_tab.add_event)
 
         self._level_timer = QTimer()
         self._level_timer.setInterval(100)
@@ -507,10 +516,12 @@ class TranslatorApp:
         self._start_hotkeys()
         self.reader = SignalReader(self.tracker, float(self.cfg.get("hover.poll_hz", 25)),
                                    on_start=lambda p, w: self.bridge.hover_start.emit(p, w),
-                                   on_stop=lambda: self.bridge.hover_stop.emit())
+                                   on_stop=lambda: self.bridge.hover_stop.emit(),
+                                   on_voice=self._on_voice_packet)
         self.reader.enabled = bool(self.cfg.get("hover.enabled", True))
         self.reader.require_foreground = "--sim" not in sys.argv
         self.reader.start()
+        threading.Thread(target=self._init_voice, name="wvt-voice-init", daemon=True).start()
         threading.Thread(target=self._load_models, name="wvt-load", daemon=True).start()
         if self.cfg.get("audio.mic_always_open", True):
             try:
@@ -531,6 +542,9 @@ class TranslatorApp:
             translator.translate("Cześć, test.", "pl-en")  # fills the prompt cache
             translator.translate("hi, test", "en-pl")
             self.translator = translator  # hover translation works from here on
+            if self.voice is not None:  # PL voice mode and the LLM step of the normalizer
+                self.voice.translator = translator
+                self.voice.normalizer.llm = self.llm
             self.bridge.models.emit("ładowanie Parakeet (STT)…", False)
             self.stt = make_stt(self.cfg)
             self.stt.load()
@@ -543,6 +557,60 @@ class TranslatorApp:
             log.exception("model loading failed")
             self.bridge.models.emit(f"BŁĄD: {exc}", False)
             self.bridge.status.emit("error", "Nie udało się załadować modeli", [str(exc), "Szczegóły: logs/wvt.log"], 15.0)
+
+    def _init_voice(self) -> None:
+        """ElevenLabs voices for /say and /party. Missing key or store never stops the app."""
+        try:
+            from .config import resolve_path
+            from .envfile import load_env, secret
+            from .voice.budget import DailyBudget
+            from .voice.elevenlabs import ElevenLabsClient
+            from .voice.manager import VoiceManager
+            from .voice.mixer import AudioMixer
+            from .voice.normalizer import TTSNormalizer
+            from .voice.resolver import VoiceResolver
+            from .voice.store import open_store
+
+            v = self.cfg["voice"]
+            load_env()
+            api_key = secret(v.get("api_key_env", "ELEVENLABS_API_KEY"))
+            if not api_key:
+                self.voice_status = "wyłączone – brak ELEVENLABS_API_KEY w pliku .env"
+                return
+            data_dir = resolve_path(v["store"].get("fallback_dir", "data"))
+            store = open_store(v["store"], data_dir)
+            resolver = VoiceResolver(store, v.get("realm", "Forever"), v.get("race_aliases") or {})
+            tts = ElevenLabsClient(api_key, v.get("model_id", "eleven_v4_turbo"), v.get("output_format", "pcm_24000"),
+                                   float(v.get("request_timeout_s", 15)), int(v.get("max_retries", 2)))
+            mixer = AudioMixer(int(v.get("sample_rate", 24000)), v.get("output_device"))
+            normalizer = TTSNormalizer(self.cfg["normalizer"], llm=self.llm if self.translator else None)
+            budget = DailyBudget(data_dir / "voice_usage.json", int(v.get("daily_char_budget", 30000)))
+            manager = VoiceManager(v, tts, resolver, mixer, normalizer, budget, translator=self.translator,
+                                   on_event=self.bridge.voice_event.emit,
+                                   log_texts=bool(self.cfg.get("privacy.log_texts", False)))
+            manager.start()
+            self.voice = manager
+            if self.translator is not None:  # models finished first
+                manager.translator = self.translator
+                manager.normalizer.llm = self.llm
+            pools = resolver.profile_count
+            self.voice_status = (f"gotowe – {pools} głosów, {store.description}" if pools else
+                                 f"brak głosów – uruchom: python -m wvt.voice.design ({store.description})")
+            log.info("voices ready: %d profiles, store %s", pools, store.kind)
+        except Exception as exc:
+            log.exception("voice init failed")
+            self.voice_status = f"BŁĄD: {exc}"
+
+    def _on_voice_packet(self, pkt: protocol.Packet) -> None:  # signal reader thread
+        if self.voice is not None:
+            self.voice.on_packet(pkt)
+
+    def _toggle_voice(self, on: bool) -> None:
+        self.cfg.set("voice.enabled", on)
+        if self.voice is not None:
+            self.voice.enabled = on
+            if not on:
+                self.voice.silence()
 
     def _start_hotkeys(self) -> None:
         if self.hotkeys:
@@ -608,6 +676,13 @@ class TranslatorApp:
         self.act_ptt = QAction("Push-to-talk aktywny", menu, checkable=True)
         self.act_ptt.setChecked(True)
         menu.addAction(self.act_ptt)
+        self.act_voice = QAction("Głosy postaci (ElevenLabs)", menu, checkable=True)
+        self.act_voice.setChecked(bool(self.cfg.get("voice.enabled", True)))
+        self.act_voice.toggled.connect(self._toggle_voice)
+        menu.addAction(self.act_voice)
+        act_silence = QAction("Przerwij odczyt", menu)
+        act_silence.triggered.connect(lambda: self.voice and self.voice.silence())
+        menu.addAction(act_silence)
         menu.addSeparator()
         act_quit = QAction("Zakończ", menu)
         act_quit.triggered.connect(self.quit)
@@ -634,6 +709,11 @@ class TranslatorApp:
                 self.hotkeys.stop()
             if self.reader:
                 self.reader.stop()
+            if self.voice is not None:
+                self.voice.stop()
+                self.voice.mixer.close()
+                self.voice.tts.close()
+                self.voice.resolver.store.close()
             self.recorder.close()
             if self.llm:
                 self.llm.stop()

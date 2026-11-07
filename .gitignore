@@ -9,3 +9,11 @@ config.json
 config.tmp
 tests/audio/
 .pytest_cache/
+
+# secrets - never commit (API keys live only in the local .env)
+.env
+.env.*
+!.env.example
+
+# local voice data: ElevenLabs voice ids of your account, player assignments, usage counts
+/data/

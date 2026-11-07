@@ -7,6 +7,11 @@
 --     on a click-through overlay exactly over that chat line.  Mouse leaves -> the grid
 --     disappears -> the overlay disappears -> you see the English original again.
 --   * after ~0.6 s the big grid shrinks to a 16-cell "still hovering" marker.
+--   * voices (opt-in with the small panel above the chat or /wvt say|party): every new
+--     /say or /party message is shown for ~0.2 s on a second grid, right of the first
+--     one, with the sender's race, sex and - for /say - distance.  The app speaks it with
+--     a voice that fits the character (ElevenLabs), in English or translated to Polish.
+--     Channels that are switched off are never sent, so they cost nothing.
 --
 -- What it does NOT do: no protected/secure calls, no chat sending, no automation.
 -- Messages that the game marks as "secret values" (Midnight rules, e.g. during
@@ -15,7 +20,7 @@
 local ADDON_NAME, ns = ...
 local P = ns.Protocol
 
-local floor = math.floor
+local floor, sqrt = math.floor, math.sqrt
 local GetTime = GetTime
 local issecretvalue = issecretvalue or function()
 	return false
@@ -27,10 +32,18 @@ end
 local POLL_INTERVAL = 0.05 -- seconds between hover checks
 local FULL_PACKET_SECONDS = 0.6 -- how long the full packet stays before shrinking
 local TEST_SECONDS = 4
+local VOICE_PACKET_SECONDS = 0.2 -- each voice packet stays this long (app reads 25x/s)
+local VOICE_QUEUE_MAX = 8
 
 local defaults = {
 	enabled = true,
 	dwell = 0.12, -- mouse must rest this long on a line before we signal
+	voiceSay = false, -- read /say aloud (costs ElevenLabs credits) - off until you switch it on
+	voiceParty = false, -- read /party aloud
+	voiceLang = "en", -- "en": hear the English original (your character repeats your line)
+	--                    "pl": hear others translated to Polish (your own lines stay silent)
+	panelShown = true,
+	voiceDebug = false,
 }
 
 local KIND = {
@@ -57,6 +70,13 @@ local KIND = {
 	CHAT_MSG_MONSTER_YELL = 21,
 	CHAT_MSG_MONSTER_WHISPER = 22,
 	CHAT_MSG_COMMUNITIES_CHANNEL = 23,
+}
+
+-- chat events that can be spoken, and which toggle controls them
+local VOICE_EVENTS = {
+	CHAT_MSG_SAY = "say",
+	CHAT_MSG_PARTY = "party",
+	CHAT_MSG_PARTY_LEADER = "party",
 }
 
 local db = defaults
@@ -86,87 +106,116 @@ local function IsTrue(v)
 	return v and true or false
 end
 
----------------------------------------------------------------------------- signal grid
-
-local signal = CreateFrame("Frame", "WoWVoiceTranslatorSignal", UIParent)
-signal:SetFrameStrata("TOOLTIP")
-signal:SetFrameLevel(9000)
-signal:SetToplevel(true)
-if signal.SetIgnoreParentScale then
-	signal:SetIgnoreParentScale(true)
+-- call a WoW API that may be missing, restricted or erroring in this client
+local function SafeCall(fn, ...)
+	if type(fn) ~= "function" then
+		return nil
+	end
+	local ok, a, b, c, d, e, f, g, h = pcall(fn, ...)
+	if not ok then
+		return nil
+	end
+	return a, b, c, d, e, f, g, h
 end
-if signal.SetIgnoreParentAlpha then
-	signal:SetIgnoreParentAlpha(true)
-end
-signal:EnableMouse(false)
-signal:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
-signal:Hide()
 
-local textures = {}
-local shownCells = 0
-local cellSize = 2
+---------------------------------------------------------------------------- signal grids
 
-local function ComputeCellSize()
+local function ComputeCellSize(frame)
 	local _, physH = GetPhysicalScreenSize()
 	if not physH or physH <= 0 then
 		physH = 768
 	end
-	local scale = signal:GetEffectiveScale()
+	local scale = frame:GetEffectiveScale()
 	if not scale or scale <= 0 then
 		scale = 1
 	end
 	return P.CELL_PX * 768 / physH / scale
 end
 
-local function LayoutTexture(k)
-	local tex = textures[k]
-	local idx = k - 1
-	local col, row = idx % P.COLS, floor(idx / P.COLS)
-	tex:ClearAllPoints()
-	tex:SetPoint("TOPLEFT", signal, "TOPLEFT", col * cellSize, -row * cellSize)
-	tex:SetSize(cellSize, cellSize)
+-- a grid of P.COLS x P.MAX_ROWS cells, `xCells` cells right of the top-left corner
+local function NewGrid(name, xCells)
+	local frame = CreateFrame("Frame", name, UIParent)
+	frame:SetFrameStrata("TOOLTIP")
+	frame:SetFrameLevel(9000)
+	frame:SetToplevel(true)
+	if frame.SetIgnoreParentScale then
+		frame:SetIgnoreParentScale(true)
+	end
+	if frame.SetIgnoreParentAlpha then
+		frame:SetIgnoreParentAlpha(true)
+	end
+	frame:EnableMouse(false)
+	frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
+	frame:Hide()
+
+	local grid = { frame = frame, textures = {}, shown = 0, cell = 2, xCells = xCells }
+
+	function grid:Layout(k)
+		local tex = self.textures[k]
+		local idx = k - 1
+		local col, row = idx % P.COLS, floor(idx / P.COLS)
+		tex:ClearAllPoints()
+		tex:SetPoint("TOPLEFT", self.frame, "TOPLEFT", col * self.cell, -row * self.cell)
+		tex:SetSize(self.cell, self.cell)
+	end
+
+	function grid:UpdateGeometry()
+		self.cell = ComputeCellSize(self.frame)
+		self.frame:ClearAllPoints()
+		self.frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", self.xCells * self.cell, 0)
+		self.frame:SetSize(P.COLS * self.cell, P.MAX_ROWS * self.cell)
+		for k = 1, #self.textures do
+			self:Layout(k)
+		end
+	end
+
+	function grid:Texture(k)
+		local tex = self.textures[k]
+		if not tex then
+			tex = self.frame:CreateTexture(nil, "OVERLAY", nil, 7)
+			self.textures[k] = tex
+			self:Layout(k)
+		end
+		return tex
+	end
+
+	function grid:Hide()
+		if self.shown > 0 or self.frame:IsShown() then
+			for k = 1, self.shown do
+				self.textures[k]:Hide()
+			end
+			self.shown = 0
+			self.frame:Hide()
+		end
+	end
+
+	function grid:ShowBytes(bytes)
+		local cells = P.BytesToCells(bytes)
+		for k = 1, #cells do
+			local tex = self:Texture(k)
+			tex:SetColorTexture(P.CellColor(cells[k]))
+			tex:Show()
+		end
+		for k = #cells + 1, self.shown do
+			self.textures[k]:Hide()
+		end
+		self.shown = #cells
+		self.frame:Show()
+	end
+
+	return grid
 end
+
+local hoverGrid = NewGrid("WoWVoiceTranslatorSignal", 0)
+local voiceGrid = NewGrid("WoWVoiceTranslatorVoiceSignal", P.VOICE_GRID_X_CELLS)
 
 local function UpdateGeometry()
-	cellSize = ComputeCellSize()
-	signal:SetSize(P.COLS * cellSize, P.MAX_ROWS * cellSize)
-	for k = 1, #textures do
-		LayoutTexture(k)
-	end
-end
-
-local function GetTexture(k)
-	local tex = textures[k]
-	if not tex then
-		tex = signal:CreateTexture(nil, "OVERLAY", nil, 7)
-		textures[k] = tex
-		LayoutTexture(k)
-	end
-	return tex
+	hoverGrid:UpdateGeometry()
+	voiceGrid:UpdateGeometry()
 end
 
 local function HideSignal()
-	if shownCells > 0 or signal:IsShown() then
-		for k = 1, shownCells do
-			textures[k]:Hide()
-		end
-		shownCells = 0
-		signal:Hide()
-	end
-end
-
-local function ShowBytes(bytes)
-	local cells = P.BytesToCells(bytes)
-	for k = 1, #cells do
-		local tex = GetTexture(k)
-		tex:SetColorTexture(P.CellColor(cells[k]))
-		tex:Show()
-	end
-	for k = #cells + 1, shownCells do
-		textures[k]:Hide()
-	end
-	shownCells = #cells
-	signal:Show()
+	hoverGrid:Hide()
 end
 
 ---------------------------------------------------------------------------- chat lines
@@ -394,24 +443,228 @@ local function HoverTick()
 			HideSignal()
 			return
 		end
-		ShowBytes(P.EncodePacket(pkt))
+		hoverGrid:ShowBytes(P.EncodePacket(pkt))
 		state.sentKey, state.sentAt, state.keepShown = key, now, false
 	elseif not state.keepShown and now - state.sentAt >= FULL_PACKET_SECONDS then
-		ShowBytes(P.EncodePacket({ type = P.TYPE_KEEP, seq = seq }))
+		hoverGrid:ShowBytes(P.EncodePacket({ type = P.TYPE_KEEP, seq = seq }))
 		state.keepShown = true
 	end
 end
 
+---------------------------------------------------------------------------- voice relay
+
+local voiceQueue = {}
+local voiceShownUntil = 0
+local voiceSeq = 0
+local voiceStats = { sent = 0, dropped = 0, last = nil }
+
+local function VoiceTick(now)
+	if voiceShownUntil > 0 and now < voiceShownUntil then
+		return
+	end
+	local nextBytes = table.remove(voiceQueue, 1)
+	if nextBytes then
+		voiceGrid:ShowBytes(nextBytes)
+		voiceShownUntil = now + VOICE_PACKET_SECONDS
+	elseif voiceShownUntil > 0 then
+		voiceGrid:Hide()
+		voiceShownUntil = 0
+	end
+end
+
+local function EnqueueVoice(bytes)
+	if #voiceQueue >= VOICE_QUEUE_MAX then
+		table.remove(voiceQueue, 1) -- the oldest line is stale anyway
+		voiceStats.dropped = voiceStats.dropped + 1
+	end
+	voiceQueue[#voiceQueue + 1] = bytes
+	voiceStats.sent = voiceStats.sent + 1
+end
+
+local function GuidOf(unit)
+	return Plain(SafeCall(UnitGUID, unit), "string")
+end
+
+-- a unit token for the sender, so we can measure the distance: target, mouseover,
+-- group members or a visible nameplate. Strangers without a nameplate have none.
+local function FindUnitForGUID(guid)
+	for _, unit in ipairs({ "target", "mouseover", "focus", "softfriend", "softinteract" }) do
+		if GuidOf(unit) == guid then
+			return unit, false
+		end
+	end
+	for i = 1, 4 do
+		local unit = "party" .. i
+		if GuidOf(unit) == guid then
+			return unit, false
+		end
+	end
+	for i = 1, 40 do
+		local unit = "raid" .. i
+		if GuidOf(unit) == guid then
+			return unit, false
+		end
+	end
+	for i = 1, 40 do
+		local unit = "nameplate" .. i
+		if GuidOf(unit) == guid then
+			return unit, true
+		end
+	end
+	return nil, false
+end
+
+-- distance in yards, best method first; every step may be unavailable in this client
+local function DistanceTo(unit, viaNameplate)
+	local d2, checked = SafeCall(UnitDistanceSquared, unit)
+	d2 = Plain(d2, "number")
+	if d2 and d2 >= 0 and IsTrue(checked) then
+		return sqrt(d2), P.DIST_EXACT
+	end
+	local py, px, _, pInst = SafeCall(UnitPosition, "player")
+	local uy, ux, _, uInst = SafeCall(UnitPosition, unit)
+	px, py, ux, uy = Plain(px, "number"), Plain(py, "number"), Plain(ux, "number"), Plain(uy, "number")
+	pInst, uInst = Plain(pInst, "number"), Plain(uInst, "number")
+	if px and py and ux and uy and pInst and pInst == uInst then
+		local dx, dy = px - ux, py - uy
+		return sqrt(dx * dx + dy * dy), P.DIST_EXACT
+	end
+	-- interaction ranges: 3 = duel (~10 yd), 2 = trade (~11 yd), 4 = follow (~28 yd)
+	if IsTrue(SafeCall(CheckInteractDistance, unit, 3)) then
+		return 8, P.DIST_RANGE
+	end
+	if IsTrue(SafeCall(CheckInteractDistance, unit, 2)) then
+		return 11, P.DIST_RANGE
+	end
+	if IsTrue(SafeCall(CheckInteractDistance, unit, 4)) then
+		return 20, P.DIST_RANGE
+	end
+	if viaNameplate then
+		return 35, P.DIST_NAMEPLATE
+	end
+	return nil, P.DIST_NONE
+end
+
+local function VoiceChannelEnabled(channel)
+	if channel == "say" then
+		return db.voiceSay
+	elseif channel == "party" then
+		return db.voiceParty
+	end
+	return false
+end
+
+local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languageID, _, guid)
+	local channel = VOICE_EVENTS[event]
+	if not channel or not VoiceChannelEnabled(channel) then
+		return
+	end
+	text = Plain(text, "string") -- secret during chat lockdown: never read
+	if not text then
+		return
+	end
+	text = P.Trim(P.StripMarkup(text))
+	if text == "" then
+		return
+	end
+	guid = Plain(guid, "string")
+	local me = GuidOf("player")
+	local isSelf = guid ~= nil and guid == me
+	if isSelf and db.voiceLang == "pl" then
+		return -- Polish mode: you already said it yourself
+	end
+	if not isSelf then
+		local lid = Plain(languageID, "number")
+		if lid and lid > 0 and C_ChatInfo and C_ChatInfo.CanPlayerSpeakLanguage then
+			local can = SafeCall(C_ChatInfo.CanPlayerSpeakLanguage, lid)
+			if can ~= nil and not issecretvalue(can) and not can then
+				return -- the other faction's language arrives garbled - not worth a voice
+			end
+		end
+	end
+
+	local race, sex = "", 0
+	if guid then
+		local _, _, _, englishRace, gender = SafeCall(GetPlayerInfoByGUID, guid)
+		race = Plain(englishRace, "string") or ""
+		sex = Plain(gender, "number") or 0
+	end
+
+	local distance, method = nil, P.DIST_NONE
+	local unit
+	if isSelf then
+		distance, method = 0, P.DIST_SELF
+	elseif channel == "say" and guid then
+		local viaNameplate
+		unit, viaNameplate = FindUnitForGUID(guid)
+		if unit then
+			distance, method = DistanceTo(unit, viaNameplate)
+		end
+	end
+
+	local flags = 0
+	if isSelf then
+		flags = flags + P.VFLAG_SELF
+	end
+	if db.voiceLang == "pl" then
+		flags = flags + P.VFLAG_LANG_PL
+	end
+	voiceSeq = (voiceSeq + 1) % 65536
+	local sender = Plain(playerName, "string") or ""
+	EnqueueVoice(P.EncodePacket({
+		type = P.TYPE_VOICE,
+		seq = voiceSeq,
+		flags = flags,
+		kind = KIND[event] or 0,
+		sex = sex,
+		distance = distance,
+		distMethod = method,
+		race = race,
+		sender = sender,
+		text = text,
+	}))
+	voiceStats.last = {
+		sender = sender,
+		race = race,
+		sex = sex,
+		distance = distance,
+		method = method,
+		unit = unit or "-",
+	}
+	if db.voiceDebug then
+		Print(("glos: %s [%s, plec %d] %s, metoda %d (%s)"):format(
+			sender,
+			race ~= "" and race or "rasa ?",
+			sex,
+			distance and ("%.1f yd"):format(distance) or "odleglosc ?",
+			method,
+			unit or "-"
+		))
+	end
+end
+
+---------------------------------------------------------------------------- update driver
+
 local driver = CreateFrame("Frame")
 local acc = 0
-local errorReported = false
+local errorReported, voiceErrorReported = false, false
 driver:SetScript("OnUpdate", function(_, elapsed)
+	local ok, err = pcall(VoiceTick, GetTime())
+	if not ok then
+		voiceGrid:Hide()
+		voiceQueue = {}
+		voiceShownUntil = 0
+		if not voiceErrorReported then
+			voiceErrorReported = true
+			Print("blad przekazywania glosu (zglaszam tylko raz): " .. tostring(err))
+		end
+	end
 	acc = acc + elapsed
 	if acc < POLL_INTERVAL then
 		return
 	end
 	acc = 0
-	local ok, err = pcall(HoverTick)
+	ok, err = pcall(HoverTick)
 	if not ok then
 		HideSignal()
 		ResetHover()
@@ -447,9 +700,125 @@ local function ShowTestPacket()
 		prefix = "[Test] ",
 		text = "Hello from WoW Voice Translator! If you can read this in Polish, the connection works.",
 	}
-	ShowBytes(P.EncodePacket(pkt))
+	hoverGrid:ShowBytes(P.EncodePacket(pkt))
 	state.testUntil = GetTime() + TEST_SECONDS
 	Print("pakiet testowy wyswietlony na " .. TEST_SECONDS .. " s - aplikacja powinna pokazac tlumaczenie na srodku ekranu.")
+end
+
+---------------------------------------------------------------------------- voice panel
+
+local panel, buttons = nil, {}
+
+local function OnOff(v)
+	return v and "WL" or "wyl"
+end
+
+local function UpdatePanel()
+	if not panel then
+		return
+	end
+	local function paint(btn, on, label)
+		btn.label:SetText(label)
+		if on then
+			btn.bg:SetColorTexture(0.10, 0.45, 0.15, 0.85)
+		else
+			btn.bg:SetColorTexture(0.18, 0.18, 0.18, 0.85)
+		end
+	end
+	paint(buttons.say, db.voiceSay, "Say: " .. OnOff(db.voiceSay))
+	paint(buttons.party, db.voiceParty, "Party: " .. OnOff(db.voiceParty))
+	paint(buttons.lang, db.voiceLang == "pl", db.voiceLang == "pl" and "Glos: PL" or "Glos: EN")
+	if db.panelShown then
+		panel:Show()
+	else
+		panel:Hide()
+	end
+end
+
+local function SetVoiceOption(key, value)
+	db[key] = value
+	UpdatePanel()
+end
+
+local function MakeButton(parent, width, x, tooltipTitle, tooltipText, onClick)
+	local btn = CreateFrame("Button", nil, parent)
+	btn:SetSize(width, 18)
+	btn:SetPoint("LEFT", parent, "LEFT", x, 0)
+	btn.bg = btn:CreateTexture(nil, "BACKGROUND")
+	btn.bg:SetAllPoints(btn)
+	btn.label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	btn.label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+	btn:RegisterForClicks("LeftButtonUp")
+	btn:SetScript("OnClick", onClick)
+	btn:SetScript("OnEnter", function(self)
+		if GameTooltip then
+			GameTooltip:SetOwner(self, "ANCHOR_TOP")
+			GameTooltip:SetText(tooltipTitle)
+			GameTooltip:AddLine(tooltipText, 1, 1, 1, true)
+			GameTooltip:AddLine("Shift + przeciagnij: przesun panel. /wvt panel: ukryj.", 0.6, 0.6, 0.6, true)
+			GameTooltip:Show()
+		end
+	end)
+	btn:SetScript("OnLeave", function()
+		if GameTooltip then
+			GameTooltip:Hide()
+		end
+	end)
+	return btn
+end
+
+local function CreatePanel()
+	panel = CreateFrame("Frame", "WoWVoiceTranslatorPanel", UIParent)
+	panel:SetSize(212, 22)
+	panel:SetFrameStrata("MEDIUM")
+	panel:SetClampedToScreen(true)
+	panel:SetMovable(true)
+	panel:EnableMouse(true)
+	panel:RegisterForDrag("LeftButton")
+	panel:SetScript("OnDragStart", function(self)
+		if IsShiftKeyDown and IsShiftKeyDown() then
+			self:StartMoving()
+		end
+	end)
+	panel:SetScript("OnDragStop", function(self)
+		self:StopMovingOrSizing()
+		local point, _, relPoint, x, y = self:GetPoint(1)
+		db.panelPoint = { point, relPoint, x, y }
+	end)
+	local bg = panel:CreateTexture(nil, "BACKGROUND")
+	bg:SetAllPoints(panel)
+	bg:SetColorTexture(0, 0, 0, 0.45)
+
+	local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	title:SetPoint("LEFT", panel, "LEFT", 4, 0)
+	title:SetText("WVT")
+
+	buttons.say = MakeButton(panel, 56, 30, "Czytaj /say na glos",
+		"Nowe wiadomosci /say w poblizu czyta glos pasujacy do rasy i plci postaci, ciszej im dalej. Zuzywa kredyty ElevenLabs tylko gdy wlaczone.",
+		function()
+			SetVoiceOption("voiceSay", not db.voiceSay)
+		end)
+	buttons.party = MakeButton(panel, 64, 88, "Czytaj /party na glos",
+		"Wiadomosci druzyny, zawsze ta sama glosnosc. Zuzywa kredyty ElevenLabs tylko gdy wlaczone.",
+		function()
+			SetVoiceOption("voiceParty", not db.voiceParty)
+		end)
+	buttons.lang = MakeButton(panel, 56, 154, "Jezyk glosu",
+		"EN: slyszysz oryginal po angielsku, a Twoja postac powtarza Twoja wiadomosc swoim glosem. PL: slyszysz innych po polsku (tlumaczenie lokalne), czat zostaje po angielsku.",
+		function()
+			SetVoiceOption("voiceLang", db.voiceLang == "pl" and "en" or "pl")
+		end)
+
+	panel:ClearAllPoints()
+	local p = db.panelPoint
+	if type(p) == "table" and p[1] then
+		panel:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+	elseif ChatFrame1 then
+		panel:SetPoint("BOTTOMLEFT", ChatFrame1, "TOPLEFT", 0, 28)
+	else
+		panel:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+	end
+	UpdatePanel()
 end
 
 ---------------------------------------------------------------------------- events / slash
@@ -459,7 +828,19 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("DISPLAY_SIZE_CHANGED")
 events:RegisterEvent("UI_SCALE_CHANGED")
-events:SetScript("OnEvent", function(_, event, arg1)
+for ev in pairs(VOICE_EVENTS) do
+	events:RegisterEvent(ev)
+end
+events:SetScript("OnEvent", function(_, event, ...)
+	if VOICE_EVENTS[event] then
+		local ok, err = pcall(OnVoiceChat, event, ...)
+		if not ok and not voiceErrorReported then
+			voiceErrorReported = true
+			Print("blad odczytu wiadomosci do glosu (zglaszam tylko raz): " .. tostring(err))
+		end
+		return
+	end
+	local arg1 = ...
 	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
 		if type(WoWVoiceTranslatorDB) ~= "table" then
 			WoWVoiceTranslatorDB = {}
@@ -472,11 +853,22 @@ events:SetScript("OnEvent", function(_, event, arg1)
 		db = WoWVoiceTranslatorDB
 	elseif event == "PLAYER_LOGIN" then
 		UpdateGeometry()
+		CreatePanel()
 		Print("aktywny. Najedz myszka na linie czatu, aby zobaczyc tlumaczenie (/wvt - pomoc).")
 	else
 		UpdateGeometry()
 	end
 end)
+
+local function ParseOnOff(rest, current)
+	rest = strlower(rest or "")
+	if rest == "on" or rest == "1" then
+		return true
+	elseif rest == "off" or rest == "0" then
+		return false
+	end
+	return not current
+end
 
 SLASH_WOWVOICETRANSLATOR1 = "/wvt"
 SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
@@ -500,6 +892,34 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 		else
 			Print("uzycie: /wvt dwell 0.12")
 		end
+	elseif cmd == "say" then
+		SetVoiceOption("voiceSay", ParseOnOff(rest, db.voiceSay))
+		Print("glos /say: " .. OnOff(db.voiceSay))
+	elseif cmd == "party" then
+		SetVoiceOption("voiceParty", ParseOnOff(rest, db.voiceParty))
+		Print("glos /party: " .. OnOff(db.voiceParty))
+	elseif cmd == "lang" then
+		local v = strlower(rest or "")
+		if v ~= "en" and v ~= "pl" then
+			v = db.voiceLang == "pl" and "en" or "pl"
+		end
+		SetVoiceOption("voiceLang", v)
+		Print("jezyk glosu: " .. strupper(v))
+	elseif cmd == "panel" then
+		SetVoiceOption("panelShown", not db.panelShown)
+		Print("panel glosow: " .. (db.panelShown and "widoczny" or "ukryty"))
+	elseif cmd == "voicedebug" then
+		db.voiceDebug = ParseOnOff(rest, db.voiceDebug)
+		Print("diagnostyka glosu: " .. OnOff(db.voiceDebug))
+	elseif cmd == "voice" then
+		Print(("glos: say %s | party %s | jezyk %s | wyslane %d, pominiete %d"):format(
+			OnOff(db.voiceSay), OnOff(db.voiceParty), strupper(db.voiceLang or "en"), voiceStats.sent, voiceStats.dropped))
+		local l = voiceStats.last
+		if l then
+			Print(("ostatni nadawca: %s [%s, plec %d] %s, metoda %d (%s)"):format(
+				l.sender, l.race ~= "" and l.race or "rasa ?", l.sex,
+				l.distance and ("%.1f yd"):format(l.distance) or "odleglosc ?", l.method, l.unit))
+		end
 	else
 		local physW, physH = GetPhysicalScreenSize()
 		Print(
@@ -508,9 +928,9 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 				db.dwell or defaults.dwell,
 				tostring(physW),
 				tostring(physH),
-				ComputeCellSize()
+				ComputeCellSize(hoverGrid.frame)
 			)
 		)
-		Print("/wvt on | off | test | dwell <sekundy>")
+		Print("/wvt on | off | test | dwell <s> | say [on|off] | party [on|off] | lang en|pl | panel | voice | voicedebug")
 	end
 end

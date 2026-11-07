@@ -25,9 +25,25 @@ P.MAX_PREFIX_BYTES = 80
 P.TYPE_HOVER = 1
 P.TYPE_KEEP = 2
 P.TYPE_TEST = 3
+P.TYPE_VOICE = 4
 
 P.FLAG_SECRET = 1
 P.FLAG_TRUNCATED = 2
+P.VFLAG_SELF = 4
+P.VFLAG_LANG_PL = 8
+
+-- voice grid: same geometry, COLS + 2 cells to the right of the hover grid
+P.VOICE_GRID_X_CELLS = P.COLS + 2
+P.MAX_RACE_BYTES = 24
+P.MAX_SENDER_BYTES = 48
+P.VOICE_FIXED_BYTES = 13
+
+P.DIST_UNKNOWN = 65535
+P.DIST_NONE = 0
+P.DIST_EXACT = 1
+P.DIST_RANGE = 2
+P.DIST_NAMEPLATE = 3
+P.DIST_SELF = 4
 
 P.LEVELS = { 0, 1 / 3, 2 / 3, 1 }
 
@@ -124,6 +140,8 @@ end
 
 -- p = { type, seq, flags, left, bottom, width, height, fontHeight, r, g, b,
 --       physW, physH, kind, prefix, text }   (r, g, b in 0..255)
+-- voice packets: { type = TYPE_VOICE, seq, flags, kind, sex, distance (yards or nil),
+--                  distMethod, race, sender, text }
 function P.EncodePacket(p)
 	local b = { 87, 86 } -- "WV"
 	pushU8(b, P.VERSION)
@@ -152,6 +170,37 @@ function P.EncodePacket(p)
 		pushU8(b, p.kind or 0)
 		pushU8(b, #prefix)
 		pushBytes(b, prefix)
+		pushU16(b, #text)
+		pushBytes(b, text)
+	elseif p.type == P.TYPE_VOICE then
+		local race = P.Utf8Truncate(p.race or "", P.MAX_RACE_BYTES)
+		local sender = P.Utf8Truncate(p.sender or "", P.MAX_SENDER_BYTES)
+		local room = P.MAX_BYTES - P.VOICE_FIXED_BYTES - #race - 1 - #sender - 2 - 2
+		local rawText = p.text or ""
+		local text = P.Utf8Truncate(rawText, room)
+		local flags = p.flags or 0
+		if #text < #rawText and floor(flags / P.FLAG_TRUNCATED) % 2 == 0 then
+			flags = flags + P.FLAG_TRUNCATED
+		end
+		pushU8(b, flags)
+		pushU8(b, p.kind or 0)
+		pushU8(b, p.sex or 0)
+		if p.distance == nil then
+			pushU16(b, P.DIST_UNKNOWN)
+		else
+			local d = floor(p.distance * 10 + 0.5)
+			if d < 0 then
+				d = 0
+			elseif d > P.DIST_UNKNOWN - 1 then
+				d = P.DIST_UNKNOWN - 1
+			end
+			pushU16(b, d)
+		end
+		pushU8(b, p.distMethod or 0)
+		pushU8(b, #race)
+		pushBytes(b, race)
+		pushU8(b, #sender)
+		pushBytes(b, sender)
 		pushU16(b, #text)
 		pushBytes(b, text)
 	end

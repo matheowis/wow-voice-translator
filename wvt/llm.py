@@ -178,7 +178,7 @@ class LocalLLM:
 
     # ------------------------------------------------------------------ inference
     def chat(self, messages: list[dict], max_tokens: int = 200, temperature: float = 0.0,
-             stop: list[str] | None = None) -> tuple[str, dict]:
+             stop: list[str] | None = None, timeout: float | None = None) -> tuple[str, dict]:
         body: dict = {
             "messages": messages,
             "max_tokens": max_tokens,
@@ -196,7 +196,10 @@ class LocalLLM:
             body["reasoning_format"] = "deepseek"
         t0 = time.perf_counter()
         try:
-            r = self.client.post("/v1/chat/completions", json=body)
+            if timeout is None:
+                r = self.client.post("/v1/chat/completions", json=body)
+            else:
+                r = self.client.post("/v1/chat/completions", json=body, timeout=timeout)
         except httpx.HTTPError as exc:
             raise LLMError(f"LLM niedostępny: {exc}") from exc
         if r.status_code != 200:

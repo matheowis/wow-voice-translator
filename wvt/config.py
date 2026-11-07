@@ -99,6 +99,52 @@ DEFAULTS: dict[str, Any] = {
         "keep_history": True,  # last 10 PTT translations kept in memory (never on disk)
     },
     "logging": {"level": "INFO", "dir": "logs"},
+    # Reading /say and /party aloud with ElevenLabs. Which channels are read is switched
+    # IN THE GAME (panel above the chat, /wvt say|party|lang) - off channels cost nothing.
+    "voice": {
+        "enabled": True,  # master switch of the app side
+        "api_key_env": "ELEVENLABS_API_KEY",  # read from the git-ignored .env
+        "model_id": "eleven_v4_turbo",
+        "output_format": "pcm_24000",
+        "sample_rate": 24000,
+        "request_timeout_s": 15,
+        "max_retries": 2,
+        "speak_own_messages": True,  # EN mode: your character repeats your line in its voice
+        "volume_say": 1.0,
+        "volume_party": 0.9,
+        # /say volume by distance in yards (linear between points); beyond the last point = silent
+        # and NOT synthesised, so far-away chatter costs nothing
+        "distance_curve": [[0, 1.0], [5, 1.0], [10, 0.75], [15, 0.5], [20, 0.25], [30, 0.0]],
+        "unknown_distance": "play_quiet",  # play_normal | play_quiet | mute
+        "quiet_gain": 0.35,
+        "max_chars_per_message": 220,
+        "daily_char_budget": 30000,  # characters sent to ElevenLabs per day (~0.5 credit each on v4 Turbo)
+        "max_queue": 6,
+        "max_concurrent": 2,  # utterances playing at the same time
+        "stale_after_s": 20,  # older lines are dropped instead of read late
+        "dedup_window_s": 15,  # same sender + same text within this window is read once
+        "blocked_players": [],
+        "output_device": None,  # sounddevice output name/index, None = Windows default
+        "realm": "Forever",  # used when the sender name has no "-Realm" part
+        "slots_per_pool": 5,  # voices per race+gender pool (Voice Design)
+        "race_aliases": {},  # extra englishRace -> pool mapping, e.g. {"Goblin": "Gnome"}
+        "store": {
+            "mongodb_uri_env": "MONGODB_URI",  # empty/missing -> mongodb://127.0.0.1:27017
+            "mongodb_default_uri": "mongodb://127.0.0.1:27017",
+            "database": "wow_voice_translator",
+            "timeout_ms": 1500,
+            "fallback_dir": "data",  # local JSON store when MongoDB is not reachable
+        },
+    },
+    # Spoken-English cleanup before ElevenLabs (EN mode): brb -> be right back, oom -> out of mana...
+    "normalizer": {
+        "enabled": True,
+        "mode": "hybrid",  # off | rules | hybrid (rules + local LLM for slang the rules leave ambiguous)
+        "timeout_ms": 500,  # LLM slower than this -> the rules result is used
+        "max_chars": 220,
+        "profanity_preservation": True,
+        "cache_size": 500,
+    },
 }
 
 

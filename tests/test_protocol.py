@@ -94,3 +94,42 @@ def test_geometry_conversion():
     x, y, w, h = P.base_rect_to_client_px(pkt, 2560, 1440)
     assert (x, y, w, h) == (0, 720, 1440, 720)
     assert P.font_px(sample_packet(font_height=14), 1440) == pytest.approx(26.25)
+
+
+# --------------------------------------------------------------------------- voice packets
+
+def _voice(**kw):
+    base = dict(type=P.TYPE_VOICE, seq=77, flags=P.VFLAG_LANG_PL, chat_kind=1, sex=3, distance=17.25,
+                dist_method=P.DIST_EXACT, race="NightElf", sender="Shalana-Forever",
+                text="lf healer, pst \u017c\u00f3\u0142w")
+    base.update(kw)
+    return P.Packet(**base)
+
+
+def test_voice_roundtrip():
+    pkt = P.decode_image(P.render_cells(P.packet_cells(_voice())))
+    assert pkt.type == P.TYPE_VOICE and pkt.seq == 77 and pkt.lang_pl and not pkt.is_self
+    assert (pkt.race, pkt.sex, pkt.sender) == ("NightElf", 3, "Shalana-Forever")
+    assert pkt.distance == pytest.approx(17.3) and pkt.dist_method == P.DIST_EXACT
+    assert pkt.text.endswith("\u017c\u00f3\u0142w")
+
+
+def test_voice_unknown_distance_and_long_text():
+    pkt = P.decode_image(P.render_cells(P.packet_cells(_voice(distance=None, dist_method=P.DIST_NONE,
+                                                                 text="x" * 600))))
+    assert pkt.distance is None and pkt.flags & P.FLAG_TRUNCATED
+    assert len(pkt.text) == P.MAX_BYTES - P.VOICE_FIXED_BYTES - len("NightElf") - 1 - len("Shalana-Forever") - 4
+
+
+def test_both_grids_in_one_capture():
+    """Hover grid at x=0 and voice grid at VOICE_ORIGIN_X (+1 px rounding) decode independently."""
+    img = np.zeros((P.REGION_H + 4, P.CAPTURE_W + 8, 3), dtype=np.uint8)
+    hover = P.Packet(type=P.TYPE_HOVER, seq=5, text="hello", prefix="[Party] [Bob]: ")
+    img[:P.REGION_H, :P.REGION_W] = P.render_cells(P.packet_cells(hover))
+    x0 = P.VOICE_ORIGIN_X + 1
+    img[1:P.REGION_H + 1, x0:x0 + P.REGION_W] = P.render_cells(P.packet_cells(_voice()))
+    assert P.try_decode(img).text == "hello"
+    v = P.try_decode_at(img, P.VOICE_ORIGIN_X)
+    assert v.type == P.TYPE_VOICE and v.sender == "Shalana-Forever"
+    img[:, P.VOICE_ORIGIN_X - 4:] = 30  # voice grid hidden -> nothing found there
+    assert P.try_decode_at(img, P.VOICE_ORIGIN_X) is None

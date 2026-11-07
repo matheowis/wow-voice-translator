@@ -40,4 +40,9 @@ if (-not $SkipAddon) {
         exit 1
     }
 }
+if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
+    Copy-Item ".env.example" ".env"
+    Write-Host "== Utworzono .env - glosy postaci (opcjonalne): wpisz tam ELEVENLABS_API_KEY i uruchom raz:"
+    Write-Host "   .venv\Scripts\python -m wvt.voice.design"
+}
 Write-Host "== Gotowe. Start: scripts\run.bat   (diagnostyka: .venv\Scripts\python -m wvt.cli check)"

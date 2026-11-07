@@ -1,7 +1,8 @@
 """Reads the addon's pixel signal from the top-left corner of the WoW client area.
 
-Plain GDI screen capture of a ~130x85 px region, 25 times per second, only while WoW
-is the foreground window. No process memory is touched.
+Plain GDI screen capture of a ~130x85 px region (~270x85 px when voices are on: the
+voice grid sits right of the hover grid), 25 times per second, only while WoW is the
+foreground window. No process memory is touched.
 """
 
 from __future__ import annotations
@@ -95,18 +96,39 @@ class HoverStateMachine:
             self.on_start(pkt)
 
 
+class VoiceDeduper:
+    """A voice packet stays on screen for several captures; pass each one on once."""
+
+    def __init__(self, memory: int = 64):
+        self._seen: list[tuple] = []
+        self._memory = memory
+
+    def is_new(self, pkt: protocol.Packet) -> bool:
+        ident = (pkt.seq, pkt.sender, pkt.text)  # seq restarts after /reload, so not alone
+        if ident in self._seen:
+            return False
+        self._seen.append(ident)
+        del self._seen[:-self._memory]
+        return True
+
+
 class SignalReader:
     def __init__(self, tracker: WowWindowTracker, poll_hz: float,
-                 on_start: Callable[[protocol.Packet, WowWindow], None], on_stop: Callable[[], None]):
+                 on_start: Callable[[protocol.Packet, WowWindow], None], on_stop: Callable[[], None],
+                 on_voice: Optional[Callable[[protocol.Packet], None]] = None):
         self.tracker = tracker
         self.interval = 1.0 / max(1.0, poll_hz)
         self._on_start = on_start
         self._window: Optional[WowWindow] = None
         self.machine = HoverStateMachine(lambda p: self._on_start(p, self._window), on_stop)
+        self.on_voice = on_voice
+        self.voice_dedup = VoiceDeduper()
         self.enabled = True
         self.require_foreground = True  # False only for the dev simulator
         self.last_packet_at = 0.0
         self.last_packet: Optional[protocol.Packet] = None
+        self.last_voice_at = 0.0
+        self.voice_packets = 0
         self.capture_errors = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -128,17 +150,30 @@ class SignalReader:
             while not self._stop.is_set():
                 t0 = time.perf_counter()
                 pkt = None
+                voice = None
                 if self.enabled:
                     win = self.tracker.find(max_age=2.0)
                     if win is not None and (not self.require_foreground or self.tracker.foreground_is_wow()):
                         self._window = win
                         x, y, w, h = win.client
+                        width = (protocol.CAPTURE_W if self.on_voice else protocol.REGION_W) + SEARCH + 1
                         try:
-                            img = cap.grab(x, y, min(w, protocol.REGION_W + SEARCH + 1), min(h, protocol.REGION_H + SEARCH + 1))
+                            img = cap.grab(x, y, min(w, width), min(h, protocol.REGION_H + SEARCH + 1))
                             pkt = protocol.try_decode(img, search=SEARCH)
+                            if self.on_voice and img.shape[1] >= protocol.CAPTURE_W:
+                                voice = protocol.try_decode_at(img, protocol.VOICE_ORIGIN_X, search=SEARCH)
                         except (OSError, protocol.DecodeError) as exc:
                             self.capture_errors += 1
                             log.debug("capture/decode failed: %s", exc)
+                if voice is not None and voice.type == protocol.TYPE_VOICE and self.voice_dedup.is_new(voice):
+                    self.last_voice_at = time.time()
+                    self.voice_packets += 1
+                    try:
+                        self.on_voice(voice)
+                    except Exception:
+                        log.exception("voice handler failed")
+                if pkt is not None and pkt.type == protocol.TYPE_VOICE:
+                    pkt = None  # never treat a voice packet as a hover
                 if pkt is not None:
                     self.last_packet_at = time.time()
                     self.last_packet = pkt
