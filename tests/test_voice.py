@@ -426,3 +426,56 @@ def test_replaced_voice_moves_players_unless_set_by_hand(tmp_path):
     assert store.reassign_voice(a.voice_id, "new-voice") == 1
     assert store.get_player("Forever", "grom")["voiceId"] == "new-voice"
     assert store.get_player("Forever", "pinned")["voiceId"] == a.voice_id
+
+
+# --------------------------------------------------------------------------- judge of Voice Design previews
+
+def _unit(v):
+    v = np.asarray(v, dtype=np.float32)
+    return v / np.linalg.norm(v)
+
+
+def test_judge_flags_men_that_sound_like_women_and_garbled_previews():
+    from wvt.voice.judge import VoiceJudge
+
+    rng = np.random.default_rng(1)
+    male_dir, female_dir = _unit(rng.normal(size=256)), _unit(rng.normal(size=256))
+    refs = [("Orc", "Male", _unit(male_dir + 0.1 * rng.normal(size=256))) for _ in range(3)]
+    refs += [("Human", "Male", _unit(male_dir + 0.1 * rng.normal(size=256))) for _ in range(3)]
+    refs += [("Human", "Female", _unit(female_dir + 0.1 * rng.normal(size=256))) for _ in range(3)]
+
+    class FakeSTT:
+        def __init__(self, text):
+            self.text = text
+
+        def transcribe(self, audio):
+            return self.text
+
+    line = "Enough talking, my axe is thirsty"
+    judge = VoiceJudge(refs, FakeSTT(line))
+    manly = _unit(male_dir + 0.05 * rng.normal(size=256))
+    girly = _unit(female_dir + 0.05 * rng.normal(size=256))
+    assert judge.gender_score(manly) < -0.5 < 0.5 < judge.gender_score(girly)
+    ok = judge.assess(np.zeros(16000), manly, "Orc", "Male", line, [], [])
+    assert ok.ok and ok.details["wer"] == 0.0
+    bad = judge.assess(np.zeros(16000), girly, "Orc", "Male", line, [], [])
+    assert not bad.ok and bad.score > ok.score
+    mumbled = VoiceJudge(refs, FakeSTT("enough uh my ax")).assess(np.zeros(16000), manly, "Orc", "Male", line, [], [])
+    assert not mumbled.ok and "WER" in mumbled.reasons[0]
+    # race fit: closer to the good orcs than to other races is rewarded
+    assert judge.race_margin(manly, "Orc", "Male") is not None
+
+
+def test_round3_briefs_follow_the_lessons_of_the_ratings():
+    from wvt.voice.briefs import BRIEFS
+
+    for (race, gender, _slot), b in BRIEFS.items():
+        text = b["brief"].lower()
+        assert 100 <= len(b["line"]) <= 1000
+        assert "ethereal" not in text and "echo" not in text and "squeaky" not in text
+        if gender == "Male":
+            assert "young adult" not in text and "breathy" not in text
+            if race != "Gnome":
+                assert "nasal" not in text
+        if race == "Undead":
+            assert any(w in text for w in ("rasp", "torn", "pain", "shredded", "crack", "broken", "ravaged", "wheez"))

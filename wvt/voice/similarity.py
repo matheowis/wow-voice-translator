@@ -90,6 +90,44 @@ def _trim_silence(x: np.ndarray, threshold: float = 0.01) -> np.ndarray:
     return x[loud[0]: loud[-1] + 1] if len(loud) else x
 
 
+def median_f0(x: np.ndarray, fmin: float = 55.0, fmax: float = 420.0, threshold: float = 0.12) -> Optional[float]:
+    """Median pitch (Hz) of the voiced frames of a 16 kHz signal (YIN, 32 ms windows, 10 ms hop).
+
+    YIN's cumulative-mean-normalised difference avoids the octave errors of plain
+    autocorrelation, so a growling orc (~90 Hz) is told apart from a chipmunk gnome (~300 Hz)
+    or a man who came out sounding like a woman.
+    """
+    win, hop = int(0.032 * SR), int(0.01 * SR)
+    lag_min, lag_max = int(SR / fmax), int(SR / fmin)
+    if len(x) < win + lag_max:
+        return None
+    energy_floor = 0.15 * np.sqrt(np.mean(x ** 2) + 1e-12)
+    taus = np.arange(lag_max + 1)
+    f0s = []
+    for start in range(0, len(x) - win - lag_max, hop):
+        seg = x[start:start + win + lag_max].astype(np.float64)
+        frame = seg[:win]
+        if np.sqrt(np.mean(frame ** 2)) < energy_floor:
+            continue
+        # difference function d(tau) = E(frame) + E(shifted frame) - 2 * crosscorr(tau)
+        cs = np.concatenate([[0.0], np.cumsum(seg ** 2)])
+        e_shift = cs[taus + win] - cs[taus]
+        corr = np.array([np.dot(frame, seg[t:t + win]) for t in taus])
+        d = e_shift[0] + e_shift - 2 * corr
+        d[0] = 0.0
+        cmnd = np.ones_like(d)
+        running = np.cumsum(d[1:])
+        cmnd[1:] = d[1:] * np.arange(1, len(d)) / np.maximum(running, 1e-12)
+        below = np.flatnonzero(cmnd[lag_min:lag_max] < threshold)
+        if not len(below):
+            continue
+        t = lag_min + below[0]
+        while t + 1 < lag_max and cmnd[t + 1] < cmnd[t]:  # walk down to the local minimum
+            t += 1
+        f0s.append(SR / t)
+    return float(np.median(f0s)) if len(f0s) >= 10 else None
+
+
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-9))
 

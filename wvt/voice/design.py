@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--guidance", type=float, default=6.0)
     ap.add_argument("--suffix", default="v2", help="appended to the names of redesigned voices")
     ap.add_argument("--model", default="eleven_ttv_v3")
+    ap.add_argument("--no-speech-check", action="store_true", help="skip the Parakeet intelligibility check")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -147,6 +148,29 @@ def main(argv: list[str] | None = None) -> int:
             if e is not None:
                 anchors.setdefault((r, g), []).append(e)
                 by_gender.setdefault(g, []).append(((r, g), e))
+    judge = None
+    if embedder is not None:
+        from .judge import VoiceJudge
+
+        refs = []
+        for (r, g, _s), p in staying.items():
+            if p.voice_id in keep:  # the user's well-rated voices teach gender and race fit
+                e = existing_embedding(p)
+                if e is not None:
+                    refs.append((r, g, e))
+        stt = None
+        if not args.no_speech_check:
+            try:
+                from ..stt import SpeechToText
+
+                stt = SpeechToText(cfg["stt"]["model_dir"], cfg["stt"].get("model_name", "nemo-parakeet-tdt-0.6b-v3"),
+                                   device="cpu")
+                stt.load()
+            except Exception as exc:
+                _print(f"Bez sprawdzania wyraźności mowy ({exc}).")
+                stt = None
+        judge = VoiceJudge(refs, stt)
+        _print(f"Sędzia: {len(refs)} wzorcowych głosów, sprawdzanie mowy: {'tak' if stt else 'nie'}.")
     replaced_log = fallback / "replaced_voices.json"
     totals = {"created": 0, "failed": 0, "requests": 0, "moved_players": 0}
     results: list[dict] = []
@@ -157,10 +181,11 @@ def main(argv: list[str] | None = None) -> int:
         for slot in todo[pool]:
             desc = describe(race, gender, slot)
             best = None
+            line = preview_line(slot, race, gender)
             for attempt in range(max(1, args.attempts)):
                 seed = 4000 + POOL_RACES.index(race) * 100 + GENDERS.index(gender) * 10 + slot + attempt * 7919
                 try:
-                    previews, _ = client.design_voice(desc, preview_line(slot), model_id=args.model, seed=seed,
+                    previews, _ = client.design_voice(desc, line, model_id=args.model, seed=seed,
                                                       guidance_scale=args.guidance)
                 except ElevenLabsError as exc:
                     if not exc.retryable:
@@ -174,15 +199,21 @@ def main(argv: list[str] | None = None) -> int:
                 if embedder is None:
                     best = (previews[0], None, 0.0)
                     break
-                from .similarity import most_distinct
+                from .similarity import decode_audio
 
-                embs = [embedder.embed_bytes(base64.b64decode(p["audio_base_64"])) for p in previews]
                 with lock:
                     others = [e for k, e in by_gender.get(gender, []) if k != pool]
-                idx, score = most_distinct(embs, chosen, others)
-                if best is None or score < best[2]:
-                    best = (previews[idx], embs[idx], score)
-                if score <= args.target:
+                done = False
+                for pv in previews:
+                    audio = decode_audio(base64.b64decode(pv["audio_base_64"]))
+                    emb = embedder.embed(audio)
+                    verdict = judge.assess(audio, emb, race, gender, line, chosen, others)
+                    key = (not verdict.ok, verdict.score)
+                    if best is None or key < (not best[3].ok, best[3].score):
+                        best = (pv, emb, verdict.details.get("pool", 0.0), verdict)
+                    if verdict.ok and verdict.score <= args.target:
+                        done = True
+                if done:
                     break
             if best is None:
                 raise ElevenLabsError(f"Voice Design nie zwrócił podglądów dla {race} {gender} {slot}")
@@ -203,7 +234,10 @@ def main(argv: list[str] | None = None) -> int:
                 totals["moved_players"] += moved
                 results.append({"name": name, "voiceId": voice_id, "replaced": old.voice_id if old else None,
                                 "similarity": round(best[2], 3)})
+            verdict = best[3] if len(best) > 3 else None
             _print(f"  {name} -> {voice_id}  podobieństwo do puli {best[2]:.2f}"
+                   + (f"  {verdict.details}" if verdict else "")
+                   + (f"  UWAGA: {'; '.join(verdict.reasons)}" if verdict and verdict.reasons else "")
                    + (f", przeniesione postacie: {moved}" if moved else ""))
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool_exec:

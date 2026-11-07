@@ -67,6 +67,9 @@ class MongoVoiceStore:
     def save_profile(self, p: VoiceProfile) -> None:
         self.profiles.update_one({"race": p.race, "gender": p.gender, "slot": p.slot}, {"$set": p.to_doc()}, upsert=True)
 
+    def delete_profile(self, race: str, gender: str, slot: int) -> None:
+        self.profiles.delete_one({"race": race, "gender": gender, "slot": slot})
+
     def get_player(self, realm: str, norm: str) -> Optional[dict]:
         return self.players.find_one({"realm": realm, "playerNameNormalized": norm}, {"_id": 0})
 
@@ -148,6 +151,12 @@ class JsonVoiceStore:
                               if (d["race"], d["gender"], int(d["slot"])) != (p.race, p.gender, p.slot)]
             self._profiles.append(p.to_doc())
             self._profiles.sort(key=lambda d: (d["race"], d["gender"], int(d["slot"])))
+            self._write(self._profiles_path, self._profiles)
+
+    def delete_profile(self, race: str, gender: str, slot: int) -> None:
+        with self._lock:
+            self._profiles = [d for d in self._profiles
+                              if (d["race"], d["gender"], int(d["slot"])) != (race, gender, slot)]
             self._write(self._profiles_path, self._profiles)
 
     def get_player(self, realm: str, norm: str) -> Optional[dict]:

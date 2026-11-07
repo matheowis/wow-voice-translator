@@ -113,6 +113,11 @@ LINES = [
 
 
 def describe(race: str, gender: str, slot: int) -> str:
+    from .briefs import BRIEFS
+
+    b = BRIEFS.get((race, gender, slot))
+    if b:  # round 3: a hand-written character
+        return b["brief"] + " High-quality, crisp audio with no background noise or music."
     r = RACES[race]
     i = (slot - 1) % 5
     register = REGISTERS[r["family"]][gender][i]
@@ -121,9 +126,15 @@ def describe(race: str, gender: str, slot: int) -> str:
             "High-quality, crisp audio with no background noise or music.")
 
 
-def preview_line(slot: int) -> str:
-    return LINES[(slot - 1) % 5]
+def preview_line(slot: int, race: str = "", gender: str = "") -> str:
+    from .briefs import BRIEFS
+
+    b = BRIEFS.get((race, gender, slot))
+    return b["line"] if b else LINES[(slot - 1) % 5]
 
 
-def label(gender: str, slot: int) -> str:
-    return SLOT_LABELS.get(gender, SLOT_LABELS["Male"])[(slot - 1) % 5]
+def label(gender: str, slot: int, race: str = "") -> str:
+    from .briefs import BRIEFS
+
+    b = BRIEFS.get((race, gender, slot))
+    return b["label"] if b else SLOT_LABELS.get(gender, SLOT_LABELS["Male"])[(slot - 1) % 5]
