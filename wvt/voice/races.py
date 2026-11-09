@@ -7,8 +7,11 @@ WoW Forever (launched 4 Nov 2026) has 10 playable races: the eight original ones
 new Skyborne in two flavours, High Order (Alliance) and Windshaper (Horde).  Both flavours
 use one race model - the client's model table is keyed "SkyborneMale"/"SkyborneFemale" -
 so they arrive as the single token "Skyborne" and share one voice pool.  Races of other
-WoW versions borrow the closest pool; anything unrecognised uses "Unknown"
-(configurable with ``voice.race_aliases``).
+WoW versions borrow the closest pool (configurable with ``voice.race_aliases``).
+
+There is no voice pool for an unknown race (the user dropped it in rating round 4): a
+character whose race the game does not give yet speaks with a voice of ``FALLBACK_RACE``
+(``voice.unknown_race_pool``) and moves once to its own race's pool when the race is known.
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ MALE, FEMALE = "Male", "Female"
 GENDERS = (MALE, FEMALE)
 
 CORE_RACES = ("Human", "Dwarf", "NightElf", "Gnome", "Orc", "Undead", "Tauren", "Troll", "Skyborne")
-POOL_RACES = CORE_RACES + (UNKNOWN,)
+POOL_RACES = CORE_RACES  # every race with its own voice pool
+FALLBACK_RACE = "Human"  # whose voices speak for characters of unknown race
 
 # englishRace token -> pool race (tokens of later expansions map to the nearest original race)
 RACE_ALIASES = {

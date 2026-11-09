@@ -48,7 +48,7 @@ from .wow_window import WowWindow, WowWindowTracker
 
 log = logging.getLogger("wvt.app")
 
-CHANNEL_CHOICES = ["say", "party", "raid", "instance", "guild", "yell", "reply"]
+CHANNEL_CHOICES = ["say", "party", "raid", "instance", "guild", "yell", "reply", "assistant"]
 
 
 def make_icon(color: str = "#ffd100") -> QIcon:
@@ -86,6 +86,7 @@ class Bridge(QObject):
     models = Signal(str, bool)
     key_captured = Signal(object)
     voice_event = Signal(object)
+    voices_enabled = Signal(bool)  # the assistant mutes/unmutes the character voices
 
 
 class QtPipelineUI:
@@ -475,6 +476,7 @@ class TranslatorApp:
         self.hotkeys: Optional[HotkeyManager] = None
         self.reader: Optional[SignalReader] = None
         self.voice = None  # VoiceManager, built in _init_voice
+        self.assistant = None  # wvt.assistant.Assistant, built with the models
         self.voice_status = "uruchamianie…"
         self.model_state = "ładowanie…"
         self.hover_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wvt-hover")
@@ -504,6 +506,7 @@ class TranslatorApp:
         b.models.connect(self._on_models)
         b.key_captured.connect(self.window.on_key_captured)
         b.voice_event.connect(self.window.voice_tab.add_event)
+        b.voices_enabled.connect(lambda on: self.act_voice.setChecked(on))
 
         self._level_timer = QTimer()
         self._level_timer.setInterval(100)
@@ -513,6 +516,7 @@ class TranslatorApp:
     # ------------------------------------------------------------------ startup
     def start(self) -> None:
         self.tray.show()
+        self._add_assistant_key()
         self._start_hotkeys()
         self.reader = SignalReader(self.tracker, float(self.cfg.get("hover.poll_hz", 25)),
                                    on_start=lambda p, w: self.bridge.hover_start.emit(p, w),
@@ -551,6 +555,13 @@ class TranslatorApp:
             self.stt.warmup()
             self.pipeline = PushToTalkPipeline(self.cfg, self.recorder, self.stt, self.translator, self.inserter,
                                                QtPipelineUI(self.bridge), self.tracker.foreground_is_wow)
+            if self.cfg.get("assistant.enabled", True):
+                from .assistant import Assistant
+
+                self.assistant = Assistant(self.cfg, self.translator, self.llm, self.inserter, QtPipelineUI(self.bridge),
+                                           self.tracker.foreground_is_wow, voice_getter=lambda: self.voice,
+                                           set_voices_enabled=self.bridge.voices_enabled.emit)
+                self.pipeline.assistant = self.assistant
             self.pipeline.models_ready.set()
             self.bridge.models.emit(f"gotowe (STT: {self.stt.device}, LLM: {self.llm.model_name})", True)
         except Exception as exc:
@@ -579,7 +590,8 @@ class TranslatorApp:
                 return
             data_dir = resolve_path(v["store"].get("fallback_dir", "data"))
             store = open_store(v["store"], data_dir)
-            resolver = VoiceResolver(store, v.get("realm", "Forever"), v.get("race_aliases") or {})
+            resolver = VoiceResolver(store, v.get("realm", "Forever"), v.get("race_aliases") or {},
+                                     v.get("unknown_race_pool", "Human"))
             tts = ElevenLabsClient(api_key, v.get("model_id", "eleven_v4_turbo"), v.get("output_format", "pcm_24000"),
                                    float(v.get("request_timeout_s", 15)), int(v.get("max_retries", 2)))
             mixer = AudioMixer(int(v.get("sample_rate", 24000)), v.get("output_device"))
@@ -602,8 +614,24 @@ class TranslatorApp:
             self.voice_status = f"BŁĄD: {exc}"
 
     def _on_voice_packet(self, pkt: protocol.Packet) -> None:  # signal reader thread
-        if self.voice is not None:
+        if self.assistant is not None:  # chat log and game state, whether spoken or not
+            try:
+                self.assistant.on_packet(pkt)
+            except Exception:
+                log.exception("assistant packet handler failed")
+        if self.voice is not None and pkt.type == protocol.TYPE_VOICE:
             self.voice.on_packet(pkt)
+
+    def _add_assistant_key(self) -> None:
+        """Configs written before the assistant existed get her push-to-talk key once."""
+        if not self.cfg.get("assistant.enabled", True) or self.cfg.get("assistant.default_key_added", False):
+            return
+        bindings = list(self.cfg.get("push_to_talk", []))
+        if not any(b.get("channel") == "assistant" for b in bindings):
+            bindings.append({"key": self.cfg.get("assistant.default_key", "mouse5"), "channel": "assistant"})
+            self.cfg.set("push_to_talk", bindings)
+        self.cfg.set("assistant.default_key_added", True)
+        self.cfg.save()
 
     def _toggle_voice(self, on: bool) -> None:
         self.cfg.set("voice.enabled", on)
@@ -656,6 +684,9 @@ class TranslatorApp:
         for b in self.cfg.get("push_to_talk", []):
             try:
                 spec = parse_key(b["key"])
+                if b.get("channel") == "assistant":
+                    parts.append(f"przytrzymaj {spec.describe()} → rozmowa z {self.cfg.get('assistant.name', 'asystentką')}")
+                    continue
                 parts.append(f"przytrzymaj {spec.describe()} → {b.get('channel', '?')} ({self.cfg.get('channels.' + b.get('channel', ''), '')})")
             except Exception:
                 parts.append(f"{b.get('key')} → {b.get('channel')} (błędny klawisz)")

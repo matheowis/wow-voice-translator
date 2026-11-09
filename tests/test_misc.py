@@ -35,7 +35,7 @@ def test_keyspec_roundtrip():
 def test_default_hotkeys_are_distinct():
     keys = [parse_key(b["key"]) for b in DEFAULTS["push_to_talk"]]
     assert len({(k.kind, k.code) for k in keys}) == len(keys)
-    assert {b["channel"] for b in DEFAULTS["push_to_talk"]} == {"say", "party"}
+    assert {b["channel"] for b in DEFAULTS["push_to_talk"]} == {"say", "party", "assistant"}
 
 
 # ----------------------------------------------------------------- config

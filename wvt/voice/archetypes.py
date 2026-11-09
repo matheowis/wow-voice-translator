@@ -95,9 +95,7 @@ RACES = {
                          "Female": "Skyborne elf woman from a floating island in the sky"}, "family": "airy",
                  "accents": ["crisp, aristocratic High Order", "breezy, free-spirited Windshaper", "precise, scholarly",
                              "ethereal, echoing", "proud, ringing sky-captain"]},
-    "Unknown": {"who": {"Male": "wandering adventurer", "Female": "wandering adventurer woman"}, "family": "normal",
-                "accents": ["General American", "Australian", "Scottish", "Northern English Mancunian", "Irish"]},
-}
+}  # no pool for an unknown race: such characters borrow Human voices (races.FALLBACK_RACE)
 LINES = [
     "Oh, this is it! Our first real dungeon together! Come on, come on, I'll grab the loot, you keep the healer "
     "alive. Let's go, let's go, before someone else gets there first!",

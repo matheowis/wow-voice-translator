@@ -53,6 +53,7 @@ class PushToTalkPipeline:
         self._rec_started = 0.0
         self.models_ready = threading.Event()
         self.last_timings: dict = {}
+        self.assistant = None  # wvt.assistant.Assistant: the "assistant" push-to-talk channel goes to her
 
     # ------------------------------------------------------------------ hotkey events
     @property
@@ -93,6 +94,8 @@ class PushToTalkPipeline:
 
     # ------------------------------------------------------------------ processing
     def _channel_label(self, channel: str) -> str:
+        if channel == "assistant":
+            return str(self.cfg.get("assistant.name", "Asystentka"))
         cmd = self.cfg.get(f"channels.{channel}", "")
         return f"{channel.upper()} ({cmd})" if cmd else channel.upper()
 
@@ -123,6 +126,21 @@ class PushToTalkPipeline:
             if not polish:
                 self.ui.status("info", "Nic nie rozpoznano", timeout=3)
                 return None
+
+            if channel == "assistant":  # her own key: no translation, she decides what to do
+                if self.assistant is None:
+                    self.ui.status("info", "Asystentka jest wyłączona", ["assistant.enabled w config.json"], timeout=4)
+                    return None
+                self.ui.status("busy", f"{self._channel_label(channel)} myśli…", [f"PL: {polish}"])
+                t1 = time.perf_counter()
+                reply, line = self.assistant.handle(polish)
+                timings["assistant_ms"] = round((time.perf_counter() - t1) * 1000)
+                self.last_timings = timings
+                item = HistoryItem(channel, polish, reply, line, timings, "assistant")
+                if self.cfg.get("privacy.keep_history", True):
+                    self.history.appendleft(item)
+                self.ui.result(item)
+                return item
 
             self.ui.status("busy", "Tłumaczenie…", [f"PL: {polish}"])
             t1 = time.perf_counter()

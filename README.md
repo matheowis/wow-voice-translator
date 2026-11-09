@@ -7,6 +7,7 @@ Głosowy tłumacz czatu do **World of Warcraft Forever**: mówisz po polsku, w c
 - Rozumie slang z czatu WoW (mb, wc, ty, LFM, WTS…).
 - Rozpoznawanie mowy i tłumaczenie działają na Twoim komputerze: bez internetu, kont i opłat.
 - Opcjonalnie: **głosy postaci**. Wiadomości z `/say` i `/party` czytane głosem pasującym do rasy i płci postaci (ElevenLabs, płatne). Dźwięk z `/say` jest cichszy, im dalej stoi postać.
+- **Asystentka głosowa**: na osobnym klawiszu mówisz do niej po polsku („zaproś tych, co piszą inv”, „co mi napisał?”, „ile mam złota?”), a ona odpowiada głosem i przygotowuje komendę w czacie.
 
 ## Czego potrzebujesz
 
@@ -41,6 +42,7 @@ Głosowy tłumacz czatu do **World of Warcraft Forever**: mówisz po polsku, w c
 |---|---|
 | przytrzymaj **`** (tylda, pod Esc) | mówisz → tekst po angielsku na **/say** |
 | przytrzymaj **Caps Lock** | mówisz → tekst po angielsku na **/party** |
+| przytrzymaj **boczny przycisk myszy 5** | rozmowa z asystentką (niżej) |
 | **Esc** w trakcie mówienia | anuluje |
 | **Enter** | wysyła tekst (aplikacja nigdy nie wysyła sama) |
 
@@ -51,7 +53,7 @@ Klawisze, mikrofon i inne ustawienia zmienisz w oknie aplikacji (dwuklik ikony p
 ## Głosy postaci (opcjonalne, ElevenLabs)
 
 1. Skopiuj plik `.env.example` jako `.env` i wpisz w nim swój klucz: `ELEVENLABS_API_KEY=...`. Plik `.env` nigdy nie trafia do repozytorium.
-2. Raz utwórz głosy (100 głosów w Twoim koncie ElevenLabs: 9 ras WoW Forever, w tym Skyborne z jedną pulą na obie odmiany, plus pula dla nieznanej rasy; po 5 na każdą płeć):
+2. Raz utwórz głosy (90 głosów w Twoim koncie ElevenLabs: 9 ras WoW Forever, w tym Skyborne z jedną pulą na obie odmiany, po 5 na każdą płeć):
 
    ```
    .venv\Scripts\python -m wvt.voice.design
@@ -64,7 +66,38 @@ Klawisze, mikrofon i inne ustawienia zmienisz w oknie aplikacji (dwuklik ikony p
 
    To samo robią komendy: `/wvt say`, `/wvt party`, `/wvt lang pl`. Panel przesuniesz, przeciągając go z wciśniętym Shift.
 
+Postać, której rasy gra nie poda, mówi głosem człowieka swojej płci, a gdy rasa się wyjaśni, raz przechodzi na głos swojej rasy.
+
 Przypisania głosów do postaci zapisują się w lokalnym MongoDB, jeśli jest zainstalowane, a jeśli nie, w folderze `data`. Dzienny limit znaków i głośność ustawisz w zakładce **Głosy** w oknie aplikacji.
+
+## Języki – kto mówi i pisze w jakim języku
+
+| Co | Język | Jak zmienić |
+|---|---|---|
+| To, co wysyłasz na czat (` i Caps Lock) | zawsze **angielski** – mówisz po polsku, aplikacja tłumaczy | – |
+| Tłumaczenie po najechaniu myszą na czat | **polski** | `/wvt on` / `/wvt off` |
+| Głosy innych graczy (/say, /party) | **EN** – oryginał po angielsku albo **PL** – tłumaczenie na polski | przycisk **Glos EN/PL** na panelu nad czatem, `/wvt lang pl` / `/wvt lang en` albo powiedz asystentce „przełącz na polski” |
+| Twoja postać (Twoje wiadomości) | w trybie EN powtarza Twoją wiadomość po angielsku swoim głosem, w trybie PL milczy | jak wyżej |
+| Asystentka | zawsze **polski** | – |
+
+Czytanie /say i /party włączasz osobno (**Say** / **Party** na panelu, `/wvt say on`, `/wvt party on`); wyłączone kanały nic nie kosztują.
+
+## Asystentka (Iskra)
+
+Przytrzymaj **boczny przycisk myszy 5** i powiedz po polsku, czego chcesz. Odpowie Ci głosem (ElevenLabs), a jeśli trzeba coś zrobić w grze, wpisze gotową komendę do czatu, np. `/wvt inv Ann Bob Cid`. **Wykonuje się dopiero po Twoim Enterze** (Esc anuluje).
+
+| Powiedz na przykład | Co się stanie |
+|---|---|
+| „zaproś ich”, „wyzapraszaj tych, co piszą inv” | zaprasza wszystkich, którzy w ostatnich 5 minutach pisali „inv me / inv pls” na say/yell albo w szepcie, ile zmieści się w party |
+| „zaproś Artasa”, „wyrzuć Bolka”, „daj lidera Jainie” | dobiera imię z czatu i grupy (rozumie odmianę: Artasa → Arthas) |
+| „zrób raid”, „opuść grupę”, „ready check” | komendy grupy (w walce i podczas bossa gra ich nie pozwala – powie Ci to) |
+| „kto chce inv?”, „co mi napisał?”, „co oni piszą?” | czyta po polsku szepty i streszcza czat |
+| „odpisz mu, że zaraz będę”, „napisz na party, że idę po wodę” | tłumaczy na angielski i wpisuje do czatu (`/w`, `/p`, `/s`…) |
+| „ile mam złota?”, „ile do levelu?”, „gdzie jestem?”, „ile miejsca w torbach?”, „kto jest w party?” | odpowiada z danych gry |
+| „wycisz głosy”, „przełącz na polski”, „wyłącz głosy na say”, „cicho” | steruje głosami postaci |
+| „co umiesz?” albo cokolwiek innego | krótka rozmowa (lokalny model – w faktach o grze może się mylić) |
+
+Jej głos wybierasz na stronie ocen głosów (sekcja *Asystentka*, daj 5 temu, który chcesz). Imię, klawisz i charakter zmienisz w `config.json` (sekcja `assistant`, np. `"persona_extra": "mów do mnie Mati"`) i w oknie aplikacji (*Ustawienia → Push-to-talk*, kanał `assistant`). W grze `/wvt asystent off` przestaje przekazywać jej czat i stan postaci.
 
 ## Coś nie działa?
 

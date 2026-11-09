@@ -36,10 +36,12 @@ _NOISE_RE = re.compile(r"^[\W_]+$")
 @dataclass
 class VoiceJob:
     pkt: protocol.Packet
-    channel: str  # say | party
+    channel: str  # say | party | assistant
     gain: float
     lang: str  # en | pl
     received: float = field(default_factory=time.monotonic)
+    voice_id: str = ""  # fixed voice (the assistant), otherwise the sender's voice
+    prepared: bool = False  # the text is final: no normalising, no translation
 
     @property
     def speaker(self) -> str:
@@ -133,6 +135,22 @@ class VoiceManager:
             self._cv.notify()
         return None
 
+    def say(self, text: str, voice_id: str, lang: str = "pl", gain: float = 1.0, speaker: str = "assistant") -> bool:
+        """Speak ready text with a fixed voice (the assistant).  False when it cannot be spoken."""
+        text = " ".join((text or "").split())
+        if not text or not voice_id or self._stop.is_set():
+            return False
+        if not self.budget.allows(len(text)):
+            self.stats["skipped:budget"] += 1
+            return False
+        pkt = protocol.Packet(type=protocol.TYPE_VOICE, seq=0, chat_kind=3, sender=speaker, text=text,
+                              flags=protocol.VFLAG_LANG_PL if lang == "pl" else 0)
+        job = VoiceJob(pkt, "assistant", gain, lang, voice_id=voice_id, prepared=True)
+        with self._cv:
+            self._queue.appendleft(job)  # an answer to you goes before chatter
+            self._cv.notify()
+        return True
+
     def enqueue_direct(self, pkt: protocol.Packet, gain: float = 1.0) -> None:
         """Test playback from the app window: no channel/duplicate/distance filters."""
         job = VoiceJob(pkt, "party", gain, "pl" if pkt.lang_pl else "en")
@@ -141,6 +159,8 @@ class VoiceManager:
             self._cv.notify()
 
     def _filter(self, pkt: protocol.Packet) -> tuple[Optional[str], Optional[VoiceJob]]:
+        if pkt.no_speak:
+            return "log-only", None  # a line only the assistant reads
         if not self.enabled or self.muted:
             return "off", None
         kind = pkt.chat_kind_name
@@ -215,6 +235,8 @@ class VoiceManager:
     def _speech_text(self, job: VoiceJob) -> tuple[str, str, str]:
         """(text to speak, language code, how it was prepared)."""
         text = job.pkt.text.strip()
+        if job.prepared:
+            return (self.normalizer.respell_pl(text) if job.lang == "pl" else text), job.lang, "prepared"
         if job.lang == "pl" and self.translator is not None:
             try:
                 res = self.translator.translate(text, "en-pl")
@@ -227,10 +249,14 @@ class VoiceManager:
 
     def _speak(self, job: VoiceJob) -> None:
         pkt = job.pkt
-        assignment = self.resolver.resolve(pkt.sender, pkt.race, pkt.sex)
-        if assignment is None:
-            self._skip(pkt, "no-voices")
-            return
+        if job.voice_id:
+            voice_id = job.voice_id
+        else:
+            assignment = self.resolver.resolve(pkt.sender, pkt.race, pkt.sex)
+            if assignment is None:
+                self._skip(pkt, "no-voices")
+                return
+            voice_id = assignment.voice_id
         speak, lang_code, prep = self._speech_text(job)
         limit = int(self.cfg.get("max_chars_per_message", 220))
         if len(speak) > limit:
@@ -242,7 +268,7 @@ class VoiceManager:
         cancel = threading.Event()
         utter = self.mixer.play(job.gain)
         try:
-            for chunk in self.tts.stream_tts(assignment.voice_id, speak, lang_code, cancel=cancel,
+            for chunk in self.tts.stream_tts(voice_id, speak, lang_code, cancel=cancel,
                                              on_stats=stats_box.append):
                 if self._stop.is_set() or utter.cancelled:
                     cancel.set()
@@ -250,9 +276,9 @@ class VoiceManager:
                 utter.feed(chunk)
         except ElevenLabsError as exc:
             utter.cancel()
-            if exc.status == 404 and assignment.voice_id not in self._missing_voice_warned:
-                self._missing_voice_warned.add(assignment.voice_id)
-                log.warning("voice %s does not exist in ElevenLabs any more", assignment.voice_id)
+            if exc.status == 404 and voice_id not in self._missing_voice_warned:
+                self._missing_voice_warned.add(voice_id)
+                log.warning("voice %s does not exist in ElevenLabs any more", voice_id)
             raise
         finally:
             utter.finish()
@@ -261,7 +287,7 @@ class VoiceManager:
         self.stats["spoken"] += 1
         if stats:
             self.ttfa_ms.append(stats.ttfa_ms)
-        self._record(pkt, "spoken", gain=job.gain, lang=lang_code, voice_id=assignment.voice_id,
+        self._record(pkt, "spoken", gain=job.gain, lang=lang_code, voice_id=voice_id,
                      ttfa_ms=stats.ttfa_ms if stats else 0.0, chars=len(speak),
                      cost=stats.cost if stats else None, note=prep, text=speak)
         utter.wait(timeout=60)  # keeps this worker busy while the line plays
@@ -269,7 +295,7 @@ class VoiceManager:
     # ------------------------------------------------------------------ bookkeeping
     def _skip(self, pkt: protocol.Packet, reason: str) -> None:
         self.stats[f"skipped:{reason}"] += 1
-        if reason not in ("off", "channel", "duplicate"):
+        if reason not in ("off", "channel", "duplicate", "log-only"):
             self._record(pkt, f"skipped:{reason}")
 
     def _record(self, pkt: protocol.Packet, status: str, **kw) -> None:

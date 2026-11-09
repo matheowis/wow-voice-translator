@@ -1,5 +1,6 @@
 """Voice pipeline: distance curve, race pools, stable assignments, normalizer, manager, client, mixer."""
 
+import json
 import time
 from datetime import date
 
@@ -15,7 +16,7 @@ from wvt.voice.elevenlabs import ElevenLabsClient, ElevenLabsError
 from wvt.voice.manager import VoiceManager
 from wvt.voice.mixer import AudioMixer, Utterance
 from wvt.voice.normalizer import TTSNormalizer
-from wvt.voice.races import UNKNOWN, gender_of, pool_race
+from wvt.voice.races import POOL_RACES, UNKNOWN, gender_of, pool_race
 from wvt.voice.resolver import VoiceResolver, split_sender, stable_index
 from wvt.voice.store import JsonVoiceStore, VoiceProfile
 
@@ -44,7 +45,7 @@ def test_race_pools_and_sex():
 
 # --------------------------------------------------------------------------- resolver
 
-def _store(tmp_path, pools=(("Orc", "Male"), ("Unknown", "Male"), ("Unknown", "Female"))):
+def _store(tmp_path, pools=(("Orc", "Male"), ("Human", "Male"), ("Human", "Female"))):
     store = JsonVoiceStore(tmp_path)
     for race, gender in pools:
         for slot in range(1, 6):
@@ -69,8 +70,9 @@ def test_same_character_keeps_its_voice_after_restart(tmp_path):
 def test_unknown_race_is_migrated_once_unless_overridden(tmp_path):
     store = _store(tmp_path)
     r = VoiceResolver(store)
-    first = r.resolve("Mystery", "", 2)
-    assert first.voice_id.startswith("Unknown-Male-") and first.race == UNKNOWN
+    first = r.resolve("Mystery", "", 2)  # no Unknown pool any more: a Human voice of the right gender
+    assert first.voice_id.startswith("Human-Male-") and first.race == UNKNOWN
+    assert "Unknown" not in POOL_RACES
     later = r.resolve("Mystery", "Orc", 2)
     assert later.migrated and later.voice_id.startswith("Orc-Male-")
     doc = store.get_player("Forever", "mystery")
@@ -479,3 +481,183 @@ def test_round3_briefs_follow_the_lessons_of_the_ratings():
                 assert "nasal" not in text
         if race == "Undead":
             assert any(w in text for w in ("rasp", "torn", "pain", "shredded", "crack", "broken", "ravaged", "wheez"))
+
+
+# --------------------------------------------------------------------------- round 4: locks and candidates
+
+def _pool(store, race="Gnome", gender="Female", ratings=(5, 1, 1, 4, 0)):
+    for slot, score in enumerate(ratings, start=1):
+        store.save_profile(VoiceProfile(f"{race}-{gender}-{slot}", race, gender, slot, rating=score,
+                                        locked=score == 5))
+
+
+def _cand(vid, race="Gnome", gender="Female", status="open"):
+    return {"voiceId": vid, "race": race, "gender": gender, "label": vid, "description": f"brief {vid}",
+            "status": status}
+
+
+def test_profile_keeps_rating_and_lock(tmp_path):
+    store = JsonVoiceStore(tmp_path)
+    store.save_profile(VoiceProfile("v1", "Orc", "Male", 1, rating=5, locked=True))
+    store.save_profile(VoiceProfile("v2", "Orc", "Male", 2))
+    again = {p.voice_id: p for p in JsonVoiceStore(tmp_path).load_profiles()}
+    assert (again["v1"].rating, again["v1"].locked) == (5, True)
+    assert (again["v2"].rating, again["v2"].locked) == (0, False)
+    old_doc = {"voiceId": "v3", "race": "Orc", "gender": "Male", "slot": 3}  # written before round 4
+    assert VoiceProfile.from_doc(old_doc).locked is False
+
+
+def test_design_never_touches_locked_slots():
+    from wvt.voice.design import plan_slots
+
+    by_slot = {("Orc", "Male", s): VoiceProfile(f"o{s}", "Orc", "Male", s, rating=5 if s < 3 else 2, locked=s < 3)
+               for s in range(1, 6)}
+    todo, skipped = plan_slots(by_slot, ["Orc"], ["Male"], 5, True, set(), set())
+    assert sorted(todo[("Orc", "Male")]) == [3, 4, 5] and sorted(skipped) == ["Orc Male 1", "Orc Male 2"]
+    todo, skipped = plan_slots(by_slot, ["Orc"], ["Male"], 5, True, set(), {("Orc", "Male", 1)})
+    assert todo == {} and skipped == ["Orc Male 1"]
+
+
+def test_round_plan_locks_fives_and_fills_open_slots_with_better_candidates():
+    from wvt.voice.candidates import CHOSEN, REJECTED, SPARE, plan_round
+
+    profiles = [VoiceProfile(f"g{s}", "Gnome", "Female", s) for s in range(1, 6)]
+    ratings = {"g1": {"score": 5}, "g2": {"score": 1}, "g3": {"score": 2}, "g4": {"score": 4},  # g5: not rated
+               "c-five": {"score": 5, "updatedAt": "2026-11-08T10:00:00Z"},
+               "c-four": {"score": 4}, "c-two": {"score": 2}, "c-late-five": {"score": 5, "updatedAt": "2026-11-08T11"}}
+    cands = [_cand("c-five"), _cand("c-four"), _cand("c-two"), _cand("c-late-five"), _cand("c-unrated")]
+    plan = plan_round(profiles, cands, ratings)
+    assert {p.voice_id: (p.rating, p.locked) for p in plan.rated} == {
+        "g1": (5, True), "g2": (1, False), "g3": (2, False), "g4": (4, False)}
+    moves = {pr.old.voice_id: (pr.new.voice_id, pr.new.slot, pr.new.locked) for pr in plan.promotions}
+    # the 5s take the worst slots first and lock them; the 4 still beats nothing (g4 is a 4 already)
+    assert moves == {"g2": ("c-five", 2, True), "g3": ("c-late-five", 3, True)}
+    assert plan.statuses == {"c-five": CHOSEN, "c-late-five": CHOSEN, "c-four": REJECTED, "c-two": REJECTED}
+    assert "c-unrated" not in plan.statuses  # waits for the user
+    # an unrated slot is never replaced, an extra 5 with no open slot left is kept aside
+    full = plan_round(profiles, cands + [_cand("c-extra")], dict(ratings, **{"c-four": {"score": 5},
+                                                                               "c-extra": {"score": 5}}))
+    assert {pr.old.voice_id for pr in full.promotions} == {"g2", "g3", "g4"}
+    assert list(full.statuses.values()).count(SPARE) == 1
+
+
+def test_a_better_candidate_below_five_replaces_but_keeps_the_slot_open():
+    from wvt.voice.candidates import plan_round
+
+    profiles = [VoiceProfile("h3", "Human", "Female", 3, rating=1)]
+    plan = plan_round(profiles, [_cand("c4", "Human"), _cand("c3", "Human")], {"c4": {"score": 4}, "c3": {"score": 3}})
+    assert [(pr.old.voice_id, pr.new.voice_id, pr.new.locked) for pr in plan.promotions] == [("h3", "c4", False)]
+    # next round a 5 replaces the 4 and closes the slot
+    now = [VoiceProfile("c4", "Human", "Female", 3, rating=4)]
+    plan = plan_round(now, [_cand("c5", "Human")], {"c4": {"score": 4}, "c5": {"score": 5}})
+    assert [(pr.old.voice_id, pr.new.voice_id, pr.new.locked) for pr in plan.promotions] == [("c4", "c5", True)]
+
+
+def test_apply_moves_players_and_records_everything(tmp_path):
+    from wvt.voice.candidates import CandidateFile, apply_plan, load_ratings, plan_round, pool_rows
+
+    store = JsonVoiceStore(tmp_path / "store")
+    _pool(store, ratings=(0, 0, 0, 0, 0))
+    VoiceResolver(store).resolve("Tinka", "Gnome", 3)
+    tinka = store.get_player("Forever", "tinka")
+    rdir = tmp_path / "export" / "ratings"
+    rdir.mkdir(parents=True)
+    raw = {"Gnome-Female-1": 5, "Gnome-Female-2": 5, "Gnome-Female-3": 5, "Gnome-Female-4": 5,
+           "Gnome-Female-5": 1, "cand-a": 5}
+    for vid, score in raw.items():
+        (rdir / f"{vid}.json").write_text(f'{{"score": {score}, "note": "ok"}}', encoding="utf-8")
+    (rdir / "wrapped.json").write_text('{"id": "cand-b", "data": {"score": 2, "note": "dziwny"}}', encoding="utf-8")
+    ratings = load_ratings(tmp_path / "export")
+    assert ratings["cand-b"]["note"] == "dziwny" and ratings["cand-a"]["score"] == 5
+    cands = CandidateFile(tmp_path / "voice_candidates.json")
+    cands.add(_cand("cand-a"))
+    cands.add(_cand("cand-b"))
+    cands.add(_cand("cand-never-heard"))  # not rated, but its character closes
+    log = tmp_path / "replaced_voices.json"
+    apply_plan(plan_round(store.load_profiles(), cands.items, ratings), ratings, store, None, cands, log)
+    slot5 = next(p for p in store.load_profiles() if p.slot == 5)
+    assert (slot5.voice_id, slot5.locked, slot5.rating) == ("cand-a", True, 5)
+    rows = pool_rows(store.load_profiles(), cands.items)
+    assert rows[0]["closed"] and rows[0]["locked"] == 5
+    states = {c["voiceId"]: (c["status"], c.get("slot"), c.get("score")) for c in CandidateFile(cands.path).items}
+    assert states == {"cand-a": ("chosen", 5, 5), "cand-b": ("rejected", None, 2),
+                      "cand-never-heard": ("unused", None, None)}
+    assert json.loads(log.read_text(encoding="utf-8"))[0]["replaced"] == "Gnome-Female-5"
+    if tinka["voiceId"] == "Gnome-Female-5":  # a character on the replaced voice moved with the slot
+        assert store.get_player("Forever", "tinka")["voiceId"] == "cand-a"
+
+
+def test_candidate_briefs_follow_what_the_ratings_taught():
+    import re
+
+    from wvt.voice.briefs import CANDIDATE_BRIEFS
+
+    everyone = ("ethereal", "echo", "squeaky", "high-pitched", "child")
+    women = ("nasal", "sing-song", "raspy", "cracked", "crackly", "gravelly", "elderly", "old ", "sixties", "seventies",
+             "frail", "husky", "sly")
+    men = ("young adult", "breathy", "tenor")
+    zombie = ("rot", "gurgl", "rattl", "rasp", "torn", "decay", "wheez", "croak", "hollow", "ragged", "strained")
+    for (race, gender), briefs in CANDIDATE_BRIEFS.items():
+        assert len(briefs) >= 5 and len({b["label"] for b in briefs}) == len(briefs)
+        if race == "Undead":  # "zombi, rozjebany głos, trochę zza światów": wrecked and a little ghostly
+            banned = ("squeaky", "high-pitched", "child", "young adult", "breathy")
+        elif race == "Assistant":  # "sexy, młoda, charyzmatyczna" - a husky voice is wanted here
+            banned = everyone + ("nasal", "sing-song", "raspy", "cracked", "elderly", "old ")
+            assert all("polish" in b["brief"].lower() and "native" in b["brief"].lower() for b in briefs)
+        elif race == "Orc" and gender == "Female":  # the kept orc women are rough; the sly, growling one was not
+            banned = everyone + ("nasal", "sing-song", "elderly", "old ", "husky", "sly", "growl")
+        else:
+            banned = everyone + (women if gender == "Female" else men + (() if race == "Gnome" else ("nasal",)))
+        for b in briefs:
+            text = b["brief"].lower()
+            assert 100 <= len(b["line"]) <= 1000
+            # a banned word at the start of a word ("old" must not hit "cold")
+            assert not [w for w in banned if re.search(r"\b" + re.escape(w.strip()), text)], (race, gender, b["label"])
+            if race == "Undead":
+                assert any(w in text for w in zombie), b["label"]
+                continue
+            # the living: an explicit adult age, never older than the fifties
+            assert re.search(r"twenties|thirties|forties|fifties|around (twenty|thirty)", text), (race, b["label"])
+        if race == "Troll" and gender == "Female":  # the kept troll matron was described by her body
+            assert all("troll" in b["brief"].lower() and "tusk" in b["brief"].lower() for b in briefs)
+
+
+def test_near_duplicate_candidates_are_dropped():
+    from wvt.voice.candidates import near_duplicates
+
+    rng = np.random.default_rng(7)
+    base = {k: _unit(rng.normal(size=256)) for k in ("locked", "a", "b", "d")}
+    locked = {"L1": base["locked"]}
+    cands = {
+        "copy-of-locked": _unit(base["locked"] + 0.3 * _unit(rng.normal(size=256))),
+        "twin-1": _unit(base["a"] + 0.2 * _unit(rng.normal(size=256))),
+        "twin-2": _unit(base["a"] + 0.2 * _unit(rng.normal(size=256))),
+        "own-voice": base["d"],
+    }
+    drop = near_duplicates(locked, cands)
+    assert drop["copy-of-locked"][0] == "L1"
+    assert ("twin-1" in drop) != ("twin-2" in drop)  # exactly one of the twins goes...
+    loser = "twin-1" if "twin-1" in drop else "twin-2"
+    assert drop[loser][0] == ("twin-2" if loser == "twin-1" else "twin-1")  # ...naming the one that stays
+    assert "own-voice" not in drop
+    assert near_duplicates(locked, {"own-voice": base["d"]}) == {}
+
+
+def test_the_assistant_voice_is_the_first_one_rated_five():
+    from wvt.voice.candidates import assistant_pick
+
+    cands = [_cand("a1", race="Assistant"), _cand("a2", race="Assistant"), _cand("g1", race="Gnome")]
+    ratings = {"a1": {"score": 5, "updatedAt": "2026-11-08T20:05"}, "a2": {"score": 5, "updatedAt": "2026-11-08T20:01"},
+               "g1": {"score": 5, "updatedAt": "2026-11-08T19:00"}}
+    assert assistant_pick(cands, ratings)["voiceId"] == "a2"
+    assert assistant_pick(cands, {"a1": {"score": 4}}) is None
+
+
+def test_assistant_lines_are_never_spoken_and_her_answers_use_her_voice(mgr):
+    m, tts, mixer, _ = mgr
+    chat_only = P.Packet(type=P.TYPE_CHAT, seq=2, chat_kind=1, sender="Ann", race="Human", sex=3, text="inv me")
+    assert m.on_packet(chat_only) == "log-only"
+    assert m.say("Mam trzech chętnych, Enter i zapraszam.", "voice-iskra", "pl", 1.0, speaker="Iskra")
+    assert _wait(lambda: m.stats["spoken"] == 1)
+    assert tts.calls == [("voice-iskra", "Mam trzech chętnych, Enter i zapraszam.", "pl")]
+    assert not m.say("", "voice-iskra") and not m.say("tekst", "")

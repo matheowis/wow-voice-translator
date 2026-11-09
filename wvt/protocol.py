@@ -23,6 +23,11 @@ first one.  It carries TYPE_VOICE packets: new /say and /party messages the play
 (with the in-game toggles) to hear spoken.  The addon shows each one for ~0.2 s, one after
 another, so hover packets and voice packets never compete for the same pixels.
 
+The same grid also carries what the voice assistant needs: chat lines nobody asked to hear
+(TYPE_CHAT - whispers, /yell, /say while its voice toggle is off...; same layout as TYPE_VOICE,
+but a type of its own, so an older app that does not know it can never read them aloud) and,
+every few seconds, a TYPE_STATE packet with the player's level, money, zone, bags and group.
+
 This module is the single source of truth; ``addon/WoWVoiceTranslator/Protocol.lua``
 implements the same encoder and ``tests/test_protocol.py`` runs the Lua code through
 ``lupa`` to prove that both sides agree.
@@ -51,11 +56,26 @@ TYPE_HOVER = 1  # full packet: geometry + text of the hovered chat line
 TYPE_KEEP = 2  # compact "still hovering the same line" packet
 TYPE_TEST = 3  # /wvt test – connection check, same layout as HOVER
 TYPE_VOICE = 4  # new /say or /party message to read aloud (second grid)
+TYPE_STATE = 5  # player state for the voice assistant (second grid)
+TYPE_CHAT = 6  # a chat line only for the assistant's log, never spoken (layout of TYPE_VOICE)
 
 FLAG_SECRET = 0x01  # message text is a Midnight "secret value" – unreadable for addons
 FLAG_TRUNCATED = 0x02  # text had to be shortened to fit the grid
 VFLAG_SELF = 0x04  # voice packet: the player wrote this message
 VFLAG_LANG_PL = 0x08  # voice packet: in-game toggle says "speak Polish translations"
+
+# TYPE_STATE flags
+SFLAG_GROUP = 0x01  # in a party or raid
+SFLAG_RAID = 0x02
+SFLAG_LEADER = 0x04  # the player leads the group
+SFLAG_RESTRICTED = 0x08  # an addon restriction is active (combat, boss, M+, PvP match): no kick/lead/raid/ready
+SFLAG_COMBAT = 0x10
+MAX_NAME_BYTES = 48
+MAX_ZONE_BYTES = 64
+MAX_MEMBERS = 4
+# magic 2 + version/type 2 + seq 2 + flags 1 + level 1 + xp 4 + xp_max 4 + gold 4 + silver_copper 2
+# + bag_free 1 + bag_slots 1 + group_size 1
+STATE_FIXED_BYTES = 25
 
 # voice grid position: right of the hover grid, same top edge
 VOICE_GRID_X_CELLS = COLS + 2
@@ -132,6 +152,8 @@ class Packet:
     distance: Optional[float] = None  # yards, None = unknown
     dist_method: int = DIST_NONE
     extra: dict = field(default_factory=dict)
+    # TYPE_STATE only
+    state: Optional["GameState"] = None
 
     @property
     def is_secret(self) -> bool:
@@ -146,12 +168,57 @@ class Packet:
         return bool(self.flags & VFLAG_LANG_PL)
 
     @property
+    def no_speak(self) -> bool:
+        return self.type == TYPE_CHAT
+
+    @property
     def chat_kind_name(self) -> str:
         return CHAT_KINDS.get(self.chat_kind, "OTHER")
 
     def identity(self) -> tuple:
         """Value used by the app to decide whether the hovered line changed."""
         return (self.seq, self.prefix, self.text, round(self.left, 1), round(self.bottom, 1))
+
+
+@dataclass
+class GameState:
+    """What the addon reports about the player (TYPE_STATE)."""
+
+    flags: int = 0
+    level: int = 0
+    xp: int = 0
+    xp_max: int = 0
+    gold: int = 0
+    silver_copper: int = 0  # silver * 100 + copper
+    bag_free: int = 0
+    bag_slots: int = 0
+    group_size: int = 0  # GetNumGroupMembers(), 0 when solo
+    name: str = ""
+    zone: str = ""
+    subzone: str = ""
+    members: list[str] = field(default_factory=list)  # other party members (not in a raid)
+
+    @property
+    def in_group(self) -> bool:
+        return bool(self.flags & SFLAG_GROUP)
+
+    @property
+    def in_raid(self) -> bool:
+        return bool(self.flags & SFLAG_RAID)
+
+    @property
+    def is_leader(self) -> bool:
+        return bool(self.flags & SFLAG_LEADER)
+
+    @property
+    def restricted(self) -> bool:
+        return bool(self.flags & SFLAG_RESTRICTED)
+
+    @property
+    def free_party_slots(self) -> int:
+        if self.in_raid:
+            return max(0, 40 - self.group_size)
+        return max(0, 5 - max(1, self.group_size))
 
 
 # --------------------------------------------------------------------------- helpers
@@ -178,6 +245,11 @@ def utf8_truncate(raw: bytes, limit: int) -> bytes:
 def _u16(v: float) -> int:
     v = int(v)
     return 0 if v < 0 else 65535 if v > 65535 else v
+
+
+def _u32(v: float) -> int:
+    v = int(v)
+    return 0 if v < 0 else 0xFFFFFFFF if v > 0xFFFFFFFF else v
 
 
 def _fixed10(v: float) -> int:
@@ -221,7 +293,7 @@ def encode_packet(p: Packet) -> bytes:
         body += prefix
         body += len(text).to_bytes(2, "big")
         body += text
-    elif p.type == TYPE_VOICE:
+    elif p.type in (TYPE_VOICE, TYPE_CHAT):
         race = utf8_truncate(p.race.encode("utf-8"), MAX_RACE_BYTES)
         sender = utf8_truncate(p.sender.encode("utf-8"), MAX_SENDER_BYTES)
         room = MAX_BYTES - VOICE_FIXED_BYTES - len(race) - 1 - len(sender) - 2 - 2
@@ -239,6 +311,24 @@ def encode_packet(p: Packet) -> bytes:
         body += sender
         body += len(text).to_bytes(2, "big")
         body += text
+    elif p.type == TYPE_STATE:
+        st = p.state or GameState()
+        body.append(st.flags & 0xFF)
+        body.append(max(0, min(255, int(st.level))))
+        for v in (st.xp, st.xp_max, st.gold):
+            body += _u32(v).to_bytes(4, "big")
+        body += _u16(st.silver_copper).to_bytes(2, "big")
+        for v in (st.bag_free, st.bag_slots, st.group_size):
+            body.append(max(0, min(255, int(v))))
+        for s_, limit in ((st.name, MAX_NAME_BYTES), (st.zone, MAX_ZONE_BYTES), (st.subzone, MAX_ZONE_BYTES)):
+            raw = utf8_truncate(s_.encode("utf-8"), limit)
+            body.append(len(raw))
+            body += raw
+        members = [utf8_truncate(m.encode("utf-8"), MAX_NAME_BYTES) for m in st.members[:MAX_MEMBERS]]
+        body.append(len(members))
+        for raw in members:
+            body.append(len(raw))
+            body += raw
     out = bytearray(MAGIC) + body
     out += fletcher16(bytes(body)).to_bytes(2, "big")
     if len(out) > MAX_BYTES:
@@ -353,7 +443,7 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         if total > MAX_BYTES:
             raise DecodeError("length out of range")
         data = read_bytes(total)
-    elif ptype == TYPE_VOICE:
+    elif ptype in (TYPE_VOICE, TYPE_CHAT):
         fixed = VOICE_FIXED_BYTES  # up to and including race_len
         data = read_bytes(fixed)
         race_len = data[-1]
@@ -370,6 +460,29 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         if total > MAX_BYTES:
             raise DecodeError("length out of range")
         data = read_bytes(total)
+    elif ptype == TYPE_STATE:
+        pos = STATE_FIXED_BYTES  # then name, zone, subzone (u8 length + bytes), member count, members
+        data = read_bytes(pos + 1)
+        for limit in (MAX_NAME_BYTES, MAX_ZONE_BYTES, MAX_ZONE_BYTES):
+            n = data[pos]
+            if n > limit:
+                raise DecodeError("state text length out of range")
+            pos += 1 + n
+            data = read_bytes(pos + 1)
+        count = data[pos]
+        if count > MAX_MEMBERS:
+            raise DecodeError("member count out of range")
+        pos += 1
+        for _ in range(count):
+            data = read_bytes(pos + 1)
+            n = data[pos]
+            if n > MAX_NAME_BYTES:
+                raise DecodeError("member name length out of range")
+            pos += 1 + n
+        total = pos + 2
+        if total > MAX_BYTES:
+            raise DecodeError("length out of range")
+        data = read_bytes(total)
     else:
         raise DecodeError(f"unknown type {ptype}")
 
@@ -380,8 +493,10 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
     seq = int.from_bytes(body[2:4], "big")
     if ptype == TYPE_KEEP:
         return Packet(type=ptype, seq=seq)
-    if ptype == TYPE_VOICE:
-        return _parse_voice(body, seq)
+    if ptype in (TYPE_VOICE, TYPE_CHAT):
+        return _parse_voice(body, seq, ptype)
+    if ptype == TYPE_STATE:
+        return _parse_state(body, seq)
 
     pos = 4
     flags = body[pos]
@@ -420,7 +535,7 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
     )
 
 
-def _parse_voice(body: bytes, seq: int) -> Packet:
+def _parse_voice(body: bytes, seq: int, ptype: int = TYPE_VOICE) -> Packet:
     pos = 4
     flags, kind, sex = body[pos], body[pos + 1], body[pos + 2]
     pos += 3
@@ -440,7 +555,7 @@ def _parse_voice(body: bytes, seq: int) -> Packet:
     pos += 2
     text = body[pos : pos + tlen].decode("utf-8", errors="replace")
     return Packet(
-        type=TYPE_VOICE,
+        type=ptype,
         seq=seq,
         flags=flags,
         chat_kind=kind,
@@ -451,6 +566,33 @@ def _parse_voice(body: bytes, seq: int) -> Packet:
         sender=sender,
         text=text,
     )
+
+
+def _parse_state(body: bytes, seq: int) -> Packet:
+    pos = 4
+    st = GameState(flags=body[pos], level=body[pos + 1])
+    pos += 2
+    st.xp, st.xp_max, st.gold = (int.from_bytes(body[pos + 4 * i : pos + 4 * i + 4], "big") for i in range(3))
+    pos += 12
+    st.silver_copper = int.from_bytes(body[pos : pos + 2], "big")
+    pos += 2
+    st.bag_free, st.bag_slots, st.group_size = body[pos], body[pos + 1], body[pos + 2]
+    pos += 3
+    texts = []
+    for _ in range(3):
+        n = body[pos]
+        pos += 1
+        texts.append(body[pos : pos + n].decode("utf-8", errors="replace"))
+        pos += n
+    st.name, st.zone, st.subzone = texts
+    count = body[pos]
+    pos += 1
+    for _ in range(count):
+        n = body[pos]
+        pos += 1
+        st.members.append(body[pos : pos + n].decode("utf-8", errors="replace"))
+        pos += n
+    return Packet(type=TYPE_STATE, seq=seq, flags=st.flags, state=st)
 
 
 def try_decode(img: np.ndarray, search: int = 3) -> Optional[Packet]:

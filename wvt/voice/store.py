@@ -2,8 +2,10 @@
 
 MongoDB (the local server by default) is the main store:
 
-* ``voice_profiles`` – ``{voiceId, race, gender, slot, enabled, description, name}``,
-  unique ``(race, gender, slot)`` and unique ``voiceId``;
+* ``voice_profiles`` – ``{voiceId, race, gender, slot, enabled, description, name, rating, locked}``,
+  unique ``(race, gender, slot)`` and unique ``voiceId``.  ``rating`` is the user's last score
+  of the voice (0 = not rated) and ``locked`` marks a voice rated 5: the voice design tools
+  never touch a locked slot, and a pool with five locked slots is closed;
 * ``player_voices`` – ``{realm, playerNameNormalized, playerNameDisplay, race, gender, voiceId,
   assignmentVersion, manuallyOverridden, createdAt, updatedAt}``, unique ``(realm, playerNameNormalized)``.
 
@@ -33,15 +35,19 @@ class VoiceProfile:
     enabled: bool = True
     description: str = ""
     name: str = ""
+    rating: int = 0  # the user's score 1-5 from the rating page, 0 = not rated yet
+    locked: bool = False  # rated 5: final, never redesigned
 
     def to_doc(self) -> dict:
         return {"voiceId": self.voice_id, "race": self.race, "gender": self.gender, "slot": int(self.slot),
-                "enabled": bool(self.enabled), "description": self.description, "name": self.name}
+                "enabled": bool(self.enabled), "description": self.description, "name": self.name,
+                "rating": int(self.rating), "locked": bool(self.locked)}
 
     @classmethod
     def from_doc(cls, d: dict) -> "VoiceProfile":
         return cls(voice_id=d["voiceId"], race=d["race"], gender=d["gender"], slot=int(d["slot"]),
-                   enabled=bool(d.get("enabled", True)), description=d.get("description", ""), name=d.get("name", ""))
+                   enabled=bool(d.get("enabled", True)), description=d.get("description", ""), name=d.get("name", ""),
+                   rating=int(d.get("rating") or 0), locked=bool(d.get("locked", False)))
 
 
 class MongoVoiceStore:

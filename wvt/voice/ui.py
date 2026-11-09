@@ -128,7 +128,7 @@ class VoiceTab(QWidget):
         test = QGroupBox("Próbka głosu")
         trow = QHBoxLayout(test)
         self.t_race = QComboBox()
-        self.t_race.addItems(list(POOL_RACES))
+        self.t_race.addItems(list(POOL_RACES) + ["Unknown"])  # Unknown: a sender without race
         self.t_gender = QComboBox()
         self.t_gender.addItems(list(GENDERS))
         self.t_lang = QComboBox()

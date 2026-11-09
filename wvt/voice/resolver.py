@@ -3,8 +3,9 @@
 1. an existing assignment wins (cache, then store);
 2. otherwise a slot of the race+gender pool is chosen deterministically from a SHA-256 of
    ``realm|name|race|gender`` (never Python's randomised ``hash()``) and stored atomically;
-3. an assignment made while race or sex was unknown is moved once to the right pool when
-   they become known - unless ``manuallyOverridden`` is set;
+3. a character of unknown race speaks with a voice of the fallback race (Human by default) of
+   its gender; an assignment made while race or sex was unknown is moved once to the right
+   pool when they become known - unless ``manuallyOverridden`` is set;
 4. changing the pools never changes stored voices; editing a player's ``voiceId`` (and
    setting ``manuallyOverridden``) in the store is the manual override;
 5. store errors never block speech: the deterministic choice is used and cached only.
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .races import GENDERS, UNKNOWN, gender_of, pool_race
+from .races import FALLBACK_RACE, GENDERS, UNKNOWN, gender_of, pool_race
 from .store import VoiceProfile
 
 log = logging.getLogger(__name__)
@@ -55,10 +56,12 @@ class Assignment:
 
 
 class VoiceResolver:
-    def __init__(self, store, default_realm: str = "Forever", race_aliases: Optional[dict] = None):
+    def __init__(self, store, default_realm: str = "Forever", race_aliases: Optional[dict] = None,
+                 fallback_race: str = FALLBACK_RACE):
         self.store = store
         self.default_realm = default_realm
         self.aliases = dict(race_aliases or {})
+        self.fallback_race = fallback_race or FALLBACK_RACE
         self._cache: dict[tuple[str, str], dict] = {}
         self._pools: dict[tuple[str, str], list[VoiceProfile]] = {}
         self._lock = threading.Lock()
@@ -85,7 +88,7 @@ class VoiceResolver:
 
     def _pool_for(self, race: str, gender: str, key: str) -> list[VoiceProfile]:
         g = gender if gender in GENDERS else GENDERS[stable_index(key + "|gender", 2)]
-        for k in ((race, g), (UNKNOWN, g)):
+        for k in ((race, g), (self.fallback_race, g)):
             if self._pools.get(k):
                 return self._pools[k]
         same_gender = [p for (r, gg), ps in sorted(self._pools.items()) if gg == g for p in ps]

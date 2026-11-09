@@ -263,9 +263,18 @@ def test_strip_markup_and_split(lua):
 
 # --------------------------------------------------------------------------- voice relay
 
-def voice_packet(g):
+def grid_packet(g):
+    """Whatever the voice grid shows right now (spoken line, assistant-only line or state)."""
     cells = grab_cells(g, "WoWVoiceTranslatorVoiceSignal")
     return None if cells is None else P.decode_image(P.render_cells(cells))
+
+
+def voice_packet(g):
+    """The line on the voice grid if it is meant to be spoken (the assistant's packets ignored)."""
+    pkt = grid_packet(g)
+    if pkt is None or pkt.type != P.TYPE_VOICE:
+        return None
+    return pkt
 
 
 def fire(mock, event, *args):
@@ -290,6 +299,11 @@ def voice(lua):
     def slash(cmd):
         g.SlashCmdList["WOWVOICETRANSLATOR"](cmd)
 
+    # the assistant's first state packet goes out right after login; let it pass (mouse off the chat)
+    mock.mouseLine = None
+    for _ in range(3):
+        driver_tick(mock, 0.25)
+    assert grid_packet(g) is None
     return rt, g, mock, add_player, slash
 
 
@@ -422,3 +436,126 @@ def test_lua_voice_encoder_matches_python(lua):
         py = P.Packet(type=4, seq=300, flags=12, chat_kind=3, sex=2, distance=dist, dist_method=1,
                       race="Scourge", sender="Zo\u00eb-Forever", text="r u ready? \u017c" * 40)
         assert lua_bytes == P.encode_packet(py)
+
+
+def test_lua_state_encoder_matches_python(lua):
+    rt, _, _ = lua
+    lp = _lua_protocol(rt)
+    members = rt.table_from(["Arthas", "Jaina-Kazzak", "Zoë", "Thrall", "Fifth-Ignored"])
+    fields = {"type": 5, "seq": 41, "flags": 1 + 4 + 8, "level": 23, "xp": 12345, "xpMax": 400000, "gold": 70000,
+              "silverCopper": 4567, "bagFree": 11, "bagSlots": 64, "groupSize": 5, "name": "Mateusz",
+              "zone": "Elwynn Forest", "subzone": "Goldshire " + "ż" * 40, "members": members}
+    lua_bytes = bytes(int(v) for v in lp.EncodePacket(rt.table_from(fields)).values())
+    st = P.GameState(flags=13, level=23, xp=12345, xp_max=400000, gold=70000, silver_copper=4567, bag_free=11,
+                     bag_slots=64, group_size=5, name="Mateusz", zone="Elwynn Forest",
+                     subzone="Goldshire " + "ż" * 40, members=["Arthas", "Jaina-Kazzak", "Zoë", "Thrall"])
+    assert lua_bytes == P.encode_packet(P.Packet(type=5, seq=41, state=st))
+    decoded = P.decode_bytes(lua_bytes) if hasattr(P, "decode_bytes") else None
+    if decoded is not None:
+        assert decoded.state.members[-1] == "Thrall" and decoded.state.subzone.startswith("Goldshire")
+
+
+# --------------------------------------------------------------------------- voice assistant
+
+GROUP_MOCK = r"""
+local mock = WVT_MOCK
+mock.calls = {}
+mock.group = { size = 0, raid = false, leader = false, restricted = false }
+local function record(name) return function(...) mock.calls[#mock.calls + 1] = { name, ... } end end
+C_PartyInfo = { InviteUnit = record("InviteUnit"), UninviteUnit = record("UninviteUnit"),
+                PromoteToLeader = record("PromoteToLeader"), ConvertToRaid = record("ConvertToRaid"),
+                LeaveParty = record("LeaveParty"), DoReadyCheck = record("DoReadyCheck") }
+Enum = { AddOnRestrictionType = { Combat = 0, Encounter = 1, ChallengeMode = 2, PvPMatch = 3 } }
+C_RestrictedActions = { IsAddOnRestrictionActive = function(kind) return mock.group.restricted and kind == 0 end }
+function InCombatLockdown() return mock.group.restricted end
+function IsInGroup() return mock.group.size > 0 end
+function IsInRaid() return mock.group.raid end
+function UnitIsGroupLeader(unit) return unit == "player" and mock.group.leader end
+function GetNumGroupMembers() return mock.group.size end
+function UnitName(unit)
+  local names = { player = "Mateusz", party1 = "Arthas", party2 = "Jaina" }
+  if unit == "party2" then return "Jaina", "Kazzak" end
+  return names[unit]
+end
+function UnitLevel() return 23 end
+function UnitXP() return 12345 end
+function UnitXPMax() return 40000 end
+function GetMoney() return 1234567 end
+function GetZoneText() return "Elwynn Forest" end
+function GetSubZoneText() return "Goldshire" end
+C_Container = { GetContainerNumFreeSlots = function(bag) return 3 end, GetContainerNumSlots = function(bag) return 16 end }
+"""
+
+
+@pytest.fixture()
+def assistant(voice):
+    rt, g, mock, add_player, slash = voice
+    rt.execute(GROUP_MOCK)
+    return rt, g, mock, add_player, slash
+
+
+def _calls(mock):
+    return [tuple(v for v in c.values()) for c in mock.calls.values()]
+
+
+def test_unspoken_chat_reaches_the_assistant_marked_never_speak(assistant):
+    _, g, mock, add_player, _ = assistant
+    fire(mock, "CHAT_MSG_WHISPER", *say_args("inv pls", "Bob-Kazzak", "Player-1-BOB", 0))
+    driver_tick(mock)
+    pkt = grid_packet(g)
+    assert pkt.type == P.TYPE_CHAT and pkt.no_speak and pkt.chat_kind_name == "WHISPER"
+    assert (pkt.sender, pkt.text) == ("Bob-Kazzak", "inv pls")
+    assert voice_packet(g) is None  # nothing for the voices: costs no credits
+
+
+def test_assistant_can_be_switched_off(assistant):
+    _, g, mock, _, slash = assistant
+    slash("asystent off")
+    fire(mock, "CHAT_MSG_SAY", *say_args("inv me", "Bob", "Player-1-BOB"))
+    for _ in range(3):
+        driver_tick(mock, 0.25)
+        assert grid_packet(g) is None
+
+
+def test_state_packet_describes_the_player_and_group(assistant):
+    _, g, mock, _, _ = assistant
+    mock.group.size, mock.group.leader = 3, True
+    fire(mock, "GROUP_ROSTER_UPDATE")
+    seen = None
+    for _ in range(6):
+        driver_tick(mock, 0.25)
+        pkt = grid_packet(g)
+        if pkt is not None and pkt.type == P.TYPE_STATE:
+            seen = pkt.state
+            break
+    assert seen is not None
+    assert (seen.level, seen.xp, seen.xp_max, seen.gold, seen.silver_copper) == (23, 12345, 40000, 123, 4567)
+    assert (seen.bag_free, seen.bag_slots, seen.zone, seen.subzone) == (15, 80, "Elwynn Forest", "Goldshire")
+    assert seen.in_group and seen.is_leader and not seen.restricted and seen.group_size == 3
+    assert seen.name == "Mateusz" and seen.members == ["Arthas", "Jaina-Kazzak"]
+
+
+def test_invite_command_fills_the_party_and_names_the_rest(assistant):
+    _, g, mock, _, slash = assistant
+    slash("inv Ann Bob Cid Dan Eve")
+    assert [c[1] for c in _calls(mock)] == ["Ann", "Bob", "Cid", "Dan"]  # solo: 4 free party slots
+    assert any("Eve" in str(m) for m in mock.prints.values())
+
+
+def test_kick_lead_raid_and_ready_respect_restrictions_and_leadership(assistant):
+    _, g, mock, _, slash = assistant
+    mock.group.size, mock.group.leader, mock.group.restricted = 3, True, True
+    slash("kick Arthas")
+    assert _calls(mock) == []  # in combat: refused, and said so
+    assert "walka" in str(list(mock.prints.values())[-1])
+    mock.group.restricted = False
+    slash("kick Arthas")
+    slash("lead Jaina-Kazzak")
+    slash("raid")
+    slash("ready")
+    assert [c[0] for c in _calls(mock)] == ["UninviteUnit", "PromoteToLeader", "ConvertToRaid", "DoReadyCheck"]
+    mock.group.leader = False
+    slash("kick Jaina")
+    assert len(_calls(mock)) == 4  # not the leader any more
+    slash("leave")
+    assert _calls(mock)[-1][0] == "LeaveParty"

@@ -12,6 +12,12 @@
 --     one, with the sender's race, sex and - for /say - distance.  The app speaks it with
 --     a voice that fits the character (ElevenLabs), in English or translated to Polish.
 --     Channels that are switched off are never sent, so they cost nothing.
+--   * voice assistant (desktop app, own push-to-talk key): /say, /yell, whispers and party
+--     lines are passed on the same grid as "chat only" packets, plus a small state packet
+--     (level, money, zone, bags, group).  She prepares commands such as "/wvt inv A B" in
+--     the chat box; they run only when you press Enter: invite, kick, give lead, raid,
+--     leave, ready check - the normal party API, refused politely during combat, boss
+--     fights, M+ and PvP matches (Midnight addon restrictions).
 --
 -- What it does NOT do: no protected/secure calls, no chat sending, no automation.
 -- Messages that the game marks as "secret values" (Midnight rules, e.g. during
@@ -44,6 +50,7 @@ local defaults = {
 	--                    "pl": hear others translated to Polish (your own lines stay silent)
 	panelShown = true,
 	voiceDebug = false,
+	assistant = true, -- pass chat lines and the player's state to the voice assistant (never spoken, free)
 }
 
 local KIND = {
@@ -78,6 +85,28 @@ local VOICE_EVENTS = {
 	CHAT_MSG_PARTY = "party",
 	CHAT_MSG_PARTY_LEADER = "party",
 }
+
+-- chat the voice assistant reads (who asked for an invite, whispers...): sent as TYPE_CHAT
+-- (never spoken) unless the line is spoken anyway
+local ASSISTANT_EVENTS = {
+	CHAT_MSG_SAY = true,
+	CHAT_MSG_YELL = true,
+	CHAT_MSG_WHISPER = true,
+	CHAT_MSG_WHISPER_INFORM = true,
+	CHAT_MSG_PARTY = true,
+	CHAT_MSG_PARTY_LEADER = true,
+	CHAT_MSG_RAID = true,
+	CHAT_MSG_RAID_LEADER = true,
+}
+-- anything that changes what the state packet says
+local STATE_EVENTS = {
+	"PLAYER_ENTERING_WORLD", "PLAYER_MONEY", "PLAYER_XP_UPDATE", "PLAYER_LEVEL_UP", "ZONE_CHANGED",
+	"ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED_INDOORS", "BAG_UPDATE_DELAYED", "GROUP_ROSTER_UPDATE",
+	"PARTY_LEADER_CHANGED", "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED", "ADDON_RESTRICTION_STATE_CHANGED",
+}
+local LOG_QUEUE_MAX = 12
+local STATE_MIN_SECONDS = 1.0 -- at most one state packet per second...
+local STATE_HEARTBEAT_SECONDS = 20 -- ...and at least one every 20 s, so a freshly started app knows
 
 local db = defaults
 
@@ -454,15 +483,23 @@ end
 ---------------------------------------------------------------------------- voice relay
 
 local voiceQueue = {}
+local logQueue = {} -- assistant-only lines: shown when no spoken line is waiting
 local voiceShownUntil = 0
 local voiceSeq = 0
 local voiceStats = { sent = 0, dropped = 0, last = nil }
+local stateDirty, lastStateAt, stateSeq = true, -1000, 0
+local BuildStatePacket -- defined with the assistant helpers below
 
 local function VoiceTick(now)
 	if voiceShownUntil > 0 and now < voiceShownUntil then
 		return
 	end
-	local nextBytes = table.remove(voiceQueue, 1)
+	local nextBytes = table.remove(voiceQueue, 1) or table.remove(logQueue, 1)
+	if not nextBytes and db.assistant and BuildStatePacket
+		and ((stateDirty and now - lastStateAt >= STATE_MIN_SECONDS) or now - lastStateAt >= STATE_HEARTBEAT_SECONDS) then
+		nextBytes = BuildStatePacket()
+		stateDirty, lastStateAt = false, now
+	end
 	if nextBytes then
 		voiceGrid:ShowBytes(nextBytes)
 		voiceShownUntil = now + VOICE_PACKET_SECONDS
@@ -479,6 +516,13 @@ local function EnqueueVoice(bytes)
 	end
 	voiceQueue[#voiceQueue + 1] = bytes
 	voiceStats.sent = voiceStats.sent + 1
+end
+
+local function EnqueueLog(bytes)
+	if #logQueue >= LOG_QUEUE_MAX then
+		table.remove(logQueue, 1)
+	end
+	logQueue[#logQueue + 1] = bytes
 end
 
 local function GuidOf(unit)
@@ -556,7 +600,9 @@ end
 
 local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languageID, _, guid)
 	local channel = VOICE_EVENTS[event]
-	if not channel or not VoiceChannelEnabled(channel) then
+	local speak = channel ~= nil and VoiceChannelEnabled(channel)
+	local forAssistant = db.assistant and ASSISTANT_EVENTS[event]
+	if not speak and not forAssistant then
 		return
 	end
 	text = Plain(text, "string") -- secret during chat lockdown: never read
@@ -569,9 +615,13 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 	end
 	guid = Plain(guid, "string")
 	local me = GuidOf("player")
-	local isSelf = guid ~= nil and guid == me
-	if isSelf and db.voiceLang == "pl" then
-		return -- Polish mode: you already said it yourself
+	-- an outgoing whisper names its recipient as the "sender"; it is still your own line
+	local isSelf = (guid ~= nil and guid == me) or event == "CHAT_MSG_WHISPER_INFORM"
+	if speak and isSelf and db.voiceLang == "pl" then
+		speak = false -- Polish mode: you already said it yourself
+		if not forAssistant then
+			return
+		end
 	end
 	if not isSelf then
 		local lid = Plain(languageID, "number")
@@ -584,7 +634,7 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 	end
 
 	local race, sex = "", 0
-	if guid then
+	if speak and guid then
 		local _, _, _, englishRace, gender = SafeCall(GetPlayerInfoByGUID, guid)
 		race = Plain(englishRace, "string") or ""
 		sex = Plain(gender, "number") or 0
@@ -592,7 +642,9 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 
 	local distance, method = nil, P.DIST_NONE
 	local unit
-	if isSelf then
+	if not speak then
+		distance, method = nil, P.DIST_NONE -- the assistant does not need it
+	elseif isSelf then
 		distance, method = 0, P.DIST_SELF
 	elseif channel == "say" and guid then
 		local viaNameplate
@@ -611,8 +663,8 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 	end
 	voiceSeq = (voiceSeq + 1) % 65536
 	local sender = Plain(playerName, "string") or ""
-	EnqueueVoice(P.EncodePacket({
-		type = P.TYPE_VOICE,
+	local bytes = P.EncodePacket({
+		type = speak and P.TYPE_VOICE or P.TYPE_CHAT,
 		seq = voiceSeq,
 		flags = flags,
 		kind = KIND[event] or 0,
@@ -622,7 +674,12 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 		race = race,
 		sender = sender,
 		text = text,
-	}))
+	})
+	if not speak then
+		EnqueueLog(bytes)
+		return
+	end
+	EnqueueVoice(bytes)
 	voiceStats.last = {
 		sender = sender,
 		race = race,
@@ -641,6 +698,179 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 			unit or "-"
 		))
 	end
+end
+
+---------------------------------------------------------------------------- assistant: state + group commands
+
+-- an addon restriction (Midnight) blocks kick / lead / raid / ready check right now
+local function IsRestricted()
+	local ra = C_RestrictedActions
+	local kinds = Enum and Enum.AddOnRestrictionType
+	if ra and ra.IsAddOnRestrictionActive and kinds then
+		for _, key in ipairs({ "Combat", "Encounter", "ChallengeMode", "PvPMatch" }) do
+			if kinds[key] ~= nil and IsTrue(SafeCall(ra.IsAddOnRestrictionActive, kinds[key])) then
+				return true
+			end
+		end
+		return false
+	end
+	return IsTrue(SafeCall(InCombatLockdown))
+end
+
+local function FullName(unit)
+	local name, realm = SafeCall(UnitName, unit)
+	name, realm = Plain(name, "string"), Plain(realm, "string")
+	if not name or name == "" then
+		return nil
+	end
+	if realm and realm ~= "" then
+		return name .. "-" .. realm
+	end
+	return name
+end
+
+local function BagSpace()
+	local c = C_Container or {}
+	local freeFn = c.GetContainerNumFreeSlots or GetContainerNumFreeSlots
+	local slotsFn = c.GetContainerNumSlots or GetContainerNumSlots
+	local free, total = 0, 0
+	for bag = 0, 4 do
+		free = free + (Plain(SafeCall(freeFn, bag), "number") or 0)
+		total = total + (Plain(SafeCall(slotsFn, bag), "number") or 0)
+	end
+	return free, total
+end
+
+BuildStatePacket = function()
+	local inGroup = IsTrue(SafeCall(IsInGroup))
+	local inRaid = IsTrue(SafeCall(IsInRaid))
+	local flags = 0
+	if inGroup then
+		flags = flags + P.SFLAG_GROUP
+	end
+	if inRaid then
+		flags = flags + P.SFLAG_RAID
+	end
+	if inGroup and IsTrue(SafeCall(UnitIsGroupLeader, "player")) then
+		flags = flags + P.SFLAG_LEADER
+	end
+	if IsRestricted() then
+		flags = flags + P.SFLAG_RESTRICTED
+	end
+	if IsTrue(SafeCall(InCombatLockdown)) then
+		flags = flags + P.SFLAG_COMBAT
+	end
+	local members = {}
+	if inGroup and not inRaid then
+		for i = 1, 4 do
+			local n = FullName("party" .. i)
+			if n then
+				members[#members + 1] = n
+			end
+		end
+	end
+	local money = Plain(SafeCall(GetMoney), "number") or 0
+	local free, total = BagSpace()
+	stateSeq = (stateSeq + 1) % 65536
+	return P.EncodePacket({
+		type = P.TYPE_STATE,
+		seq = stateSeq,
+		flags = flags,
+		level = Plain(SafeCall(UnitLevel, "player"), "number") or 0,
+		xp = Plain(SafeCall(UnitXP, "player"), "number") or 0,
+		xpMax = Plain(SafeCall(UnitXPMax, "player"), "number") or 0,
+		gold = floor(money / 10000),
+		silverCopper = money % 10000,
+		bagFree = free,
+		bagSlots = total,
+		groupSize = Plain(SafeCall(GetNumGroupMembers), "number") or 0,
+		name = FullName("player") or "",
+		zone = Plain(SafeCall(GetZoneText), "string") or "",
+		subzone = Plain(SafeCall(GetSubZoneText), "string") or "",
+		members = members,
+	})
+end
+
+-- C_PartyInfo first (WoW Forever), the old globals as a fallback; true when the call went through
+local function PartyCall(name, ...)
+	local fn = (C_PartyInfo and C_PartyInfo[name]) or _G[name]
+	if type(fn) ~= "function" then
+		return false
+	end
+	return (pcall(fn, ...))
+end
+
+local function GroupActionAllowed(needLeader)
+	if IsRestricted() then
+		Print("teraz nie moge tego zrobic (walka, boss, M+ albo PvP) - sprobuj po walce")
+		return false
+	end
+	if needLeader and IsTrue(SafeCall(IsInGroup)) and not IsTrue(SafeCall(UnitIsGroupLeader, "player")) then
+		Print("to moze zrobic tylko lider grupy")
+		return false
+	end
+	return true
+end
+
+local function Words(rest)
+	local out = {}
+	for w in string.gmatch(rest or "", "%S+") do
+		out[#out + 1] = w
+	end
+	return out
+end
+
+local function InviteNames(names)
+	if #names == 0 then
+		Print("uzycie: /wvt inv Imie1 Imie2 ...")
+		return
+	end
+	local inRaid = IsTrue(SafeCall(IsInRaid))
+	local size = Plain(SafeCall(GetNumGroupMembers), "number") or 0
+	local room = inRaid and (40 - size) or (5 - math.max(1, size))
+	local invited, skipped = {}, {}
+	for _, name in ipairs(names) do
+		if #invited < room and PartyCall("InviteUnit", name) then
+			invited[#invited + 1] = name
+		else
+			skipped[#skipped + 1] = name
+		end
+	end
+	if #invited > 0 then
+		Print("zaproszenia wyslane: " .. table.concat(invited, ", "))
+	end
+	if #skipped > 0 then
+		Print("bez zaproszenia (brak miejsca w party - /wvt raid): " .. table.concat(skipped, ", "))
+	end
+	stateDirty = true
+end
+
+local function GroupCommand(cmd, rest)
+	local names = Words(rest)
+	if cmd == "inv" then
+		InviteNames(names)
+	elseif cmd == "kick" then
+		if names[1] and GroupActionAllowed(true) and PartyCall("UninviteUnit", names[1]) then
+			Print("usuwam z grupy: " .. names[1])
+		end
+	elseif cmd == "lead" then
+		if names[1] and GroupActionAllowed(true) and PartyCall("PromoteToLeader", names[1]) then
+			Print("lider dla: " .. names[1])
+		end
+	elseif cmd == "raid" then
+		if GroupActionAllowed(true) and PartyCall("ConvertToRaid") then
+			Print("zmieniam grupe w raid")
+		end
+	elseif cmd == "leave" then
+		if PartyCall("LeaveParty") then
+			Print("opuszczam grupe")
+		end
+	elseif cmd == "ready" then
+		if GroupActionAllowed(true) and PartyCall("DoReadyCheck") then
+			Print("ready check")
+		end
+	end
+	stateDirty = true
 end
 
 ---------------------------------------------------------------------------- update driver
@@ -831,8 +1061,22 @@ events:RegisterEvent("UI_SCALE_CHANGED")
 for ev in pairs(VOICE_EVENTS) do
 	events:RegisterEvent(ev)
 end
+for ev in pairs(ASSISTANT_EVENTS) do
+	if not VOICE_EVENTS[ev] then
+		pcall(events.RegisterEvent, events, ev)
+	end
+end
+local STATE_EVENT_SET = {}
+for _, ev in ipairs(STATE_EVENTS) do
+	STATE_EVENT_SET[ev] = true
+	pcall(events.RegisterEvent, events, ev) -- an event this client lacks must not break the addon
+end
 events:SetScript("OnEvent", function(_, event, ...)
-	if VOICE_EVENTS[event] then
+	if STATE_EVENT_SET[event] then
+		stateDirty = true
+		return
+	end
+	if VOICE_EVENTS[event] or ASSISTANT_EVENTS[event] then
 		local ok, err = pcall(OnVoiceChat, event, ...)
 		if not ok and not voiceErrorReported then
 			voiceErrorReported = true
@@ -908,6 +1152,14 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 	elseif cmd == "panel" then
 		SetVoiceOption("panelShown", not db.panelShown)
 		Print("panel glosow: " .. (db.panelShown and "widoczny" or "ukryty"))
+	elseif cmd == "inv" or cmd == "kick" or cmd == "lead" or cmd == "raid" or cmd == "leave" or cmd == "ready" then
+		GroupCommand(cmd, rest)
+	elseif cmd == "asystent" or cmd == "assistant" then
+		db.assistant = ParseOnOff(rest, db.assistant)
+		if not db.assistant then
+			logQueue = {}
+		end
+		Print("asystentka (czat i stan dla aplikacji): " .. OnOff(db.assistant))
 	elseif cmd == "voicedebug" then
 		db.voiceDebug = ParseOnOff(rest, db.voiceDebug)
 		Print("diagnostyka glosu: " .. OnOff(db.voiceDebug))
@@ -932,5 +1184,6 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 			)
 		)
 		Print("/wvt on | off | test | dwell <s> | say [on|off] | party [on|off] | lang en|pl | panel | voice | voicedebug")
+		Print("/wvt inv Imie1 Imie2 | kick Imie | lead Imie | raid | leave | ready | asystent [on|off]")
 	end
 end

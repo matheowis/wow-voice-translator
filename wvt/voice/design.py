@@ -14,6 +14,10 @@ still too close is repeated with another seed.  Created voices are written to th
 right away (MongoDB plus a JSON copy in data/); a replaced voice's players move to the new
 voice of the same slot unless their assignment was set by hand, and the replaced ids are
 listed in data/replaced_voices.json (the old voices stay in your ElevenLabs account).
+
+Slots the user rated 5 are locked (``VoiceProfile.locked``) and never redesigned, not even with
+--replace or --only.  Extra choices for the slots rated below 5 come from
+``python -m wvt.voice.candidates`` instead.
 """
 
 from __future__ import annotations
@@ -43,6 +47,70 @@ SLOT_ORDER = (2, 3, 1, 4, 5)  # the most contrasting briefs first
 
 def _print(*a) -> None:
     print(*a, flush=True)
+
+
+def plan_slots(by_slot: dict, races: list[str], genders: list[str], slots: int, replace: bool,
+               keep: set[str], only: set[tuple[str, str, int]]) -> tuple[dict[tuple[str, str], list[int]], list[str]]:
+    """Which slots to design: (pool -> slots, locked slots that were skipped)."""
+    todo: dict[tuple[str, str], list[int]] = {}
+    skipped: list[str] = []
+    for r in races:
+        for g in genders:
+            for s in ([s for s in SLOT_ORDER if s <= slots] if slots <= 5 else range(1, slots + 1)):
+                old = by_slot.get((r, g, s))
+                if only and (r, g, s) not in only:
+                    continue
+                if old is not None and old.locked:  # rated 5 by the user: final
+                    if replace:
+                        skipped.append(f"{r} {g} {s}")
+                    continue
+                if old is None or (replace and old.voice_id not in keep):
+                    todo.setdefault((r, g), []).append(s)
+    return todo, skipped
+
+
+def load_embedder():
+    """The speaker model, or None when it (or ffmpeg) is missing."""
+    try:
+        from .similarity import SpeakerEmbedder
+
+        return SpeakerEmbedder()
+    except Exception as exc:  # model or ffmpeg missing: still works, just without the checks
+        _print(f"Bez porównywania głosów ({exc}) – biorę pierwszy podgląd.")
+        return None
+
+
+def voice_embedding(embedder, voice_id: str, samples_dir: Optional[Path], sample_client) -> Optional[np.ndarray]:
+    """Speaker embedding of an existing voice: its review samples, or one short line (~45 credits)."""
+    if embedder is None:
+        return None
+    from .similarity import decode_audio
+
+    parts = []
+    if samples_dir:
+        for lang in ("en", "pl"):
+            f = samples_dir / f"{voice_id}_{lang}.mp3"
+            if f.exists():
+                parts.append(decode_audio(f.read_bytes()))
+    if not parts:
+        if sample_client is None:  # no sample on disk and no credits to be spent on one
+            return None
+        parts.append(decode_audio(b"".join(sample_client.stream_tts(voice_id, SAMPLE_TEXT, "en"))))
+    return embedder.embed(np.concatenate(parts))
+
+
+def load_stt(cfg: Config):
+    """Parakeet on the CPU for the intelligibility check, or None."""
+    try:
+        from ..stt import SpeechToText
+
+        stt = SpeechToText(cfg["stt"]["model_dir"], cfg["stt"].get("model_name", "nemo-parakeet-tdt-0.6b-v3"),
+                           device="cpu")
+        stt.load()
+        return stt
+    except Exception as exc:
+        _print(f"Bez sprawdzania wyraźności mowy ({exc}).")
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,18 +159,12 @@ def main(argv: list[str] | None = None) -> int:
     store = open_store(vcfg["store"], fallback)
     backup = JsonVoiceStore(fallback) if store.kind == "mongodb" else None
     by_slot = {(p.race, p.gender, p.slot): p for p in store.load_profiles()}
-    todo: dict[tuple[str, str], list[int]] = {}
-    for r in races:
-        for g in genders:
-            for s in ([s for s in SLOT_ORDER if s <= slots] if slots <= 5 else range(1, slots + 1)):
-                old = by_slot.get((r, g, s))
-                if only and (r, g, s) not in only:
-                    continue
-                if old is None or (args.replace and old.voice_id not in keep):
-                    todo.setdefault((r, g), []).append(s)
+    todo, skipped = plan_slots(by_slot, races, genders, slots, args.replace, keep, only)
     total = sum(len(v) for v in todo.values())
     _print(f"Magazyn: {store.description}. Do zaprojektowania: {total} głosów w {len(todo)} pulach"
            + (f", zostają: {len(keep)}" if keep else "") + ".")
+    if skipped:
+        _print(f"Zablokowane (ocena 5), nie ruszam: {', '.join(skipped)}.")
     if args.dry_run or not total:
         for (r, g), ss in todo.items():
             for s in ss:
@@ -110,32 +172,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     client = ElevenLabsClient(secret(vcfg.get("api_key_env", "ELEVENLABS_API_KEY")), timeout_s=60)
-    try:
-        from .similarity import SpeakerEmbedder
-
-        embedder: Optional[SpeakerEmbedder] = SpeakerEmbedder()
-    except Exception as exc:  # model or ffmpeg missing: still works, just without the distinctness check
-        _print(f"Bez porównywania głosów ({exc}) – biorę pierwszy podgląd.")
-        embedder = None
-
+    embedder = load_embedder()
     samples_dir = Path(args.samples_dir) if args.samples_dir else None
     lock = threading.Lock()
     sample_client = ElevenLabsClient(secret(vcfg.get("api_key_env", "ELEVENLABS_API_KEY")), output_format="mp3_44100_64")
 
     def existing_embedding(p: VoiceProfile) -> Optional[np.ndarray]:
-        if embedder is None:
-            return None
-        from .similarity import decode_audio
-
-        parts = []
-        if samples_dir:
-            for lang in ("en", "pl"):
-                f = samples_dir / f"{p.voice_id}_{lang}.mp3"
-                if f.exists():
-                    parts.append(decode_audio(f.read_bytes()))
-        if not parts:  # no sample on disk: one short line (~45 credits)
-            parts.append(decode_audio(b"".join(sample_client.stream_tts(p.voice_id, SAMPLE_TEXT, "en"))))
-        return embedder.embed(np.concatenate(parts))
+        return voice_embedding(embedder, p.voice_id, samples_dir, sample_client)
 
     # voices that stay: anchors for their own pool and (weaker) for the same gender elsewhere
     staying = {k: p for k, p in by_slot.items() if (k[0], k[1]) not in todo or k[2] not in todo[(k[0], k[1])]}
@@ -158,17 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 e = existing_embedding(p)
                 if e is not None:
                     refs.append((r, g, e))
-        stt = None
-        if not args.no_speech_check:
-            try:
-                from ..stt import SpeechToText
-
-                stt = SpeechToText(cfg["stt"]["model_dir"], cfg["stt"].get("model_name", "nemo-parakeet-tdt-0.6b-v3"),
-                                   device="cpu")
-                stt.load()
-            except Exception as exc:
-                _print(f"Bez sprawdzania wyraźności mowy ({exc}).")
-                stt = None
+        stt = None if args.no_speech_check else load_stt(cfg)
         judge = VoiceJudge(refs, stt)
         _print(f"Sędzia: {len(refs)} wzorcowych głosów, sprawdzanie mowy: {'tak' if stt else 'nie'}.")
     replaced_log = fallback / "replaced_voices.json"

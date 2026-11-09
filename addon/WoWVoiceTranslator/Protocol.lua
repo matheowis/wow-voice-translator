@@ -26,11 +26,22 @@ P.TYPE_HOVER = 1
 P.TYPE_KEEP = 2
 P.TYPE_TEST = 3
 P.TYPE_VOICE = 4
+P.TYPE_STATE = 5 -- player state for the voice assistant
+P.TYPE_CHAT = 6 -- a chat line only for the assistant, never spoken (same layout as TYPE_VOICE)
 
 P.FLAG_SECRET = 1
 P.FLAG_TRUNCATED = 2
 P.VFLAG_SELF = 4
 P.VFLAG_LANG_PL = 8
+
+P.SFLAG_GROUP = 1
+P.SFLAG_RAID = 2
+P.SFLAG_LEADER = 4
+P.SFLAG_RESTRICTED = 8 -- combat / boss / M+ / PvP match: no kick, lead, raid or ready check
+P.SFLAG_COMBAT = 16
+P.MAX_NAME_BYTES = 48
+P.MAX_ZONE_BYTES = 64
+P.MAX_MEMBERS = 4
 
 -- voice grid: same geometry, COLS + 2 cells to the right of the hover grid
 P.VOICE_GRID_X_CELLS = P.COLS + 2
@@ -62,6 +73,29 @@ local function pushU16(t, v)
 	v = clampU16(v)
 	t[#t + 1] = floor(v / 256)
 	t[#t + 1] = v % 256
+end
+
+local function pushU32(t, v)
+	v = floor(v or 0)
+	if v < 0 then
+		v = 0
+	elseif v > 4294967295 then
+		v = 4294967295
+	end
+	t[#t + 1] = floor(v / 16777216) % 256
+	t[#t + 1] = floor(v / 65536) % 256
+	t[#t + 1] = floor(v / 256) % 256
+	t[#t + 1] = v % 256
+end
+
+local function pushByte(t, v)
+	v = floor(v or 0)
+	if v < 0 then
+		v = 0
+	elseif v > 255 then
+		v = 255
+	end
+	t[#t + 1] = v
 end
 
 local function pushFixed10(t, v)
@@ -142,6 +176,8 @@ end
 --       physW, physH, kind, prefix, text }   (r, g, b in 0..255)
 -- voice packets: { type = TYPE_VOICE, seq, flags, kind, sex, distance (yards or nil),
 --                  distMethod, race, sender, text }
+-- state packets: { type = TYPE_STATE, seq, flags, level, xp, xpMax, gold, silverCopper,
+--                  bagFree, bagSlots, groupSize, name, zone, subzone, members = { names } }
 function P.EncodePacket(p)
 	local b = { 87, 86 } -- "WV"
 	pushU8(b, P.VERSION)
@@ -172,7 +208,7 @@ function P.EncodePacket(p)
 		pushBytes(b, prefix)
 		pushU16(b, #text)
 		pushBytes(b, text)
-	elseif p.type == P.TYPE_VOICE then
+	elseif p.type == P.TYPE_VOICE or p.type == P.TYPE_CHAT then
 		local race = P.Utf8Truncate(p.race or "", P.MAX_RACE_BYTES)
 		local sender = P.Utf8Truncate(p.sender or "", P.MAX_SENDER_BYTES)
 		local room = P.MAX_BYTES - P.VOICE_FIXED_BYTES - #race - 1 - #sender - 2 - 2
@@ -203,6 +239,32 @@ function P.EncodePacket(p)
 		pushBytes(b, sender)
 		pushU16(b, #text)
 		pushBytes(b, text)
+	elseif p.type == P.TYPE_STATE then
+		pushU8(b, p.flags or 0)
+		pushByte(b, p.level)
+		pushU32(b, p.xp)
+		pushU32(b, p.xpMax)
+		pushU32(b, p.gold)
+		pushU16(b, p.silverCopper or 0)
+		pushByte(b, p.bagFree)
+		pushByte(b, p.bagSlots)
+		pushByte(b, p.groupSize)
+		for _, field in ipairs({ { p.name, P.MAX_NAME_BYTES }, { p.zone, P.MAX_ZONE_BYTES }, { p.subzone, P.MAX_ZONE_BYTES } }) do
+			local s = P.Utf8Truncate(field[1] or "", field[2])
+			pushU8(b, #s)
+			pushBytes(b, s)
+		end
+		local members = p.members or {}
+		local count = #members
+		if count > P.MAX_MEMBERS then
+			count = P.MAX_MEMBERS
+		end
+		pushU8(b, count)
+		for i = 1, count do
+			local s = P.Utf8Truncate(members[i] or "", P.MAX_NAME_BYTES)
+			pushU8(b, #s)
+			pushBytes(b, s)
+		end
 	end
 	pushU16(b, P.Fletcher16(b, 3, #b))
 	return b

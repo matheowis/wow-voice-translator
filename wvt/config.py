@@ -26,7 +26,22 @@ DEFAULTS: dict[str, Any] = {
     "push_to_talk": [
         {"key": "caps_lock", "channel": "party"},
         {"key": "`", "channel": "say"},
+        {"key": "mouse5", "channel": "assistant"},
     ],
+    # the voice assistant: her own push-to-talk key (channel "assistant"), Polish speech in, a spoken
+    # answer and group/chat commands out (prepared in the chat box, Enter runs them) - wvt/assistant.py
+    "assistant": {
+        "enabled": True,
+        "name": "Iskra",
+        "default_key": "mouse5",  # added once to push_to_talk for configs older than the assistant
+        "default_key_added": False,
+        "voice_id": "",  # her ElevenLabs voice - set when you pick one on the voice rating page
+        "volume": 1.0,
+        "invite_window_s": 300,  # "inv me" requests younger than this are invited
+        "llm_timeout_s": 8,
+        "max_reply_chars": 240,
+        "persona_extra": "",  # added to her character description, e.g. "mów do mnie Mati"
+    },
     "channels": {
         "say": "/s",
         "party": "/p",
@@ -128,6 +143,7 @@ DEFAULTS: dict[str, Any] = {
         "realm": "Forever",  # used when the sender name has no "-Realm" part
         "slots_per_pool": 5,  # voices per race+gender pool (Voice Design)
         "race_aliases": {},  # extra englishRace -> pool mapping, e.g. {"Goblin": "Gnome"}
+        "unknown_race_pool": "Human",  # voices for characters whose race the game does not give
         "store": {
             "mongodb_uri_env": "MONGODB_URI",  # empty/missing -> mongodb://127.0.0.1:27017
             "mongodb_default_uri": "mongodb://127.0.0.1:27017",
