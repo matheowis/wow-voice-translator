@@ -477,6 +477,9 @@ class TranslatorApp:
         self.reader: Optional[SignalReader] = None
         self.voice = None  # VoiceManager, built in _init_voice
         self.assistant = None  # wvt.assistant.Assistant, built with the models
+        from .assistant import ChatLog
+
+        self.chat_log = ChatLog()  # recent chat from the addon: the assistant's memory and the translator's context
         self.voice_status = "uruchamianie…"
         self.model_state = "ładowanie…"
         self.hover_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wvt-hover")
@@ -560,8 +563,9 @@ class TranslatorApp:
 
                 self.assistant = Assistant(self.cfg, self.translator, self.llm, self.inserter, QtPipelineUI(self.bridge),
                                            self.tracker.foreground_is_wow, voice_getter=lambda: self.voice,
-                                           set_voices_enabled=self.bridge.voices_enabled.emit)
+                                           set_voices_enabled=self.bridge.voices_enabled.emit, chat_log=self.chat_log)
                 self.pipeline.assistant = self.assistant
+            self.pipeline.chat_log = self.chat_log
             self.pipeline.models_ready.set()
             self.bridge.models.emit(f"gotowe (STT: {self.stt.device}, LLM: {self.llm.model_name})", True)
         except Exception as exc:
@@ -614,11 +618,13 @@ class TranslatorApp:
             self.voice_status = f"BŁĄD: {exc}"
 
     def _on_voice_packet(self, pkt: protocol.Packet) -> None:  # signal reader thread
-        if self.assistant is not None:  # chat log and game state, whether spoken or not
-            try:
-                self.assistant.on_packet(pkt)
-            except Exception:
-                log.exception("assistant packet handler failed")
+        try:  # chat log (the assistant's memory, the translator's context) and game state
+            if self.assistant is not None:
+                self.assistant.on_packet(pkt)  # its log is self.chat_log
+            else:
+                self.chat_log.add_packet(pkt)
+        except Exception:
+            log.exception("chat log / assistant packet handler failed")
         if self.voice is not None and pkt.type == protocol.TYPE_VOICE:
             self.voice.on_packet(pkt)
 

@@ -82,6 +82,8 @@ Przypisania głosów do postaci zapisują się w lokalnym MongoDB, jeśli jest z
 
 Czytanie /say i /party włączasz osobno (**Say** / **Party** na panelu, `/wvt say on`, `/wvt party on`); wyłączone kanały nic nie kosztują.
 
+**Bezpiecznik /say** (np. w mieście): zawsze najpierw czytana jest osoba najbliżej Ciebie. Gdy w ciągu 15 s pisze na /say 4 lub więcej osób (albo przychodzi 6 linii), czytani są tylko gracze w promieniu 10 jardów, najwyżej 6 linii na minutę. Gracz, który wysyła więcej niż 3 linie w 20 s, jest na 30 s wyciszany. Pominięte linie nic nie kosztują. Zakładka **Głosy** pokazuje je z powodem („tłok”, „zalew”), a progi zmienisz w `config.json` (`voice.say_valve`).
+
 ## Asystentka (Iskra)
 
 Przytrzymaj **boczny przycisk myszy 5** i powiedz po polsku, czego chcesz. Odpowie Ci głosem (ElevenLabs), a jeśli trzeba coś zrobić w grze, wpisze gotową komendę do czatu, np. `/wvt inv Ann Bob Cid`. **Wykonuje się dopiero po Twoim Enterze** (Esc anuluje).
@@ -94,6 +96,7 @@ Przytrzymaj **boczny przycisk myszy 5** i powiedz po polsku, czego chcesz. Odpow
 | „kto chce inv?”, „co mi napisał?”, „co oni piszą?” | czyta po polsku szepty i streszcza czat |
 | „odpisz mu, że zaraz będę”, „napisz na party, że idę po wodę” | tłumaczy na angielski i wpisuje do czatu (`/w`, `/p`, `/s`…) |
 | „ile mam złota?”, „ile do levelu?”, „gdzie jestem?”, „ile miejsca w torbach?”, „kto jest w party?” | odpowiada z danych gry |
+| „co mam do zrobienia?”, „ile mi zostało świec?”, „gdzie mam iść?”, „co mogę oddać?”, „który quest najbliżej?”, „o co chodzi w tym queście?” | odpowiada z Twojego dziennika zadań; kierunek i odległość liczy do znacznika celu, który gra pokazuje na mapie |
 | „wycisz głosy”, „przełącz na polski”, „wyłącz głosy na say”, „cicho” | steruje głosami postaci |
 | „co umiesz?” albo cokolwiek innego | krótka rozmowa (lokalny model – w faktach o grze może się mylić) |
 

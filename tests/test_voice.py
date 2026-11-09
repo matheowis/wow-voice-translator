@@ -661,3 +661,52 @@ def test_assistant_lines_are_never_spoken_and_her_answers_use_her_voice(mgr):
     assert _wait(lambda: m.stats["spoken"] == 1)
     assert tts.calls == [("voice-iskra", "Mam trzech chętnych, Enter i zapraszam.", "pl")]
     assert not m.say("", "voice-iskra") and not m.say("tekst", "")
+
+
+# --------------------------------------------------------------------------- /say safety valve
+
+def _quiet_manager(tmp_path, **valve):
+    from wvt.config import DEFAULTS
+
+    cfg = dict(DEFAULTS["voice"])
+    cfg["say_valve"] = {**DEFAULTS["voice"]["say_valve"], **valve}
+    return VoiceManager(cfg, FakeTTS(), VoiceResolver(_store(tmp_path)), FakeMixer(), TTSNormalizer({"mode": "rules"}),
+                        DailyBudget(tmp_path / "usage.json", 5000))  # workers not started: the queue stays visible
+
+
+def test_the_nearest_speaker_is_read_first_and_a_full_queue_drops_the_farthest(tmp_path):
+    m = _quiet_manager(tmp_path, crowd_lines=99, crowd_speakers=99)
+    for dist, who in [(20, "Far-F"), (5, "Near-F"), (12, "Mid-F"), (None, "Unknown-F")]:
+        assert m.on_packet(_pkt(f"line from {who}", distance=dist, sender=who)) is None
+    assert m.on_packet(_pkt("party line", kind=3, sender="Pal-F")) is None
+    order = [m._next_job().pkt.sender for _ in range(5)]
+    assert order == ["Pal-F", "Near-F", "Mid-F", "Far-F", "Unknown-F"]
+    m.cfg["max_queue"] = 2
+    m._speaking.clear()
+    assert m.on_packet(_pkt("far away", distance=25, sender="A-F")) is None
+    assert m.on_packet(_pkt("middle", distance=15, sender="B-F")) is None
+    assert m.on_packet(_pkt("right here", distance=3, sender="C-F")) is None  # pushes out the farthest
+    assert m.on_packet(_pkt("even farther", distance=28, sender="D-F")) == "queue-full"
+    assert sorted(j.pkt.sender for j in m._queue) == ["B-F", "C-F"]
+
+
+def test_in_a_crowd_only_nearby_players_are_read(tmp_path):
+    m = _quiet_manager(tmp_path, crowd_lines=99, crowd_speakers=3, crowd_radius_yd=10, crowd_max_per_min=2)
+    assert m.on_packet(_pkt("hello there", distance=20, sender="A-F")) is None
+    assert m.on_packet(_pkt("anyone selling cloth", distance=25, sender="B-F")) is None
+    assert m.on_packet(_pkt("wts boots cheap", distance=22, sender="C-F")) == "crowd"  # third player: a crowd
+    assert m.crowded
+    assert m.on_packet(_pkt("hi friend", distance=4, sender="D-F")) is None  # close: still read
+    assert m.on_packet(_pkt("who knows where", distance=None, sender="E-F")) == "crowd"
+    assert m.on_packet(_pkt("close again", distance=6, sender="F-F")) is None
+    assert m.on_packet(_pkt("third close one", distance=3, sender="G-F")) == "crowd"  # 2 a minute at most
+    assert m.on_packet(_pkt("party is never limited", kind=3, sender="H-F")) is None
+
+
+def test_a_flooding_player_is_muted_for_a_while(tmp_path):
+    m = _quiet_manager(tmp_path, crowd_lines=99, crowd_speakers=99, flood_lines=3)
+    for i in range(3):
+        assert m.on_packet(_pkt(f"spam number {i}", distance=5, sender="Spammer-F")) is None
+    assert m.on_packet(_pkt("spam number 3", distance=5, sender="Spammer-F")) == "flood"
+    assert m.on_packet(_pkt("spam number 4", distance=5, sender="Spammer-F")) == "flood"
+    assert m.on_packet(_pkt("hello, calm here", distance=5, sender="Calm-F")) is None

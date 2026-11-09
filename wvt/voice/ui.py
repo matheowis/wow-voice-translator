@@ -41,7 +41,9 @@ SKIP_REASONS = {
     "noise": "komenda/znaki",
     "empty": "pusta/ukryta",
     "stale": "za stara",
-    "queue-full": "kolejka pełna",
+    "queue-full": "kolejka pełna (bliżsi mają pierwszeństwo)",
+    "crowd": "tłok – czytam tylko najbliższych",
+    "flood": "zalew wiadomości od tego gracza",
     "no-voices": "brak głosów (Voice Design)",
     "silenced": "przerwane",
 }

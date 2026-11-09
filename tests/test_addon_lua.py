@@ -559,3 +559,101 @@ def test_kick_lead_raid_and_ready_respect_restrictions_and_leadership(assistant)
     assert len(_calls(mock)) == 4  # not the leader any more
     slash("leave")
     assert _calls(mock)[-1][0] == "LeaveParty"
+
+
+def test_lua_quest_and_position_encoders_match_python(lua):
+    rt, _, _ = lua
+    lp = _lua_protocol(rt)
+    objectives = rt.table_from([rt.table_from({"done": False, "text": "3/8 Kobold Candle"}),
+                                rt.table_from({"done": True, "text": "Explore ż" * 20})])
+    fields = {"type": 7, "seq": 12, "sync": 3, "index": 2, "total": 7, "questID": 60123, "level": 8, "flags": 12,
+              "group": 0, "poiMap": 37, "poiX": 0.4123, "poiY": 0.8261, "distance": 230.6,
+              "title": "The Fargodeep Mine", "zone": "Elwynn Forest", "objectives": objectives}
+    lua_bytes = bytes(int(v) for v in lp.EncodePacket(rt.table_from(fields)).values())
+    q = P.QuestEntry(sync=3, index=2, total=7, quest_id=60123, level=8, flags=12, group=0, poi_map=37, poi_x=0.4123,
+                     poi_y=0.8261, distance_yd=231, title="The Fargodeep Mine", zone="Elwynn Forest",
+                     objectives=[(False, "3/8 Kobold Candle"), (True, "Explore ż" * 20)])
+    assert lua_bytes == P.encode_packet(P.Packet(type=7, seq=12, quest=q))
+    no_poi = rt.table_from({"type": 7, "seq": 1, "title": "x"})  # no distance, no objectives
+    assert bytes(int(v) for v in lp.EncodePacket(no_poi).values()) == P.encode_packet(
+        P.Packet(type=7, seq=1, quest=P.QuestEntry(title="x")))
+    pos = rt.table_from({"type": 8, "seq": 9, "mapID": 1429, "x": 0.4, "y": 0.8, "width": 3470.8, "height": 2314.6})
+    assert bytes(int(v) for v in lp.EncodePacket(pos).values()) == P.encode_packet(
+        P.Packet(type=8, seq=9, pos=P.PlayerPos(1429, 0.4, 0.8, 3470.8, 2314.6)))
+
+
+QUEST_MOCK = r"""
+local mock = WVT_MOCK
+mock.map = { id = 37, x = 0.40, y = 0.70 }
+mock.log = {
+  { header = true, title = "Elwynn Forest" },
+  { questID = 101, title = "The Fargodeep Mine", level = 8, done = false, have = 3, need = 8 },
+  { questID = 102, title = "Bounty on Murlocs", level = 9, done = true },
+}
+local function entry(id) for _, q in ipairs(mock.log) do if q.questID == id then return q end end end
+C_QuestLog = {
+  GetNumQuestLogEntries = function() return #mock.log end,
+  GetInfo = function(i)
+    local q = mock.log[i]
+    return { title = q.title, questID = q.questID or 0, isHeader = q.header or false, level = q.level,
+             difficultyLevel = q.level, suggestedGroup = 0, isHidden = false }
+  end,
+  ReadyForTurnIn = function(id) return entry(id).done end,
+  IsComplete = function(id) return entry(id).done end,
+  IsFailed = function() return false end,
+  GetQuestWatchType = function(id) if id == 101 then return 0 end return nil end,
+  GetQuestsOnMap = function(mapID) return { { questID = 101, x = 0.55, y = 0.50 } } end,
+  GetNextWaypoint = function(id) if id == 102 then return 52, 0.5, 0.25 end end,
+  GetDistanceSqToQuest = function(id) if id == 101 then return 230 * 230 end end,
+  GetQuestObjectives = function(id)
+    local q = entry(id)
+    if q.need then return { { text = q.have .. "/" .. q.need .. " Kobold Candle", finished = q.have >= q.need } } end
+    return {}
+  end,
+}
+C_Map = {
+  GetBestMapForUnit = function() return mock.map.id end,
+  GetPlayerMapPosition = function() return { x = mock.map.x, y = mock.map.y } end,
+  GetMapWorldSize = function() return 3470, 2314 end,
+  GetMapInfo = function(id) return { name = id == 37 and "Elwynn Forest" or "Westfall" } end,
+}
+"""
+
+
+def _collect(g, mock, seconds):
+    seen, last = [], None
+    for _ in range(int(seconds / 0.1)):
+        driver_tick(mock, 0.1)
+        pkt = grid_packet(g)
+        if pkt is not None and pkt != last:
+            seen.append(pkt)
+        last = pkt
+    return seen
+
+
+def test_quest_log_and_position_reach_the_app(voice):
+    rt, g, mock, _, slash = voice
+    rt.execute(QUEST_MOCK)
+    fire(mock, "QUEST_LOG_UPDATE")
+    seen = _collect(g, mock, 3)
+    quests = {p.quest.quest_id: p.quest for p in seen if p.type == P.TYPE_QUEST}
+    pos = [p.pos for p in seen if p.type == P.TYPE_POS]
+    assert pos and pos[0].map_id == 37 and abs(pos[0].x - 0.40) < 1e-3 and pos[0].width == 3470
+    mine = quests[101]
+    assert (mine.title, mine.zone, mine.level, mine.total) == ("The Fargodeep Mine", "Elwynn Forest", 8, 2)
+    assert mine.objectives == [(False, "3/8 Kobold Candle")] and mine.tracked and mine.has_poi
+    assert abs(mine.poi_x - 0.55) < 1e-3 and mine.distance_yd == 230
+    other = quests[102]
+    assert other.complete and other.zone == "Westfall" and other.flags & P.QFLAG_POI_OTHER_MAP
+    # progress: only the changed quest goes again, in the same sync
+    mock.log[2]["have"] = 4  # Lua tables are 1-based; [2] is quest 101
+    fire(mock, "QUEST_LOG_UPDATE")
+    again = [p.quest for p in _collect(g, mock, 3) if p.type == P.TYPE_QUEST]
+    assert [(q.quest_id, q.objectives[0][1], q.sync) for q in again] == [(101, "4/8 Kobold Candle", mine.sync)]
+    # a new quest: a new sync with every quest
+    mock.log[4] = rt.table_from({"questID": 103, "title": "Report to Gryan", "level": 10, "done": False})
+    fire(mock, "QUEST_ACCEPTED")
+    fresh = [p.quest for p in _collect(g, mock, 3) if p.type == P.TYPE_QUEST]
+    assert sorted(q.quest_id for q in fresh) == [101, 102, 103] and {q.sync for q in fresh} == {mine.sync + 1}
+    slash("questy")
+    assert "3 questow, 2 ze znacznikiem" in str(list(mock.prints.values())[-1])

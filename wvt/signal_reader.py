@@ -105,7 +105,7 @@ class VoiceDeduper:
 
     def is_new(self, pkt: protocol.Packet) -> bool:
         # seq restarts after /reload, so not alone; state packets have their own counter
-        ident = (pkt.type, pkt.seq, pkt.sender, pkt.text, repr(pkt.state))
+        ident = (pkt.type, pkt.seq, pkt.sender, pkt.text, repr(pkt.state), repr(pkt.quest), repr(pkt.pos))
         if ident in self._seen:
             return False
         self._seen.append(ident)
@@ -166,7 +166,8 @@ class SignalReader:
                         except (OSError, protocol.DecodeError) as exc:
                             self.capture_errors += 1
                             log.debug("capture/decode failed: %s", exc)
-                if (voice is not None and voice.type in (protocol.TYPE_VOICE, protocol.TYPE_STATE, protocol.TYPE_CHAT)
+                if (voice is not None and voice.type in (protocol.TYPE_VOICE, protocol.TYPE_STATE, protocol.TYPE_CHAT,
+                                                         protocol.TYPE_QUEST, protocol.TYPE_POS)
                         and self.voice_dedup.is_new(voice)):
                     self.last_voice_at = time.time()
                     self.voice_packets += 1

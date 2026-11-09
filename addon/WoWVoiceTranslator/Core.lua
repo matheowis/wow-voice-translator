@@ -18,6 +18,8 @@
 --     the chat box; they run only when you press Enter: invite, kick, give lead, raid,
 --     leave, ready check - the normal party API, refused politely during combat, boss
 --     fights, M+ and PvP matches (Midnight addon restrictions).
+--     She also gets your quest log (titles, objectives, progress, the game's own map marker
+--     of the next objective) and where you stand, so she can say where to go.
 --
 -- What it does NOT do: no protected/secure calls, no chat sending, no automation.
 -- Messages that the game marks as "secret values" (Midnight rules, e.g. during
@@ -104,6 +106,18 @@ local STATE_EVENTS = {
 	"ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED_INDOORS", "BAG_UPDATE_DELAYED", "GROUP_ROSTER_UPDATE",
 	"PARTY_LEADER_CHANGED", "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED", "ADDON_RESTRICTION_STATE_CHANGED",
 }
+-- quest log changes: scan again (at most every QUEST_SCAN_SECONDS)
+local QUEST_EVENTS = {
+	"QUEST_LOG_UPDATE", "QUEST_ACCEPTED", "QUEST_REMOVED", "QUEST_TURNED_IN", "QUEST_WATCH_LIST_CHANGED",
+	"UNIT_QUEST_LOG_CHANGED", "ZONE_CHANGED_NEW_AREA",
+}
+local QUEST_SET_EVENTS = { QUEST_ACCEPTED = true, QUEST_REMOVED = true, QUEST_TURNED_IN = true }
+local QUEST_SCAN_SECONDS = 2
+local QUEST_FULL_SECONDS = 60 -- every quest again once a minute, so a restarted app catches up
+local POS_CHECK_SECONDS = 0.5
+local POS_MIN_SECONDS = 2 -- at most one position packet per 2 s...
+local POS_HEARTBEAT_SECONDS = 20 -- ...at least one per 20 s
+local POS_MIN_YARDS = 4 -- ...and only after moving this far
 local LOG_QUEUE_MAX = 12
 local STATE_MIN_SECONDS = 1.0 -- at most one state packet per second...
 local STATE_HEARTBEAT_SECONDS = 20 -- ...and at least one every 20 s, so a freshly started app knows
@@ -489,6 +503,7 @@ local voiceSeq = 0
 local voiceStats = { sent = 0, dropped = 0, last = nil }
 local stateDirty, lastStateAt, stateSeq = true, -1000, 0
 local BuildStatePacket -- defined with the assistant helpers below
+local AssistantExtra -- position and quest packets, defined below
 
 local function VoiceTick(now)
 	if voiceShownUntil > 0 and now < voiceShownUntil then
@@ -499,6 +514,9 @@ local function VoiceTick(now)
 		and ((stateDirty and now - lastStateAt >= STATE_MIN_SECONDS) or now - lastStateAt >= STATE_HEARTBEAT_SECONDS) then
 		nextBytes = BuildStatePacket()
 		stateDirty, lastStateAt = false, now
+	end
+	if not nextBytes and db.assistant and AssistantExtra then
+		nextBytes = AssistantExtra(now)
 	end
 	if nextBytes then
 		voiceGrid:ShowBytes(nextBytes)
@@ -791,6 +809,205 @@ BuildStatePacket = function()
 	})
 end
 
+---------------------------------------------------------------------------- assistant: quests + position
+
+local questQueue = {}
+local questsDirty, questSetChanged = true, true
+local questSync, questSeq, posSeq = 0, 0, 0
+local lastQuestScan, lastFullQuestSend = -1000, -1000
+local questSent = {} -- questID -> what the app got last (title, flags, objectives, marker)
+local questStats = { quests = 0, withMarker = 0 }
+local lastPosCheck, lastPosAt, lastPos = -1000, -1000, nil
+
+local function PlayerMap()
+	return Plain(SafeCall(C_Map and C_Map.GetBestMapForUnit, "player"), "number")
+end
+
+local function QuestMarkers(mapID)
+	local out = {}
+	local list = mapID and SafeCall(C_QuestLog and C_QuestLog.GetQuestsOnMap, mapID)
+	if type(list) == "table" and not issecrettable(list) then
+		for _, q in ipairs(list) do
+			local id, x, y = Plain(q.questID, "number"), Plain(q.x, "number"), Plain(q.y, "number")
+			if id and x and y then
+				out[id] = { x, y }
+			end
+		end
+	end
+	return out
+end
+
+local function MapName(mapID)
+	local info = SafeCall(C_Map and C_Map.GetMapInfo, mapID)
+	if type(info) == "table" and not issecrettable(info) then
+		return Plain(info.name, "string")
+	end
+end
+
+local function ScanQuests()
+	local ql = C_QuestLog
+	local n = ql and Plain(SafeCall(ql.GetNumQuestLogEntries), "number") or 0
+	local mapID = PlayerMap()
+	local markers = QuestMarkers(mapID)
+	local quests, header = {}, ""
+	for i = 1, n do
+		local info = SafeCall(ql.GetInfo, i)
+		if type(info) == "table" and not issecrettable(info) then
+			local title = Plain(info.title, "string") or ""
+			local id = Plain(info.questID, "number")
+			if IsTrue(info.isHeader) then
+				header = title
+			elseif id and id > 0 and not IsTrue(info.isHidden) then
+				local flags = 0
+				if IsTrue(SafeCall(ql.ReadyForTurnIn, id)) or IsTrue(SafeCall(ql.IsComplete, id)) then
+					flags = flags + P.QFLAG_COMPLETE
+				end
+				if IsTrue(SafeCall(ql.IsFailed, id)) then
+					flags = flags + P.QFLAG_FAILED
+				end
+				if SafeCall(ql.GetQuestWatchType, id) ~= nil then
+					flags = flags + P.QFLAG_TRACKED
+				end
+				local poiMap, x, y, zone = 0, 0, 0, header
+				local m = markers[id]
+				if m and mapID then
+					poiMap, x, y = mapID, m[1], m[2]
+					flags = flags + P.QFLAG_POI
+				else
+					local wm, wx, wy = SafeCall(ql.GetNextWaypoint, id)
+					wm, wx, wy = Plain(wm, "number"), Plain(wx, "number"), Plain(wy, "number")
+					if wm and wx and wy then
+						poiMap, x, y = wm, wx, wy
+						flags = flags + P.QFLAG_POI
+						if wm ~= mapID then
+							flags = flags + P.QFLAG_POI_OTHER_MAP
+						end
+					end
+				end
+				if poiMap ~= 0 then
+					zone = MapName(poiMap) or zone
+				end
+				local dist
+				local d2 = Plain(SafeCall(ql.GetDistanceSqToQuest, id), "number")
+				if d2 and d2 >= 0 then
+					dist = sqrt(d2)
+				end
+				local objectives = {}
+				local objs = SafeCall(ql.GetQuestObjectives, id)
+				if type(objs) == "table" and not issecrettable(objs) then
+					for _, o in ipairs(objs) do
+						local text = Plain(o.text, "string")
+						if text and text ~= "" then
+							objectives[#objectives + 1] = { done = IsTrue(o.finished), text = text }
+						end
+					end
+				end
+				quests[#quests + 1] = {
+					questID = id,
+					level = Plain(info.difficultyLevel, "number") or Plain(info.level, "number") or 0,
+					flags = flags,
+					group = Plain(info.suggestedGroup, "number") or 0,
+					poiMap = poiMap,
+					poiX = x,
+					poiY = y,
+					distance = dist,
+					title = title,
+					zone = zone,
+					objectives = objectives,
+				}
+			end
+		end
+	end
+	return quests
+end
+
+local function QuestKey(q)
+	local parts = { q.title, q.flags, q.poiMap, floor(q.poiX * 1000), floor(q.poiY * 1000) }
+	for _, o in ipairs(q.objectives) do
+		parts[#parts + 1] = (o.done and "+" or "-") .. o.text
+	end
+	return table.concat(parts, "|")
+end
+
+local function QueueQuests(now)
+	local quests = ScanQuests()
+	questStats.quests, questStats.withMarker = #quests, 0
+	if questSetChanged then -- accepted / abandoned / turned in: the app replaces its whole list
+		questSync, questSetChanged, questSent = (questSync + 1) % 65536, false, {}
+	end
+	local full = now - lastFullQuestSend >= QUEST_FULL_SECONDS
+	if full then
+		lastFullQuestSend, questSent = now, {}
+	end
+	questQueue = {}
+	for i, q in ipairs(quests) do
+		if q.flags % (P.QFLAG_POI * 2) >= P.QFLAG_POI then
+			questStats.withMarker = questStats.withMarker + 1
+		end
+		local key = QuestKey(q)
+		if questSent[q.questID] ~= key then
+			questSent[q.questID] = key
+			q.type, q.sync, q.index, q.total = P.TYPE_QUEST, questSync, i, #quests
+			questQueue[#questQueue + 1] = q
+		end
+	end
+	if #quests == 0 and (full or questSent.empty ~= questSync) then -- an empty log is news too
+		questSent.empty = questSync
+		questQueue[1] = { type = P.TYPE_QUEST, sync = questSync, index = 0, total = 0, questID = 0 }
+	end
+end
+
+local function PositionBytes(now)
+	if now - lastPosCheck < POS_CHECK_SECONDS then
+		return nil
+	end
+	lastPosCheck = now
+	local mapID = PlayerMap()
+	if not mapID then
+		return nil
+	end
+	local pos = SafeCall(C_Map.GetPlayerMapPosition, mapID, "player")
+	if type(pos) ~= "table" or issecrettable(pos) then
+		return nil
+	end
+	local x, y = Plain(pos.x, "number"), Plain(pos.y, "number")
+	if not x or not y then
+		return nil
+	end
+	local w, h = SafeCall(C_Map.GetMapWorldSize, mapID)
+	w, h = Plain(w, "number") or 0, Plain(h, "number") or 0
+	local moved = true
+	if lastPos and lastPos.mapID == mapID then
+		local dx, dy = (x - lastPos.x) * w, (y - lastPos.y) * h
+		moved = sqrt(dx * dx + dy * dy) >= POS_MIN_YARDS
+	end
+	local due = (moved and now - lastPosAt >= POS_MIN_SECONDS) or now - lastPosAt >= POS_HEARTBEAT_SECONDS
+	if not due then
+		return nil
+	end
+	lastPos, lastPosAt = { mapID = mapID, x = x, y = y }, now
+	posSeq = (posSeq + 1) % 65536
+	return P.EncodePacket({ type = P.TYPE_POS, seq = posSeq, mapID = mapID, x = x, y = y, width = w, height = h })
+end
+
+AssistantExtra = function(now)
+	local bytes = PositionBytes(now) -- time-sensitive and tiny: first
+	if bytes then
+		return bytes
+	end
+	if (questsDirty and now - lastQuestScan >= QUEST_SCAN_SECONDS) or now - lastFullQuestSend >= QUEST_FULL_SECONDS then
+		lastQuestScan, questsDirty = now, false
+		QueueQuests(now)
+	end
+	local q = table.remove(questQueue, 1)
+	if q then
+		questSeq = (questSeq + 1) % 65536
+		q.seq = questSeq
+		return P.EncodePacket(q)
+	end
+	return nil
+end
+
 -- C_PartyInfo first (WoW Forever), the old globals as a fallback; true when the call went through
 local function PartyCall(name, ...)
 	local fn = (C_PartyInfo and C_PartyInfo[name]) or _G[name]
@@ -1071,7 +1288,21 @@ for _, ev in ipairs(STATE_EVENTS) do
 	STATE_EVENT_SET[ev] = true
 	pcall(events.RegisterEvent, events, ev) -- an event this client lacks must not break the addon
 end
+local QUEST_EVENT_SET = {}
+for _, ev in ipairs(QUEST_EVENTS) do
+	QUEST_EVENT_SET[ev] = true
+	pcall(events.RegisterEvent, events, ev)
+end
 events:SetScript("OnEvent", function(_, event, ...)
+	if QUEST_EVENT_SET[event] then
+		questsDirty = true
+		if QUEST_SET_EVENTS[event] then
+			questSetChanged = true
+		end
+		if not STATE_EVENT_SET[event] then
+			return
+		end
+	end
 	if STATE_EVENT_SET[event] then
 		stateDirty = true
 		return
@@ -1154,6 +1385,9 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 		Print("panel glosow: " .. (db.panelShown and "widoczny" or "ukryty"))
 	elseif cmd == "inv" or cmd == "kick" or cmd == "lead" or cmd == "raid" or cmd == "leave" or cmd == "ready" then
 		GroupCommand(cmd, rest)
+	elseif cmd == "questy" or cmd == "quests" then
+		Print(("dziennik dla asystentki: %d questow, %d ze znacznikiem na mapie (wysylane: %s)"):format(
+			questStats.quests, questStats.withMarker, OnOff(db.assistant)))
 	elseif cmd == "asystent" or cmd == "assistant" then
 		db.assistant = ParseOnOff(rest, db.assistant)
 		if not db.assistant then
@@ -1184,6 +1418,6 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 			)
 		)
 		Print("/wvt on | off | test | dwell <s> | say [on|off] | party [on|off] | lang en|pl | panel | voice | voicedebug")
-		Print("/wvt inv Imie1 Imie2 | kick Imie | lead Imie | raid | leave | ready | asystent [on|off]")
+		Print("/wvt inv Imie1 Imie2 | kick Imie | lead Imie | raid | leave | ready | asystent [on|off] | questy")
 	end
 end

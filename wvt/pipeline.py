@@ -54,6 +54,7 @@ class PushToTalkPipeline:
         self.models_ready = threading.Event()
         self.last_timings: dict = {}
         self.assistant = None  # wvt.assistant.Assistant: the "assistant" push-to-talk channel goes to her
+        self.chat_log = None  # wvt.assistant.ChatLog: recent chat, the context of what you say next
 
     # ------------------------------------------------------------------ hotkey events
     @property
@@ -98,6 +99,25 @@ class PushToTalkPipeline:
             return str(self.cfg.get("assistant.name", "Asystentka"))
         cmd = self.cfg.get(f"channels.{channel}", "")
         return f"{channel.upper()} ({cmd})" if cmd else channel.upper()
+
+    # chat kinds that belong to the conversation of each push-to-talk channel
+    CONTEXT_KINDS = {
+        "say": ("SAY", "YELL"), "yell": ("SAY", "YELL"),
+        "party": ("PARTY", "PARTY_LEADER"), "raid": ("RAID", "RAID_LEADER", "PARTY", "PARTY_LEADER"),
+        "reply": ("WHISPER", "WHISPER_INFORM"),
+    }
+
+    def conversation(self, channel: str) -> list[str]:
+        """The last lines of this channel's conversation ("Ann: ...", "You: ...") for the translator."""
+        kinds = self.CONTEXT_KINDS.get(channel)
+        if self.chat_log is None or not kinds:
+            return []
+        lines = self.chat_log.recent(n=int(self.cfg.get("translation.context_lines", 6)), kinds=kinds,
+                                     max_age_s=float(self.cfg.get("translation.context_seconds", 180)))
+        if channel == "reply" and lines:  # /r answers whoever whispered you last: only that conversation
+            partner = next((ln.sender for ln in reversed(lines) if ln.kind == "WHISPER"), "")
+            lines = [ln for ln in lines if ln.sender == partner]
+        return [f"{'You' if ln.is_self else ln.sender.split('-')[0]}: {ln.text}" for ln in lines]
 
     def process_audio(self, audio: np.ndarray, channel: str, insert: bool = True) -> Optional[HistoryItem]:
         """Synchronous variant used by the CLI and the settings 'test' button."""
@@ -144,7 +164,9 @@ class PushToTalkPipeline:
 
             self.ui.status("busy", "Tłumaczenie…", [f"PL: {polish}"])
             t1 = time.perf_counter()
-            res = self.translator.translate(polish, "pl-en")
+            context = self.conversation(channel)
+            res = self.translator.translate(polish, "pl-en", context=context)
+            timings["context_lines"] = len(context)
             timings["translate_ms"] = round((time.perf_counter() - t1) * 1000)
             english = res.text
             if not english:

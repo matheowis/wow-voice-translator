@@ -26,7 +26,10 @@ another, so hover packets and voice packets never compete for the same pixels.
 The same grid also carries what the voice assistant needs: chat lines nobody asked to hear
 (TYPE_CHAT - whispers, /yell, /say while its voice toggle is off...; same layout as TYPE_VOICE,
 but a type of its own, so an older app that does not know it can never read them aloud) and,
-every few seconds, a TYPE_STATE packet with the player's level, money, zone, bags and group.
+every few seconds, a TYPE_STATE packet with the player's level, money, zone, bags and group;
+TYPE_QUEST packets (one per quest in the quest log: objectives, progress, the game's own map marker of
+the next objective) and TYPE_POS packets (where the player stands, so the app can tell the direction
+and distance to a quest marker at the moment you ask).
 
 This module is the single source of truth; ``addon/WoWVoiceTranslator/Protocol.lua``
 implements the same encoder and ``tests/test_protocol.py`` runs the Lua code through
@@ -58,6 +61,8 @@ TYPE_TEST = 3  # /wvt test – connection check, same layout as HOVER
 TYPE_VOICE = 4  # new /say or /party message to read aloud (second grid)
 TYPE_STATE = 5  # player state for the voice assistant (second grid)
 TYPE_CHAT = 6  # a chat line only for the assistant's log, never spoken (layout of TYPE_VOICE)
+TYPE_QUEST = 7  # one quest of the quest log (assistant)
+TYPE_POS = 8  # the player's map position (assistant)
 
 FLAG_SECRET = 0x01  # message text is a Midnight "secret value" – unreadable for addons
 FLAG_TRUNCATED = 0x02  # text had to be shortened to fit the grid
@@ -76,6 +81,21 @@ MAX_MEMBERS = 4
 # magic 2 + version/type 2 + seq 2 + flags 1 + level 1 + xp 4 + xp_max 4 + gold 4 + silver_copper 2
 # + bag_free 1 + bag_slots 1 + group_size 1
 STATE_FIXED_BYTES = 25
+
+# TYPE_QUEST flags
+QFLAG_COMPLETE = 0x01  # ready to turn in
+QFLAG_FAILED = 0x02
+QFLAG_TRACKED = 0x04  # shown in the objective tracker
+QFLAG_POI = 0x08  # the game shows a map marker for it (poi_* fields are valid)
+QFLAG_POI_OTHER_MAP = 0x10  # ...but on another map than the player's (another zone)
+MAX_QUEST_TITLE_BYTES = 64
+MAX_QUEST_ZONE_BYTES = 40
+MAX_OBJECTIVES = 5
+MAX_OBJECTIVE_BYTES = 60
+# magic 2 + version/type 2 + seq 2 + sync 2 + index 1 + total 1 + quest id 4 + level 1 + flags 1 + group 1
+# + poi map 4 + poi x 2 + poi y 2 + distance 2
+QUEST_FIXED_BYTES = 27
+POS_BYTES = 18  # magic 2 + version/type 2 + seq 2 + map 4 + x 2 + y 2 + width 2 + height 2 (+ checksum 2)
 
 # voice grid position: right of the hover grid, same top edge
 VOICE_GRID_X_CELLS = COLS + 2
@@ -154,6 +174,9 @@ class Packet:
     extra: dict = field(default_factory=dict)
     # TYPE_STATE only
     state: Optional["GameState"] = None
+    # TYPE_QUEST / TYPE_POS only
+    quest: Optional["QuestEntry"] = None
+    pos: Optional["PlayerPos"] = None
 
     @property
     def is_secret(self) -> bool:
@@ -219,6 +242,57 @@ class GameState:
         if self.in_raid:
             return max(0, 40 - self.group_size)
         return max(0, 5 - max(1, self.group_size))
+
+
+@dataclass
+class QuestEntry:
+    """One quest of the player's quest log (TYPE_QUEST)."""
+
+    sync: int = 0  # changes when the set of quests changes (accepted, abandoned, turned in)
+    index: int = 0  # position in that sync, 1-based...
+    total: int = 0  # ...of this many quests
+    quest_id: int = 0
+    level: int = 0
+    flags: int = 0
+    group: int = 0  # suggested group size, 0/1 = solo
+    poi_map: int = 0  # the game's marker for the next objective (uiMapID + normalised x, y)
+    poi_x: float = 0.0
+    poi_y: float = 0.0
+    distance_yd: Optional[int] = None  # the game's own distance to the quest (measured when sent)
+    title: str = ""
+    zone: str = ""  # map of the marker, or the quest log header
+    objectives: list[tuple[bool, str]] = field(default_factory=list)  # (done, "3/8 Kobold Candle")
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.flags & QFLAG_COMPLETE)
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.flags & QFLAG_FAILED)
+
+    @property
+    def tracked(self) -> bool:
+        return bool(self.flags & QFLAG_TRACKED)
+
+    @property
+    def has_poi(self) -> bool:
+        return bool(self.flags & QFLAG_POI)
+
+
+@dataclass
+class PlayerPos:
+    """Where the player stands (TYPE_POS): uiMapID, normalised x/y, the map's size in yards."""
+
+    map_id: int = 0
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+
+
+def _norm16(v: float) -> int:
+    return max(0, min(65535, int(round(float(v) * 65535))))
 
 
 # --------------------------------------------------------------------------- helpers
@@ -329,6 +403,30 @@ def encode_packet(p: Packet) -> bytes:
         for raw in members:
             body.append(len(raw))
             body += raw
+    elif p.type == TYPE_QUEST:
+        q = p.quest or QuestEntry()
+        body += _u16(q.sync).to_bytes(2, "big")
+        body += bytes([max(0, min(255, q.index)), max(0, min(255, q.total))])
+        body += _u32(q.quest_id).to_bytes(4, "big")
+        body += bytes([max(0, min(255, q.level)), q.flags & 0xFF, max(0, min(255, q.group))])
+        body += _u32(q.poi_map).to_bytes(4, "big")
+        body += _norm16(q.poi_x).to_bytes(2, "big") + _norm16(q.poi_y).to_bytes(2, "big")
+        body += (DIST_UNKNOWN if q.distance_yd is None else _u16(min(q.distance_yd, 65534))).to_bytes(2, "big")
+        for s_, limit in ((q.title, MAX_QUEST_TITLE_BYTES), (q.zone, MAX_QUEST_ZONE_BYTES)):
+            raw = utf8_truncate(s_.encode("utf-8"), limit)
+            body.append(len(raw))
+            body += raw
+        objs = q.objectives[:MAX_OBJECTIVES]
+        body.append(len(objs))
+        for done, text in objs:
+            raw = utf8_truncate(text.encode("utf-8"), MAX_OBJECTIVE_BYTES)
+            body += bytes([1 if done else 0, len(raw)])
+            body += raw
+    elif p.type == TYPE_POS:
+        pos = p.pos or PlayerPos()
+        body += _u32(pos.map_id).to_bytes(4, "big")
+        body += _norm16(pos.x).to_bytes(2, "big") + _norm16(pos.y).to_bytes(2, "big")
+        body += _u16(round(pos.width)).to_bytes(2, "big") + _u16(round(pos.height)).to_bytes(2, "big")
     out = bytearray(MAGIC) + body
     out += fletcher16(bytes(body)).to_bytes(2, "big")
     if len(out) > MAX_BYTES:
@@ -483,6 +581,31 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         if total > MAX_BYTES:
             raise DecodeError("length out of range")
         data = read_bytes(total)
+    elif ptype == TYPE_QUEST:
+        pos = QUEST_FIXED_BYTES  # then title, zone (u8 length + bytes), objective count, objectives
+        data = read_bytes(pos + 1)
+        for limit in (MAX_QUEST_TITLE_BYTES, MAX_QUEST_ZONE_BYTES):
+            n = data[pos]
+            if n > limit:
+                raise DecodeError("quest text length out of range")
+            pos += 1 + n
+            data = read_bytes(pos + 1)
+        count = data[pos]
+        if count > MAX_OBJECTIVES:
+            raise DecodeError("objective count out of range")
+        pos += 1
+        for _ in range(count):
+            data = read_bytes(pos + 2)
+            n = data[pos + 1]
+            if n > MAX_OBJECTIVE_BYTES:
+                raise DecodeError("objective length out of range")
+            pos += 2 + n
+        total = pos + 2
+        if total > MAX_BYTES:
+            raise DecodeError("length out of range")
+        data = read_bytes(total)
+    elif ptype == TYPE_POS:
+        data = read_bytes(POS_BYTES + 2)
     else:
         raise DecodeError(f"unknown type {ptype}")
 
@@ -497,6 +620,10 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         return _parse_voice(body, seq, ptype)
     if ptype == TYPE_STATE:
         return _parse_state(body, seq)
+    if ptype == TYPE_QUEST:
+        return _parse_quest(body, seq)
+    if ptype == TYPE_POS:
+        return _parse_pos(body, seq)
 
     pos = 4
     flags = body[pos]
@@ -593,6 +720,36 @@ def _parse_state(body: bytes, seq: int) -> Packet:
         st.members.append(body[pos : pos + n].decode("utf-8", errors="replace"))
         pos += n
     return Packet(type=TYPE_STATE, seq=seq, flags=st.flags, state=st)
+
+
+def _parse_quest(body: bytes, seq: int) -> Packet:
+    q = QuestEntry(sync=int.from_bytes(body[4:6], "big"), index=body[6], total=body[7],
+                   quest_id=int.from_bytes(body[8:12], "big"), level=body[12], flags=body[13], group=body[14],
+                   poi_map=int.from_bytes(body[15:19], "big"), poi_x=int.from_bytes(body[19:21], "big") / 65535,
+                   poi_y=int.from_bytes(body[21:23], "big") / 65535)
+    dist = int.from_bytes(body[23:25], "big")
+    q.distance_yd = None if dist == DIST_UNKNOWN else dist
+    pos = 25
+    texts = []
+    for _ in range(2):
+        n = body[pos]
+        texts.append(body[pos + 1 : pos + 1 + n].decode("utf-8", errors="replace"))
+        pos += 1 + n
+    q.title, q.zone = texts
+    count = body[pos]
+    pos += 1
+    for _ in range(count):
+        done, n = body[pos], body[pos + 1]
+        q.objectives.append((bool(done), body[pos + 2 : pos + 2 + n].decode("utf-8", errors="replace")))
+        pos += 2 + n
+    return Packet(type=TYPE_QUEST, seq=seq, flags=q.flags, quest=q)
+
+
+def _parse_pos(body: bytes, seq: int) -> Packet:
+    pos = PlayerPos(map_id=int.from_bytes(body[4:8], "big"), x=int.from_bytes(body[8:10], "big") / 65535,
+                    y=int.from_bytes(body[10:12], "big") / 65535, width=int.from_bytes(body[12:14], "big"),
+                    height=int.from_bytes(body[14:16], "big"))
+    return Packet(type=TYPE_POS, seq=seq, pos=pos)
 
 
 def try_decode(img: np.ndarray, search: int = 3) -> Optional[Packet]:

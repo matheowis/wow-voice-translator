@@ -165,3 +165,66 @@ def test_short_reply_kept_when_retry_is_not_better():
     tr = Translator(llm, {})
     res = tr.translate(src, "pl-en")
     assert res.text == "wait, OOM" and res.info["retry"] == "too-short"
+
+
+# ----------------------------------------------------------------- conversation context, "cześć"
+
+@pytest.mark.parametrize("text,context,farewell", [
+    ("ok, cześć", None, True),  # what the user said at the end of a talk
+    ("dzięki, cześć", None, True),
+    ("dobra, cześć wszystkim", None, True),
+    ("cześć", ["Ann: see you at 8", "You: ok"], True),  # you were already talking
+    ("cześć", None, False),
+    ("cześć", ["Ann: hey! long time no see"], False),  # she greets you first
+    ("cześć, co tam?", ["You: hi"], False),  # a greeting that goes on
+    ("hej, możesz mnie zaprosić?", None, False),
+    ("cześć wszystkim", None, False),
+    ("idziemy do lochu", ["You: ok"], False),
+])
+def test_cześć_is_hi_or_bye(text, context, farewell):
+    from wvt.translator import greeting_is_farewell
+
+    assert greeting_is_farewell(text, context) is farewell
+
+
+def test_say_bye_changes_only_the_last_greeting():
+    from wvt.translator import say_bye
+
+    assert say_bye("thx, hi") == "thx, bye"
+    assert say_bye("Hi") == "Bye"
+    assert say_bye("say hi to Ann, hey") == "say hi to Ann, bye"
+    assert say_bye("ok, cya") == "ok, cya"
+
+
+def test_translation_gets_the_conversation_and_caches_per_conversation():
+    llm = FakeLLM("thx, hi")
+    tr = Translator(llm, {})
+    talk = ["Ann: great, see you tomorrow", "You: sure"]
+    assert tr.translate("dzięki, cześć", "pl-en", context=talk).text == "thx, bye"
+    system = llm.calls[-1][0]["content"]
+    assert "Ann: great, see you tomorrow" in system and "never translate it" in system
+    assert llm.calls[-1][-1] == {"role": "user", "content": "dzięki, cześć"}  # only the message is translated
+    llm.reply = "hi"
+    assert tr.translate("cześć", "pl-en").text == "hi"  # no conversation: a greeting
+    assert tr.translate("cześć", "pl-en", context=talk).text == "bye"  # mid-conversation: goodbye
+    assert len(llm.calls) == 3
+
+
+def test_push_to_talk_uses_the_conversation_of_its_channel():
+    from wvt import protocol as P
+    from wvt.assistant import ChatLog
+    from wvt.pipeline import PushToTalkPipeline
+
+    log = ChatLog()
+    for kind, sender, text, me in [(1, "Ann", "see you at 8?", False), (3, "Bob", "pull now", False),
+                                   (1, "Me", "yes", True), (10, "Kai", "hi there", False),
+                                   (11, "Kai", "hello", True), (10, "Zed", "wts sword", False)]:
+        flags = P.VFLAG_SELF if me else 0
+        log.add_packet(P.Packet(type=P.TYPE_CHAT, seq=0, flags=flags, chat_kind=kind, sender=sender, text=text))
+    pipe = PushToTalkPipeline.__new__(PushToTalkPipeline)
+    pipe.cfg, pipe.chat_log = {}, log
+    pipe.cfg = type("C", (dict,), {"get": lambda self, k, d=None: d})()
+    assert pipe.conversation("say") == ["Ann: see you at 8?", "You: yes"]
+    assert pipe.conversation("party") == ["Bob: pull now"]
+    assert pipe.conversation("reply") == ["Zed: wts sword"]  # /r goes to the last whisper partner
+    assert pipe.conversation("guild") == []

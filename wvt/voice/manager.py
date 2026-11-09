@@ -1,7 +1,7 @@
 """Turns voice packets from the addon into speech.
 
-packet -> filters (channel, own line, block list, duplicates, distance, daily budget)
-       -> bounded queue (oldest dropped, stale lines skipped)
+packet -> filters (channel, own line, block list, duplicates, distance, /say safety valve, daily budget)
+       -> bounded queue (oldest dropped, stale lines skipped; the nearest speaker is read first)
        -> worker: voice of the character -> text (EN: normalised for speech, PL: translated
           locally) -> ElevenLabs stream -> mixer with the channel/distance gain
 
@@ -88,6 +88,12 @@ class VoiceManager:
         self._cv = threading.Condition()
         self._speaking: set[str] = set()
         self._recent: dict[tuple[str, str], float] = {}
+        # /say safety valve (a city full of chatter): recent /say lines, per-speaker floods, lines let through
+        self._say_seen: deque[tuple[float, str]] = deque()
+        self._flood: dict[str, deque[float]] = {}
+        self._flood_until: dict[str, float] = {}
+        self._crowd_spoken: deque[float] = deque()
+        self.crowded = False
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self.stats: Counter = Counter()
@@ -129,7 +135,13 @@ class VoiceManager:
             return reason
         with self._cv:
             if len(self._queue) >= int(self.cfg.get("max_queue", 6)):
-                old = self._queue.popleft()
+                # full: drop the line that would be read last (the farthest /say), not simply the oldest
+                worst = max(range(len(self._queue)), key=lambda i: self._priority(self._queue[i]))
+                if self._priority(job) >= self._priority(self._queue[worst]):
+                    self._skip(pkt, "queue-full")
+                    return "queue-full"
+                old = self._queue[worst]
+                del self._queue[worst]
                 self._skip(old.pkt, "queue-full")
             self._queue.append(job)
             self._cv.notify()
@@ -195,21 +207,78 @@ class VoiceManager:
                             float(self.cfg.get("quiet_gain", 0.35))) * float(self.cfg.get("volume_say", 1.0))
         if gain <= 0.01:
             return "out-of-range", None  # too far to hear: not synthesised, costs nothing
+        if channel == "say" and not pkt.is_self:
+            reason = self._say_valve(norm, pkt.distance, now)
+            if reason:
+                return reason, None
         if not self.budget.allows(min(len(text), int(self.cfg.get("max_chars_per_message", 220)))):
             return "budget", None
         self._recent[key] = now
         lang = "pl" if (pkt.lang_pl and not pkt.is_self) else "en"
         return None, VoiceJob(pkt, channel, gain, lang)
 
+    def _say_valve(self, speaker: str, distance: Optional[float], now: float) -> Optional[str]:
+        """The /say safety valve.  Returns why a line is skipped, or None.
+
+        * flood: a player who writes more than ``flood_lines`` lines in ``flood_window_s`` is not
+          read for ``flood_mute_s`` (spammers, macros);
+        * crowd: when ``crowd_lines`` /say lines or ``crowd_speakers`` different players arrive within
+          ``crowd_window_s`` (a city), only players within ``crowd_radius_yd`` are read, at most
+          ``crowd_max_per_min`` lines a minute.  Skipped lines are never synthesised: they cost nothing.
+        """
+        c = self.cfg.get("say_valve") or {}
+        window = float(c.get("crowd_window_s", 15))
+        self._say_seen.append((now, speaker))
+        while self._say_seen and now - self._say_seen[0][0] > window:
+            self._say_seen.popleft()
+        until = self._flood_until.get(speaker, 0.0)
+        times = self._flood.setdefault(speaker, deque())
+        times.append(now)
+        while times and now - times[0] > float(c.get("flood_window_s", 20)):
+            times.popleft()
+        if now < until:
+            return "flood"
+        if len(times) > int(c.get("flood_lines", 3)):
+            self._flood_until[speaker] = now + float(c.get("flood_mute_s", 30))
+            return "flood"
+        speakers = {s for _, s in self._say_seen}
+        crowded = len(self._say_seen) >= int(c.get("crowd_lines", 6)) or len(speakers) >= int(c.get("crowd_speakers", 4))
+        if crowded != self.crowded:
+            self.crowded = crowded
+            log.info("say safety valve: %s", "crowd - only the nearest players are read" if crowded else "off")
+        if not crowded:
+            return None
+        if distance is None or distance > float(c.get("crowd_radius_yd", 10)):
+            return "crowd"
+        while self._crowd_spoken and now - self._crowd_spoken[0] > 60:
+            self._crowd_spoken.popleft()
+        if len(self._crowd_spoken) >= int(c.get("crowd_max_per_min", 6)):
+            return "crowd"
+        self._crowd_spoken.append(now)
+        return None
+
     # ------------------------------------------------------------------ workers
+    @staticmethod
+    def _priority(job: VoiceJob) -> tuple:
+        """Who is read first: the assistant, then the party, then /say by distance (nearest first)."""
+        if job.channel == "assistant":
+            return (0, 0.0, job.received)
+        if job.channel == "party":
+            return (1, 0.0, job.received)
+        dist = 0.0 if job.pkt.is_self else (job.pkt.distance if job.pkt.distance is not None else 999.0)
+        return (2, dist, job.received)
+
     def _next_job(self) -> Optional[VoiceJob]:
         with self._cv:
             while not self._stop.is_set():
-                for i, job in enumerate(self._queue):
-                    if job.speaker not in self._speaking:  # one line at a time per speaker
-                        del self._queue[i]
-                        self._speaking.add(job.speaker)
-                        return job
+                ready = [(self._priority(job), i) for i, job in enumerate(self._queue)
+                         if job.speaker not in self._speaking]  # one line at a time per speaker
+                if ready:
+                    _, i = min(ready)
+                    job = self._queue[i]
+                    del self._queue[i]
+                    self._speaking.add(job.speaker)
+                    return job
                 self._cv.wait(0.5)
         return None
 

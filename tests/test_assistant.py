@@ -41,7 +41,7 @@ def test_polish_requests_become_intents(text, kind):
 
 
 @pytest.mark.parametrize("text", [
-    "Czy mogę solo zrobić Deadmines na 18 levelu?", "gdzie znajdę kask?", "czy znasz polskich graczy?",
+    "Czy mogę solo zrobić Deadmines na 18 levelu?", "czy znasz polskich graczy?",
     "kto jest liderem?", "kup mi torbę", "jaki jest najlepszy expowisko", "idziemy do bagna",
 ])
 def test_ordinary_questions_are_not_mistaken_for_commands(text):
@@ -245,3 +245,82 @@ def test_chat_log_keeps_whisper_partners_and_names():
     log.add_packet(chat_pkt("Ann", "you there?", kind=11, self_=True))  # you whispered Ann
     assert log.last_whisper_partner() == "Ann"
     assert log.names() == ["Ann", "Bob-Kazzak"]
+
+
+@pytest.mark.parametrize("text,on", [
+    ("włącz głosy na say", True), ("włącz sej", True), ("czytaj say", True), ("niech czyta say", True),
+    ("włącz czytanie", True), ("czytaj mi co mówią ludzie obok", True), ("wyłącz say", False),
+    ("wyłącz czytanie say", False),
+])
+def test_say_reading_is_switched_by_voice(text, on):
+    it = parse_intent(text)
+    assert (it.kind, it.on) == ("voice_say", on)
+
+
+# --------------------------------------------------------------------------- quests
+
+class QuestTranslator(FakeTranslator):
+    EN = {"ile mi zostało świec?": "how many candles do I have left?",
+          "gdzie są te wątroby?": "where are those livers?",
+          "gdzie znajdę kask?": "where can I find a helmet?"}
+
+    def translate(self, text, direction):
+        return Result(self.EN.get(text, "")) if direction == "pl-en" else super().translate(text, direction)
+
+
+def quest_pkt(**kw):
+    return P.Packet(type=P.TYPE_QUEST, seq=0, quest=P.QuestEntry(**kw))
+
+
+def quest_assistant():
+    a, ins, ui, voice, llm = make_assistant()
+    a.translator = QuestTranslator()
+    a.on_packet(P.Packet(type=P.TYPE_POS, seq=1, pos=P.PlayerPos(37, 0.40, 0.70, 3470, 2314)))
+    poi = P.QFLAG_POI
+    a.on_packet(quest_pkt(sync=1, index=1, total=3, quest_id=101, level=8, flags=P.QFLAG_TRACKED | poi, poi_map=37,
+                          poi_x=0.45, poi_y=0.60, title="The Fargodeep Mine", zone="Elwynn Forest",
+                          objectives=[(False, "3/8 Kobold Candle")]))
+    a.on_packet(quest_pkt(sync=1, index=2, total=3, quest_id=102, level=9, flags=P.QFLAG_COMPLETE | poi, poi_map=37,
+                          poi_x=0.30, poi_y=0.70, title="Bounty on Murlocs", zone="Elwynn Forest",
+                          objectives=[(True, "8/8 Murloc Fin")]))
+    a.on_packet(quest_pkt(sync=1, index=3, total=3, quest_id=103, level=10, flags=poi | P.QFLAG_POI_OTHER_MAP,
+                          poi_map=52, poi_x=0.5, poi_y=0.25, title="Westfall Stew", zone="Westfall",
+                          objectives=[(False, "0/5 Goretusk Liver")]))
+    return a, llm
+
+
+def test_quest_log_answers_come_from_the_game():
+    a, llm = quest_assistant()
+    assert a.handle("co mam do zrobienia?")[0] == (
+        "Masz 3 questy. Do oddania: Bounty on Murlocs. W toku: The Fargodeep Mine: Kobold Candle 3 z 8; "
+        "Westfall Stew: Goretusk Liver 0 z 5.")
+    assert a.handle("ile mi zostało świec?")[0] == "The Fargodeep Mine: Kobold Candle 3 z 8."
+    # the tracked quest's marker: 173 yd east and 231 yd north of the player
+    assert a.handle("gdzie mam iść?")[0] == "The Fargodeep Mine: około 290 jardów na północny wschód."
+    assert a.handle("gdzie są te wątroby?")[0] == "Westfall Stew: cel jest w innej strefie: Westfall."
+    assert a.handle("co mogę oddać?")[0] == (
+        "Do oddania masz: Bounty on Murlocs. Najbliżej oddasz Bounty on Murlocs, około 350 jardów na zachód.")
+    assert a.handle("który quest jest najbliżej?")[0] == "Najbliżej masz The Fargodeep Mine, około 290 jardów na północny wschód."
+    assert llm.calls == []  # all of that without the LLM
+
+
+def test_free_quest_questions_get_the_log_as_facts_and_other_places_go_to_chat():
+    a, llm = quest_assistant()
+    a.handle("o co chodzi w tym queście?")
+    system = llm.calls[-1][0]["content"]
+    assert "The Fargodeep Mine" in system and "Kobold Candle 3 z 8" in system and "jedyne fakty" in system
+    a.handle("gdzie znajdę kask?")  # not in the quest log: an ordinary chat answer
+    assert "Dziennik zadań" not in llm.calls[-1][0]["content"]
+
+
+def test_without_a_quest_log_she_says_so_and_a_new_log_replaces_the_old_one():
+    a, *_ = make_assistant()
+    assert "Nie widzę jeszcze twojego dziennika" in a.handle("co mam do zrobienia?")[0]
+    a.on_packet(quest_pkt(sync=1, index=1, total=2, quest_id=1, title="Old One"))
+    a.on_packet(quest_pkt(sync=1, index=2, total=2, quest_id=2, title="Kept One"))
+    a.on_packet(quest_pkt(sync=2, index=1, total=2, quest_id=2, title="Kept One"))
+    assert sorted(q.title for q in a.quests.quests()) == ["Kept One", "Old One"]  # the new list is still arriving
+    a.on_packet(quest_pkt(sync=2, index=2, total=2, quest_id=3, title="New One"))
+    assert [q.title for q in a.quests.quests()] == ["Kept One", "New One"]
+    a.on_packet(quest_pkt(sync=3, index=0, total=0))
+    assert a.handle("jakie mam questy?")[0].startswith("Twój dziennik zadań jest pusty")

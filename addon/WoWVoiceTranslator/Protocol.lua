@@ -28,6 +28,8 @@ P.TYPE_TEST = 3
 P.TYPE_VOICE = 4
 P.TYPE_STATE = 5 -- player state for the voice assistant
 P.TYPE_CHAT = 6 -- a chat line only for the assistant, never spoken (same layout as TYPE_VOICE)
+P.TYPE_QUEST = 7 -- one quest of the quest log (assistant)
+P.TYPE_POS = 8 -- the player's map position (assistant)
 
 P.FLAG_SECRET = 1
 P.FLAG_TRUNCATED = 2
@@ -42,6 +44,16 @@ P.SFLAG_COMBAT = 16
 P.MAX_NAME_BYTES = 48
 P.MAX_ZONE_BYTES = 64
 P.MAX_MEMBERS = 4
+
+P.QFLAG_COMPLETE = 1 -- ready to turn in
+P.QFLAG_FAILED = 2
+P.QFLAG_TRACKED = 4
+P.QFLAG_POI = 8 -- the game shows a map marker for the next objective
+P.QFLAG_POI_OTHER_MAP = 16 -- ...on another map than the player's
+P.MAX_QUEST_TITLE_BYTES = 64
+P.MAX_QUEST_ZONE_BYTES = 40
+P.MAX_OBJECTIVES = 5
+P.MAX_OBJECTIVE_BYTES = 60
 
 -- voice grid: same geometry, COLS + 2 cells to the right of the hover grid
 P.VOICE_GRID_X_CELLS = P.COLS + 2
@@ -96,6 +108,16 @@ local function pushByte(t, v)
 		v = 255
 	end
 	t[#t + 1] = v
+end
+
+local function pushNorm16(t, v) -- 0..1 -> 0..65535
+	local n = floor((v or 0) * 65535 + 0.5)
+	if n < 0 then
+		n = 0
+	elseif n > 65535 then
+		n = 65535
+	end
+	pushU16(t, n)
 end
 
 local function pushFixed10(t, v)
@@ -178,6 +200,10 @@ end
 --                  distMethod, race, sender, text }
 -- state packets: { type = TYPE_STATE, seq, flags, level, xp, xpMax, gold, silverCopper,
 --                  bagFree, bagSlots, groupSize, name, zone, subzone, members = { names } }
+-- quest packets: { type = TYPE_QUEST, seq, sync, index, total, questID, level, flags, group,
+--                  poiMap, poiX, poiY (0..1), distance (yards or nil), title, zone,
+--                  objectives = { { done = bool, text = "3/8 Kobold Candle" }, ... } }
+-- position packets: { type = TYPE_POS, seq, mapID, x, y (0..1), width, height (yards) }
 function P.EncodePacket(p)
 	local b = { 87, 86 } -- "WV"
 	pushU8(b, P.VERSION)
@@ -265,6 +291,50 @@ function P.EncodePacket(p)
 			pushU8(b, #s)
 			pushBytes(b, s)
 		end
+	elseif p.type == P.TYPE_QUEST then
+		pushU16(b, p.sync or 0)
+		pushByte(b, p.index)
+		pushByte(b, p.total)
+		pushU32(b, p.questID)
+		pushByte(b, p.level)
+		pushU8(b, p.flags or 0)
+		pushByte(b, p.group)
+		pushU32(b, p.poiMap)
+		pushNorm16(b, p.poiX)
+		pushNorm16(b, p.poiY)
+		if p.distance == nil then
+			pushU16(b, P.DIST_UNKNOWN)
+		else
+			local d = floor(p.distance + 0.5)
+			if d > P.DIST_UNKNOWN - 1 then
+				d = P.DIST_UNKNOWN - 1
+			end
+			pushU16(b, d)
+		end
+		for _, field in ipairs({ { p.title, P.MAX_QUEST_TITLE_BYTES }, { p.zone, P.MAX_QUEST_ZONE_BYTES } }) do
+			local s = P.Utf8Truncate(field[1] or "", field[2])
+			pushU8(b, #s)
+			pushBytes(b, s)
+		end
+		local objectives = p.objectives or {}
+		local count = #objectives
+		if count > P.MAX_OBJECTIVES then
+			count = P.MAX_OBJECTIVES
+		end
+		pushU8(b, count)
+		for i = 1, count do
+			local o = objectives[i]
+			local s = P.Utf8Truncate(o.text or "", P.MAX_OBJECTIVE_BYTES)
+			pushU8(b, o.done and 1 or 0)
+			pushU8(b, #s)
+			pushBytes(b, s)
+		end
+	elseif p.type == P.TYPE_POS then
+		pushU32(b, p.mapID)
+		pushNorm16(b, p.x)
+		pushNorm16(b, p.y)
+		pushU16(b, floor((p.width or 0) + 0.5))
+		pushU16(b, floor((p.height or 0) + 0.5))
 	end
 	pushU16(b, P.Fletcher16(b, 3, #b))
 	return b

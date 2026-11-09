@@ -16,6 +16,9 @@ pipeline and:
   group (from the addon's state packet);
 * **voices** - mute or unmute the character voices, Polish/English voice mode, /say and /party
   voices on or off;
+* **quests** - what is in your quest log, how far you are with a quest, what you can turn in,
+  where to go (direction and distance to the game's own map marker of the next objective), which
+  quest is nearest; free questions about your quests go to the LLM with the quest log as facts;
 * anything else - a short chat in character (the local LLM; she may be wrong about game facts).
 
 Commands are matched by rules on the Polish text (fast, predictable, nothing invented); the LLM only
@@ -37,6 +40,7 @@ from typing import Callable, Optional
 
 from . import protocol
 from .chat_insert import build_chat_line
+from .quests import QuestBook, match_quests, spoken_objective
 
 log = logging.getLogger(__name__)
 
@@ -229,7 +233,8 @@ _RULES: tuple[tuple[str, str], ...] = (
                 r"\b(po polsku|na polski|polski)\b"),
     ("lang_en", r"\b(przelacz\w*|zmien\w*|ustaw\w*|tryb\w*|niech|mow\w*|czytaj\w*|wroc\w*)\b.*"
                 r"\b(po angielsku|na angielski|angielski|w oryginale|oryginal)\b"),
-    ("voice_say", r"\b(wlacz\w*|wylacz\w*)\b.*\b(say|sej\w*|sayu)\b"),
+    ("voice_say", r"\b(wlacz\w*|wylacz\w*|zalacz\w*|odpal\w*|uruchom\w*|czytaj\w*|czyta)\b.*\b(say\w*|sej\w*)\b"
+                  r"|\bczytaj\w*\b.*\bco (mowia|pisza|gadaja)\b.*\bobok\b|^(wlacz|zalacz)\w* czytanie( czatu)?$"),
     ("voice_party", r"\b(wlacz\w*|wylacz\w*)\b.*\b(party|partyjn\w*|druzyn\w*)\b.*\bglos|"
                     r"\b(wlacz\w*|wylacz\w*)\b.*\bglos\w*\b.*\b(party|druzyn\w*)\b"),
     ("mute", r"\b(wycisz\w*|wylacz\w*|zamknij|uspij)\b.*\b(glos\w*|ich|wszystkich|lektor\w*|czytanie)\b"),
@@ -253,6 +258,17 @@ _RULES: tuple[tuple[str, str], ...] = (
     ("bags", r"\b(ile|miejsc\w*|woln\w*|peln\w*|zapchan\w*|slot\w*)\b.*\b(torb\w*|plecak\w*|ekwipunk\w*|bagach|bagi)\b"
              r"|\b(torb\w*|plecak\w*|ekwipunk\w*)\b.*\b(miejsc\w*|woln\w*|peln\w*|zapchan\w*)\b"),
     ("members", r"\b(kto|kogo)\b.*\b(party|grup\w*|druzyn\w*|raid\w*)\b|\bsklad\b"),
+    # quests (after gold / xp / bags, which also start with "ile")
+    ("quest_turnin", r"\b(co|ktore|ktory|jakie|czy)\b.*\b(oddac|oddania|oddam|skonczon\w*|ukonczon\w*|gotow\w*"
+                     r"|zrobion\w*)\b|\bgdzie\b.*\boddac\b"),
+    ("quest_nearest", r"\b(najblizsz\w*|najblizej)\b"),
+    ("quest_list", r"\b(jakie|ile)\b.*\b(quest\w*|quesc\w*|kwest\w*|kwesc\w*|zadan\w*|dziennik\w*|misj\w*)\b"
+                   r"|\bco (mam|jest) w (dzienniku|questach)\b|\b(lista|liste) (questow|zadan)\b"
+                   r"|\bco mam (do zrobienia|zrobic|teraz robic)\b|\bco (dalej|teraz) (robic|robimy|robie)\b"),
+    ("quest_where", r"\bgdzie\b.*\b(mam|musze|isc|ide|jest|sa|znajde|szukac|lezy|leza|teraz)\b|\bw ktora strone\b"
+                    r"|\bjak (tam )?(dojsc|trafic|dotrzec|dojechac)\b|\bprowadz\w* mnie\b"),
+    ("quest_progress", r"\bile\b.*\b(zostalo|brakuje|jeszcze|zebral\w*|mam)\b|\bjak (mi )?idzie\b"),
+    ("quest_info", r"\b(quest\w*|quesc\w*|kwest\w*|kwesc\w*|zadani\w*|misj\w*)\b"),
 )
 _COMPILED = tuple((kind, re.compile(rx)) for kind, rx in _RULES)
 _MESSAGE_RE = re.compile(r"^(?:(?:ej|hej|sluchaj|prosze|i)\s+)*(odpisz|odpowiedz|napisz|powiedz)\b")
@@ -312,7 +328,9 @@ def parse_intent(text: str) -> Intent:
     for kind, rx in _COMPILED:
         if not rx.search(t):
             continue
-        if kind in ("voice_say", "voice_party", "mute", "unmute"):
+        if kind in ("voice_say", "voice_party"):  # "czytaj say" switches on, "wyłącz say" off
+            return Intent(kind, on=not re.search(r"\b(wylacz\w*|zamknij|stop)\b", t))
+        if kind in ("mute", "unmute"):
             on = bool(re.search(r"\b(wlacz\w*|odcisz\w*|przywroc\w*)\b", t)) and not re.search(r"\bwylacz\w*", t)
             return Intent(kind, on=on)
         if kind in ("lead", "kick"):
@@ -353,7 +371,8 @@ SUMMARY = (
 class Assistant:
     def __init__(self, cfg, translator, llm, inserter, ui, wow_foreground: Callable[[], bool],
                  voice_getter: Callable[[], object] = lambda: None,
-                 set_voices_enabled: Optional[Callable[[bool], None]] = None):
+                 set_voices_enabled: Optional[Callable[[bool], None]] = None,
+                 chat_log: Optional["ChatLog"] = None, quests: Optional[QuestBook] = None):
         self.cfg = cfg
         self.translator = translator
         self.llm = llm
@@ -362,7 +381,8 @@ class Assistant:
         self.wow_foreground = wow_foreground
         self.voice_getter = voice_getter
         self.set_voices_enabled = set_voices_enabled
-        self.chat = ChatLog()
+        self.chat = chat_log if chat_log is not None else ChatLog()
+        self.quests = quests if quests is not None else QuestBook()
         self.state: Optional[protocol.GameState] = None
         self.state_at = 0.0
         self._invited: dict[str, float] = {}
@@ -379,6 +399,8 @@ class Assistant:
             self.state, self.state_at = pkt.state, time.time()
         elif pkt.type in (protocol.TYPE_VOICE, protocol.TYPE_CHAT):
             self.chat.add_packet(pkt)
+        elif pkt.type in (protocol.TYPE_QUEST, protocol.TYPE_POS):
+            self.quests.on_packet(pkt)
 
     # ------------------------------------------------------------------ one request
     def handle(self, polish: str) -> tuple[str, str]:
@@ -441,6 +463,8 @@ class Assistant:
             return "Enter i od teraz inni mówią po polsku.", "/wvt lang pl"
         if k == "lang_en":
             return "Enter i wracamy do angielskiego oryginału.", "/wvt lang en"
+        if k.startswith("quest_"):
+            return self._quest_answer(k, polish), ""
         return self._chat(polish), ""
 
     # ------------------------------------------------------------------ group
@@ -603,6 +627,107 @@ class Assistant:
             self._history.append({"role": "user", "content": polish})
             self._history.append({"role": "assistant", "content": out})
         return out or "Hm, zawiesiłam się na chwilę. Powtórzysz?"
+
+    # ------------------------------------------------------------------ quests
+    _GENERIC = {"gdzie", "mam", "musze", "isc", "ide", "teraz", "dalej", "w", "ktora", "strone", "jak", "tam", "dojsc",
+                "trafic", "dotrzec", "dojechac", "ile", "mi", "zostalo", "brakuje", "jeszcze", "jest", "sa", "to", "ten",
+                "ta", "te", "quest", "questa", "questu", "questy", "questow", "quescie", "kwescie", "zadanie", "zadania", "cel", "celu", "ej",
+                "hej", "iskra", "prosze", "powiedz", "a", "i", "mnie", "prowadz", "znajde", "szukac", "idzie", "co", "z",
+                "do", "na", "po", "o", "chodzi", "w", "tym", "tej", "lezy", "leza", "moj", "moje", "moim", "nastepny",
+                "nastepne", "zebralem", "zebralam", "robic", "zrobic", "teraz"}
+
+    def _names_something(self, polish: str) -> bool:
+        return any(w not in self._GENERIC and len(w) > 2 for w in fold(polish).split())
+
+    def _pick_quest(self, polish: str, quests: list) -> tuple[Optional[protocol.QuestEntry], bool]:
+        """(the quest the question is about, whether it was named).  None: it names something not in the log."""
+        english = self._translate(polish, "pl-en")
+        scored = match_quests(f"{english} {polish}", quests)
+        if scored:
+            return scored[0][1], True
+        if self._names_something(polish):
+            return None, False
+        open_quests = [q for q in quests if not q.complete]
+        tracked = [q for q in open_quests if q.tracked]
+        if len(tracked) == 1:
+            return tracked[0], False
+        near = self.quests.nearest(open_quests)
+        if near:
+            return near[0], False
+        return (tracked or open_quests or quests)[0], False
+
+    @staticmethod
+    def _progress(q: protocol.QuestEntry) -> str:
+        if q.complete:
+            return f"{q.title} – zrobione, do oddania"
+        objs = [spoken_objective(t, done) for done, t in q.objectives if not done] or \
+            [spoken_objective(t, done) for done, t in q.objectives]
+        return f"{q.title}: {', '.join(objs)}" if objs else q.title
+
+    def _where_text(self, q: protocol.QuestEntry) -> str:
+        w = self.quests.where(q)
+        if w is None:
+            return f"Nie mam znacznika dla {q.title} na mapie." + (f" Cel: {self._progress(q).split(': ', 1)[-1]}."
+                                                                   if q.objectives else "")
+        prefix = f"{q.title} jest gotowy do oddania, punkt oddania: " if q.complete else f"{q.title}: "
+        return prefix + w.polish() + "."
+
+    def _quest_facts(self, quests: list) -> str:
+        lines = []
+        for q in quests[:4]:
+            w = self.quests.where(q)
+            bits = [f"poziom {q.level}"] + (["gotowy do oddania"] if q.complete else []) + \
+                ([f"na grupę {q.group} osób"] if q.group > 1 else [])
+            objs = ", ".join(spoken_objective(t, d) for d, t in q.objectives) or "brak celów"
+            lines.append(f"- {q.title} ({', '.join(bits)}): cele: {objs}; {w.polish() if w else 'brak znacznika'}")
+        return "\n".join(lines)
+
+    def _quest_answer(self, kind: str, polish: str) -> str:
+        book = self.quests
+        if not book.known:
+            return "Nie widzę jeszcze twojego dziennika zadań. Daj mi chwilę po /reload albo wpisz /wvt asystent on."
+        quests = book.quests()
+        if not quests:
+            return "Twój dziennik zadań jest pusty. Czas złapać jakiś quest."
+        done = [q for q in quests if q.complete]
+        todo = [q for q in quests if not q.complete]
+        if kind == "quest_list":
+            n = len(quests)
+            parts = [f"Masz {n} {plural(n, 'quest', 'questy', 'questów')}."]
+            if done:
+                parts.append(f"Do oddania: {polish_list([q.title for q in done[:3]])}.")
+            if todo:
+                shown = [self._progress(q) for q in todo[:3]]
+                parts.append("W toku: " + "; ".join(shown) + ("; i jeszcze inne." if len(todo) > 3 else "."))
+            return " ".join(parts)
+        if kind == "quest_turnin":
+            if not done:
+                return "Jeszcze nic nie jest skończone. " + (f"Najbliżej końca: {self._progress(todo[0])}." if todo else "")
+            near = book.nearest(done)
+            out = f"Do oddania masz: {polish_list([q.title for q in done[:4]])}."
+            if near:
+                out += f" Najbliżej oddasz {near[0].title}, {near[1].polish()}."
+            return out
+        if kind == "quest_nearest":
+            near = book.nearest(todo) or book.nearest(quests)
+            if not near:
+                return "Żaden quest nie ma teraz znacznika na tej mapie."
+            return f"Najbliżej masz {near[0].title}, {near[1].polish()}."
+        target, named = self._pick_quest(polish, quests)
+        if target is None:  # asks about something that is not in the quest log
+            return self._chat(polish)
+        if kind == "quest_where":
+            return self._where_text(target)
+        if kind == "quest_progress":
+            return self._progress(target) + "."
+        # anything else about quests: the LLM, with the quest log as the only facts
+        picked = [target] + [q for q in quests if q is not target]
+        extra = str(self.cfg.get("assistant.persona_extra", "") or "")
+        system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "")
+        system += ("\nDziennik zadań gracza (to są jedyne fakty o questach, nie dodawaj niczego od siebie):\n"
+                   + self._quest_facts(picked))
+        out = self._llm_text([{"role": "system", "content": system}, {"role": "user", "content": polish}])
+        return out or self._progress(target) + "."
 
     def _info(self, kind: str) -> str:
         st = self.state

@@ -87,6 +87,10 @@ DEFAULTS: dict[str, Any] = {
         "temperature": 0.0,
         "glossary_file": "wvt/data/glossary.json",
         "cache_size": 500,
+        # what you say is translated together with the last lines of the same conversation
+        # (/say, /party, /raid, whispers for /r), so "ok, cześć" at the end of a talk becomes "ok, bye"
+        "context_lines": 6,
+        "context_seconds": 180,
     },
     "insert": {
         # slash: press "/" (opens chat with "/") then paste "p text"  -> safest
@@ -138,6 +142,19 @@ DEFAULTS: dict[str, Any] = {
         "max_concurrent": 2,  # utterances playing at the same time
         "stale_after_s": 20,  # older lines are dropped instead of read late
         "dedup_window_s": 15,  # same sender + same text within this window is read once
+        # /say safety valve for crowded places (cities): the nearest player is always read first;
+        # when many people talk at once only players within crowd_radius_yd are read, at most
+        # crowd_max_per_min lines a minute; a player flooding the chat is muted for a while
+        "say_valve": {
+            "crowd_window_s": 15,
+            "crowd_lines": 6,  # this many /say lines in the window...
+            "crowd_speakers": 4,  # ...or this many different players = a crowd
+            "crowd_radius_yd": 10,
+            "crowd_max_per_min": 6,
+            "flood_lines": 3,  # more lines than this from one player within flood_window_s...
+            "flood_window_s": 20,
+            "flood_mute_s": 30,  # ...and they are not read for this long
+        },
         "blocked_players": [],
         "output_device": None,  # sounddevice output name/index, None = Windows default
         "realm": "Forever",  # used when the sender name has no "-Realm" part
