@@ -30,6 +30,36 @@ P.TYPE_STATE = 5 -- player state for the voice assistant
 P.TYPE_CHAT = 6 -- a chat line only for the assistant, never spoken (same layout as TYPE_VOICE)
 P.TYPE_QUEST = 7 -- one quest of the quest log (assistant)
 P.TYPE_POS = 8 -- the player's map position (assistant)
+P.TYPE_PLAYER = 9 -- class, race, faction, sex (assistant)
+P.TYPE_DONE = 10 -- completed quest ids, in parts (assistant)
+P.FACTION_NONE, P.FACTION_ALLIANCE, P.FACTION_HORDE = 0, 1, 2
+P.MAX_DONE_IDS = 154 -- (MAX_BYTES - 11 - 2) / 3
+P.TYPE_LOOT = 11 -- an item somebody can roll on (assistant: need or greed)
+P.LFLAG_BOP, P.LFLAG_NEED, P.LFLAG_GREED, P.LFLAG_DE = 1, 2, 4, 8
+P.MAX_LOOT_NAME_BYTES = 64
+P.MAX_WORN_NAME_BYTES = 40
+P.MAX_LOOT_STATS = 12
+-- equip locations by index (1-based; 0 = not equippable) - same list as wvt/protocol.py EQUIP_LOCS
+P.EQUIP_LOCS = {
+	"INVTYPE_HEAD", "INVTYPE_NECK", "INVTYPE_SHOULDER", "INVTYPE_BODY", "INVTYPE_CHEST", "INVTYPE_ROBE",
+	"INVTYPE_WAIST", "INVTYPE_LEGS", "INVTYPE_FEET", "INVTYPE_WRIST", "INVTYPE_HAND", "INVTYPE_FINGER",
+	"INVTYPE_TRINKET", "INVTYPE_CLOAK", "INVTYPE_WEAPON", "INVTYPE_SHIELD", "INVTYPE_2HWEAPON",
+	"INVTYPE_WEAPONMAINHAND", "INVTYPE_WEAPONOFFHAND", "INVTYPE_HOLDABLE", "INVTYPE_RANGED", "INVTYPE_THROWN",
+	"INVTYPE_RANGEDRIGHT", "INVTYPE_RELIC", "INVTYPE_TABARD", "INVTYPE_BAG", "INVTYPE_AMMO", "INVTYPE_QUIVER",
+}
+P.EQUIP_LOC_INDEX = {}
+for i, loc in ipairs(P.EQUIP_LOCS) do
+	P.EQUIP_LOC_INDEX[loc] = i
+end
+-- inventory slots an item of that location would replace
+P.SLOTS_FOR = {
+	INVTYPE_HEAD = { 1 }, INVTYPE_NECK = { 2 }, INVTYPE_SHOULDER = { 3 }, INVTYPE_BODY = { 4 }, INVTYPE_CHEST = { 5 },
+	INVTYPE_ROBE = { 5 }, INVTYPE_WAIST = { 6 }, INVTYPE_LEGS = { 7 }, INVTYPE_FEET = { 8 }, INVTYPE_WRIST = { 9 },
+	INVTYPE_HAND = { 10 }, INVTYPE_FINGER = { 11, 12 }, INVTYPE_TRINKET = { 13, 14 }, INVTYPE_CLOAK = { 15 },
+	INVTYPE_WEAPON = { 16, 17 }, INVTYPE_SHIELD = { 17 }, INVTYPE_2HWEAPON = { 16 }, INVTYPE_WEAPONMAINHAND = { 16 },
+	INVTYPE_WEAPONOFFHAND = { 17 }, INVTYPE_HOLDABLE = { 17 }, INVTYPE_RANGED = { 18 }, INVTYPE_THROWN = { 18 },
+	INVTYPE_RANGEDRIGHT = { 18 }, INVTYPE_RELIC = { 18 },
+}
 
 P.FLAG_SECRET = 1
 P.FLAG_TRUNCATED = 2
@@ -95,6 +125,18 @@ local function pushU32(t, v)
 		v = 4294967295
 	end
 	t[#t + 1] = floor(v / 16777216) % 256
+	t[#t + 1] = floor(v / 65536) % 256
+	t[#t + 1] = floor(v / 256) % 256
+	t[#t + 1] = v % 256
+end
+
+local function pushU24(t, v)
+	v = floor(v or 0)
+	if v < 0 then
+		v = 0
+	elseif v > 16777215 then
+		v = 16777215
+	end
 	t[#t + 1] = floor(v / 65536) % 256
 	t[#t + 1] = floor(v / 256) % 256
 	t[#t + 1] = v % 256
@@ -204,6 +246,11 @@ end
 --                  poiMap, poiX, poiY (0..1), distance (yards or nil), title, zone,
 --                  objectives = { { done = bool, text = "3/8 Kobold Candle" }, ... } }
 -- position packets: { type = TYPE_POS, seq, mapID, x, y (0..1), width, height (yards) }
+-- player packets: { type = TYPE_PLAYER, seq, classID, raceID, faction (FACTION_*), sex }
+-- done packets: { type = TYPE_DONE, seq, sync, part, parts (0 = just turned in), ids = { questID, ... } }
+-- loot packets: { type = TYPE_LOOT, seq, rollID, flags (LFLAG_*), quality, itemLevel, minLevel, classID, subclassID,
+--                 equipLoc (index into EQUIP_LOCS), count, name, stats = { { code, value }, ... },
+--                 equipped = { { itemLevel, subclassID, name, stats }, ... } }   (at most 2 worn items)
 function P.EncodePacket(p)
 	local b = { 87, 86 } -- "WV"
 	pushU8(b, P.VERSION)
@@ -335,6 +382,56 @@ function P.EncodePacket(p)
 		pushNorm16(b, p.y)
 		pushU16(b, floor((p.width or 0) + 0.5))
 		pushU16(b, floor((p.height or 0) + 0.5))
+	elseif p.type == P.TYPE_PLAYER then
+		pushByte(b, p.classID)
+		pushByte(b, p.raceID)
+		pushByte(b, p.faction)
+		pushByte(b, p.sex)
+	elseif p.type == P.TYPE_DONE then
+		local ids = p.ids or {}
+		local n = math.min(#ids, P.MAX_DONE_IDS)
+		pushU16(b, p.sync or 0)
+		pushByte(b, p.part)
+		pushByte(b, p.parts)
+		pushByte(b, n)
+		for i = 1, n do
+			pushU24(b, ids[i])
+		end
+	elseif p.type == P.TYPE_LOOT then
+		local function pushStats(stats)
+			stats = stats or {}
+			local n = math.min(#stats, P.MAX_LOOT_STATS)
+			pushByte(b, n)
+			for i = 1, n do
+				pushByte(b, stats[i][1])
+				pushU16(b, floor(stats[i][2]) % 65536) -- signed 16 bit, two's complement
+			end
+		end
+		pushU32(b, p.rollID)
+		pushByte(b, p.flags)
+		pushByte(b, p.quality)
+		pushU16(b, p.itemLevel or 0)
+		pushByte(b, p.minLevel)
+		pushByte(b, p.classID)
+		pushByte(b, p.subclassID)
+		pushByte(b, p.equipLoc)
+		pushByte(b, p.count)
+		local name = P.Utf8Truncate(p.name or "", P.MAX_LOOT_NAME_BYTES)
+		pushByte(b, #name)
+		pushBytes(b, name)
+		pushStats(p.stats)
+		local worn = p.equipped or {}
+		local m = math.min(#worn, 2)
+		pushByte(b, m)
+		for i = 1, m do
+			local w = worn[i]
+			pushU16(b, w.itemLevel or 0)
+			pushByte(b, w.subclassID)
+			local wname = P.Utf8Truncate(w.name or "", P.MAX_WORN_NAME_BYTES)
+			pushByte(b, #wname)
+			pushBytes(b, wname)
+			pushStats(w.stats)
+		end
 	end
 	pushU16(b, P.Fletcher16(b, 3, #b))
 	return b

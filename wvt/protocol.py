@@ -28,8 +28,9 @@ The same grid also carries what the voice assistant needs: chat lines nobody ask
 but a type of its own, so an older app that does not know it can never read them aloud) and,
 every few seconds, a TYPE_STATE packet with the player's level, money, zone, bags and group;
 TYPE_QUEST packets (one per quest in the quest log: objectives, progress, the game's own map marker of
-the next objective) and TYPE_POS packets (where the player stands, so the app can tell the direction
-and distance to a quest marker at the moment you ask).
+the next objective), TYPE_POS packets (where the player stands, so the app can tell the direction
+and distance to a quest marker at the moment you ask), TYPE_PLAYER (class, race, faction) and
+TYPE_DONE (the ids of completed quests, in parts, so the assistant knows which quests are left).
 
 This module is the single source of truth; ``addon/WoWVoiceTranslator/Protocol.lua``
 implements the same encoder and ``tests/test_protocol.py`` runs the Lua code through
@@ -63,6 +64,9 @@ TYPE_STATE = 5  # player state for the voice assistant (second grid)
 TYPE_CHAT = 6  # a chat line only for the assistant's log, never spoken (layout of TYPE_VOICE)
 TYPE_QUEST = 7  # one quest of the quest log (assistant)
 TYPE_POS = 8  # the player's map position (assistant)
+TYPE_PLAYER = 9  # class, race, faction, sex of the player (assistant: what quests fit)
+TYPE_DONE = 10  # completed quest ids, in parts (assistant: which quests are left to take)
+TYPE_LOOT = 11  # an item of a group loot roll + what the player wears in that slot (assistant: need or greed)
 
 FLAG_SECRET = 0x01  # message text is a Midnight "secret value" – unreadable for addons
 FLAG_TRUNCATED = 0x02  # text had to be shortened to fit the grid
@@ -96,6 +100,33 @@ MAX_OBJECTIVE_BYTES = 60
 # + poi map 4 + poi x 2 + poi y 2 + distance 2
 QUEST_FIXED_BYTES = 27
 POS_BYTES = 18  # magic 2 + version/type 2 + seq 2 + map 4 + x 2 + y 2 + width 2 + height 2 (+ checksum 2)
+PLAYER_BYTES = 10  # magic 2 + version/type 2 + seq 2 + class 1 + race 1 + faction 1 + sex 1 (+ checksum 2)
+FACTION_NONE, FACTION_ALLIANCE, FACTION_HORDE = 0, 1, 2
+# magic 2 + version/type 2 + seq 2 + sync 2 + part 1 + parts 1 + count 1, then count x u24 quest id
+DONE_FIXED_BYTES = 11
+MAX_DONE_IDS = (MAX_BYTES - DONE_FIXED_BYTES - 2) // 3  # 154 per packet
+
+# TYPE_LOOT
+LFLAG_BOP, LFLAG_NEED, LFLAG_GREED, LFLAG_DE = 1, 2, 4, 8  # binds on pickup / the game offers need, greed, disenchant
+MAX_LOOT_NAME_BYTES = 64
+MAX_WORN_NAME_BYTES = 40
+MAX_LOOT_STATS = 12
+# magic 2 + version/type 2 + seq 2 + roll id 4 + flags 1 + quality 1 + item level 2 + min level 1 + class 1
+# + subclass 1 + equip location 1 + count 1 + name length 1
+LOOT_FIXED_BYTES = 20
+# index -> GetItemInfoInstant equipLoc (Protocol.lua P.EQUIP_LOCS, 1-based; 0 = not equippable)
+EQUIP_LOCS = (
+    "", "INVTYPE_HEAD", "INVTYPE_NECK", "INVTYPE_SHOULDER", "INVTYPE_BODY", "INVTYPE_CHEST", "INVTYPE_ROBE",
+    "INVTYPE_WAIST", "INVTYPE_LEGS", "INVTYPE_FEET", "INVTYPE_WRIST", "INVTYPE_HAND", "INVTYPE_FINGER",
+    "INVTYPE_TRINKET", "INVTYPE_CLOAK", "INVTYPE_WEAPON", "INVTYPE_SHIELD", "INVTYPE_2HWEAPON",
+    "INVTYPE_WEAPONMAINHAND", "INVTYPE_WEAPONOFFHAND", "INVTYPE_HOLDABLE", "INVTYPE_RANGED", "INVTYPE_THROWN",
+    "INVTYPE_RANGEDRIGHT", "INVTYPE_RELIC", "INVTYPE_TABARD", "INVTYPE_BAG", "INVTYPE_AMMO", "INVTYPE_QUIVER",
+)
+# stat codes of TYPE_LOOT (Core.lua STAT_PATTERNS); "dps" travels x10
+STAT_CODES = {1: "str", 2: "agi", 3: "sta", 4: "int", 5: "spi", 6: "armor", 7: "dps", 8: "ap", 9: "rap", 10: "sp",
+              11: "heal", 12: "crit", 13: "hit", 14: "spell_crit", 15: "spell_hit", 16: "def", 17: "mp5",
+              18: "block", 19: "dodge", 20: "parry"}
+STAT_IDS = {v: k for k, v in STAT_CODES.items()}
 
 # voice grid position: right of the hover grid, same top edge
 VOICE_GRID_X_CELLS = COLS + 2
@@ -177,6 +208,10 @@ class Packet:
     # TYPE_QUEST / TYPE_POS only
     quest: Optional["QuestEntry"] = None
     pos: Optional["PlayerPos"] = None
+    # TYPE_PLAYER / TYPE_DONE only
+    player: Optional["PlayerInfo"] = None
+    done: Optional["DoneChunk"] = None
+    loot: Optional["LootItem"] = None
 
     @property
     def is_secret(self) -> bool:
@@ -289,6 +324,93 @@ class PlayerPos:
     y: float = 0.0
     width: float = 0.0
     height: float = 0.0
+
+
+@dataclass
+class PlayerInfo:
+    """Who the player is (TYPE_PLAYER): WoW class id (UnitClass), race id (UnitRace), faction, sex."""
+
+    class_id: int = 0  # 1 Warrior, 2 Paladin, 3 Hunter, 4 Rogue, 5 Priest, 7 Shaman, 8 Mage, 9 Warlock, 11 Druid
+    race_id: int = 0  # 1 Human, 2 Orc, 3 Dwarf, 4 Night Elf, 5 Undead, 6 Tauren, 7 Gnome, 8 Troll, 95/96 Skyborne
+    faction: int = FACTION_NONE
+    sex: int = 0  # 2 male, 3 female
+
+    @property
+    def faction_code(self) -> str:
+        return {FACTION_ALLIANCE: "A", FACTION_HORDE: "H"}.get(self.faction, "")
+
+
+@dataclass
+class DoneChunk:
+    """Part ``part`` of ``parts`` of the completed-quest list number ``sync``; parts == 0: ids just turned in."""
+
+    sync: int = 0
+    part: int = 0
+    parts: int = 0
+    ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class WornItem:
+    """What the player wears in a slot the rolled item would take (TYPE_LOOT)."""
+
+    item_level: int = 0
+    subclass_id: int = 0
+    name: str = ""
+    stats: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class LootItem:
+    """An item of a group loot roll (TYPE_LOOT): GetLootRollItemInfo + GetItemInfoInstant + GetItemStats."""
+
+    roll_id: int = 0
+    flags: int = 0
+    quality: int = 0  # 0 poor, 1 common, 2 uncommon, 3 rare, 4 epic, 5 legendary
+    item_level: int = 0
+    min_level: int = 0
+    class_id: int = 0  # 2 weapon, 4 armor, 9 recipe, 15 miscellaneous...
+    subclass_id: int = 0  # armor: 1 cloth, 2 leather, 3 mail, 4 plate, 6 shield; weapons: 0 axe, 7 sword...
+    equip_loc: str = ""  # "INVTYPE_HAND"...
+    count: int = 1
+    name: str = ""
+    stats: dict[str, float] = field(default_factory=dict)
+    equipped: list[WornItem] = field(default_factory=list)
+
+    @property
+    def bop(self) -> bool:
+        return bool(self.flags & LFLAG_BOP)
+
+    @property
+    def can_need(self) -> bool:
+        return bool(self.flags & LFLAG_NEED)
+
+    @property
+    def can_greed(self) -> bool:
+        return bool(self.flags & LFLAG_GREED)
+
+
+def _encode_stats(stats: dict[str, float]) -> bytes:
+    items = [(STAT_IDS[k], v) for k, v in stats.items() if k in STAT_IDS][:MAX_LOOT_STATS]
+    out = bytearray([len(items)])
+    for code, v in sorted(items):
+        raw = int(round(v * 10 if code == STAT_IDS["dps"] else v))
+        out += bytes([code]) + (raw % 65536).to_bytes(2, "big")
+    return bytes(out)
+
+
+def _decode_stats(body: bytes, pos: int) -> tuple[dict[str, float], int]:
+    n = body[pos]
+    pos += 1
+    stats: dict[str, float] = {}
+    for _ in range(n):
+        code, raw = body[pos], int.from_bytes(body[pos + 1:pos + 3], "big")
+        pos += 3
+        v = raw - 65536 if raw >= 32768 else raw
+        name = STAT_CODES.get(code)
+        if name:
+            stats[name] = v / 10.0 if name == "dps" else float(v)
+    return stats, pos
 
 
 def _norm16(v: float) -> int:
@@ -427,6 +549,31 @@ def encode_packet(p: Packet) -> bytes:
         body += _u32(pos.map_id).to_bytes(4, "big")
         body += _norm16(pos.x).to_bytes(2, "big") + _norm16(pos.y).to_bytes(2, "big")
         body += _u16(round(pos.width)).to_bytes(2, "big") + _u16(round(pos.height)).to_bytes(2, "big")
+    elif p.type == TYPE_PLAYER:
+        pl = p.player or PlayerInfo()
+        body += bytes(max(0, min(255, int(v))) for v in (pl.class_id, pl.race_id, pl.faction, pl.sex))
+    elif p.type == TYPE_LOOT:
+        it = p.loot or LootItem()
+        body += _u32(it.roll_id).to_bytes(4, "big")
+        body += bytes([it.flags & 0xFF, max(0, min(255, it.quality))])
+        body += _u16(it.item_level).to_bytes(2, "big")
+        loc = EQUIP_LOCS.index(it.equip_loc) if it.equip_loc in EQUIP_LOCS else 0
+        body += bytes(max(0, min(255, int(v))) for v in (it.min_level, it.class_id, it.subclass_id, loc, it.count))
+        name = utf8_truncate(it.name.encode("utf-8"), MAX_LOOT_NAME_BYTES)
+        body += bytes([len(name)]) + name + _encode_stats(it.stats)
+        worn = it.equipped[:2]
+        body.append(len(worn))
+        for w in worn:
+            wname = utf8_truncate(w.name.encode("utf-8"), MAX_WORN_NAME_BYTES)
+            body += _u16(w.item_level).to_bytes(2, "big") + bytes([max(0, min(255, w.subclass_id)), len(wname)])
+            body += wname + _encode_stats(w.stats)
+    elif p.type == TYPE_DONE:
+        d = p.done or DoneChunk()
+        ids = d.ids[:MAX_DONE_IDS]
+        body += _u16(d.sync).to_bytes(2, "big")
+        body += bytes([max(0, min(255, d.part)), max(0, min(255, d.parts)), len(ids)])
+        for qid in ids:
+            body += max(0, min(0xFFFFFF, int(qid))).to_bytes(3, "big")
     out = bytearray(MAGIC) + body
     out += fletcher16(bytes(body)).to_bytes(2, "big")
     if len(out) > MAX_BYTES:
@@ -606,6 +753,40 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         data = read_bytes(total)
     elif ptype == TYPE_POS:
         data = read_bytes(POS_BYTES + 2)
+    elif ptype == TYPE_PLAYER:
+        data = read_bytes(PLAYER_BYTES + 2)
+    elif ptype == TYPE_LOOT:
+        pos = LOOT_FIXED_BYTES  # name length is the last fixed byte
+
+        def skip_stats(at: int) -> int:
+            d = read_bytes(at + 1)
+            if d[at] > MAX_LOOT_STATS:
+                raise DecodeError("loot stat count out of range")
+            return at + 1 + 3 * d[at]
+
+        data = read_bytes(pos)
+        if data[-1] > MAX_LOOT_NAME_BYTES:
+            raise DecodeError("loot name length out of range")
+        pos = skip_stats(pos + data[-1])
+        data = read_bytes(pos + 1)
+        worn = data[pos]
+        if worn > 2:
+            raise DecodeError("worn item count out of range")
+        pos += 1
+        for _ in range(worn):
+            data = read_bytes(pos + 4)
+            if data[pos + 3] > MAX_WORN_NAME_BYTES:
+                raise DecodeError("worn name length out of range")
+            pos = skip_stats(pos + 4 + data[pos + 3])
+        if pos + 2 > MAX_BYTES:
+            raise DecodeError("length out of range")
+        data = read_bytes(pos + 2)
+    elif ptype == TYPE_DONE:
+        data = read_bytes(DONE_FIXED_BYTES)
+        count = data[-1]
+        if count > MAX_DONE_IDS:
+            raise DecodeError("done count out of range")
+        data = read_bytes(DONE_FIXED_BYTES + 3 * count + 2)
     else:
         raise DecodeError(f"unknown type {ptype}")
 
@@ -624,6 +805,15 @@ def decode_image(img: np.ndarray, ox: int = 0, oy: int = 0) -> Packet:
         return _parse_quest(body, seq)
     if ptype == TYPE_POS:
         return _parse_pos(body, seq)
+    if ptype == TYPE_PLAYER:
+        return Packet(type=TYPE_PLAYER, seq=seq, player=PlayerInfo(body[4], body[5], body[6], body[7]))
+    if ptype == TYPE_LOOT:
+        return Packet(type=TYPE_LOOT, seq=seq, loot=_parse_loot(body))
+    if ptype == TYPE_DONE:
+        count = body[8]
+        ids = [int.from_bytes(body[9 + 3 * i: 12 + 3 * i], "big") for i in range(count)]
+        return Packet(type=TYPE_DONE, seq=seq,
+                      done=DoneChunk(int.from_bytes(body[4:6], "big"), body[6], body[7], ids))
 
     pos = 4
     flags = body[pos]
@@ -743,6 +933,26 @@ def _parse_quest(body: bytes, seq: int) -> Packet:
         q.objectives.append((bool(done), body[pos + 2 : pos + 2 + n].decode("utf-8", errors="replace")))
         pos += 2 + n
     return Packet(type=TYPE_QUEST, seq=seq, flags=q.flags, quest=q)
+
+
+def _parse_loot(body: bytes) -> LootItem:
+    it = LootItem(roll_id=int.from_bytes(body[4:8], "big"), flags=body[8], quality=body[9],
+                  item_level=int.from_bytes(body[10:12], "big"), min_level=body[12], class_id=body[13],
+                  subclass_id=body[14], count=body[16])
+    loc = body[15]
+    it.equip_loc = EQUIP_LOCS[loc] if loc < len(EQUIP_LOCS) else ""
+    n = body[17]
+    it.name = body[18:18 + n].decode("utf-8", errors="replace")
+    it.stats, pos = _decode_stats(body, 18 + n)
+    worn = body[pos]
+    pos += 1
+    for _ in range(worn):
+        w = WornItem(item_level=int.from_bytes(body[pos:pos + 2], "big"), subclass_id=body[pos + 2])
+        n = body[pos + 3]
+        w.name = body[pos + 4:pos + 4 + n].decode("utf-8", errors="replace")
+        w.stats, pos = _decode_stats(body, pos + 4 + n)
+        it.equipped.append(w)
+    return it
 
 
 def _parse_pos(body: bytes, seq: int) -> Packet:

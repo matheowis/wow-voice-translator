@@ -134,7 +134,8 @@ class Cfg(dict):
 
 
 def make_assistant(voice_id="voice-iskra"):
-    cfg = Cfg({"assistant.name": "Iskra", "assistant.voice_id": voice_id, "assistant.invite_window_s": 300})
+    cfg = Cfg({"assistant.name": "Iskra", "assistant.voice_id": voice_id, "assistant.invite_window_s": 300,
+               "assistant.flavor": False})  # one fixed phrasing, no LLM for spontaneous comments
     ins, ui, voice, llm = FakeInserter(), FakeUI(), FakeVoice(), FakeLLM()
     a = Assistant(cfg, FakeTranslator(), llm, ins, ui, lambda: True, voice_getter=lambda: voice)
     return a, ins, ui, voice, llm
@@ -324,3 +325,171 @@ def test_without_a_quest_log_she_says_so_and_a_new_log_replaces_the_old_one():
     assert [q.title for q in a.quests.quests()] == ["Kept One", "New One"]
     a.on_packet(quest_pkt(sync=3, index=0, total=0))
     assert a.handle("jakie mam questy?")[0].startswith("Twój dziennik zadań jest pusty")
+
+
+# --------------------------------------------------------------------------- where next, reminders, loot, guides
+
+@pytest.mark.parametrize("text,kind", [
+    ("przypomnij mi za 10 minut że mam pranie", "reminder_add"),
+    ("jakie mam przypomnienia?", "reminder_list"),
+    ("usuń przypomnienia", "reminder_cancel"),
+    ("ile expa robię na godzinę?", "stats"),
+    ("kiedy wbiję następny poziom?", "stats"),
+    ("zresetuj statystyki", "stats_reset"),
+    ("brać need czy greed?", "loot"),
+    ("czy to dla mnie?", "loot"),
+    ("postaw znacznik na trenera", "waypoint"),
+    ("zaznacz to na mapie", "waypoint"),
+    ("zaprowadź mnie do Hoggera", "waypoint"),
+    ("usuń znacznik", "waypoint_clear"),
+    ("gdzie mam się teraz udać?", "where_next"),
+    ("co mam teraz robić?", "where_next"),
+    ("gdzie najlepiej expić na moim poziomie?", "where_next"),
+    ("jaki dungeon na mój poziom?", "dungeon_level"),
+    ("gdzie jest najbliższy karczmarz?", "find"),
+    ("gdzie jest trener pierwszej pomocy?", "find"),
+    ("gdzie jest wejście do Deadmines?", "find"),
+    ("pomoc", "help"),
+])
+def test_new_requests_become_intents(text, kind):
+    assert parse_intent(text).kind == kind
+
+
+def kb_assistant():
+    from tests.test_kb import world
+
+    a, ins, ui, voice, llm = make_assistant()
+    w = world()
+    a.world_getter = lambda: w
+    a.on_packet(state_pkt(level=12, xp=100, xp_max=1000, name="Mati"))
+    a.on_packet(P.Packet(type=P.TYPE_PLAYER, seq=1, player=P.PlayerInfo(8, 1, P.FACTION_ALLIANCE, 2)))
+    a.on_packet(P.Packet(type=P.TYPE_DONE, seq=2, done=P.DoneChunk(1, 1, 1, [])))
+    a.on_packet(P.Packet(type=P.TYPE_POS, seq=3, pos=P.PlayerPos(1436, 0.56, 0.47, 3500, 2333)))
+    a.on_packet(quest_pkt(sync=1, index=0, total=0))
+    return a, ins, ui, voice, llm
+
+
+def test_where_next_and_places_prepare_a_waypoint():
+    a, ins, *_ = kb_assistant()
+    reply, line = a.handle("gdzie mam się teraz udać?")
+    assert reply.startswith("U Gryan's Aide weźmiesz 2 questy") and reply.endswith("Znacznik czeka na Enter.")
+    assert line == "/wvt way 1436 56.0 47.0 Gryan's Aide" and ins.lines[-1] == line
+    reply, line = a.handle("gdzie jest najbliższy mistrz lotów?")
+    assert reply.startswith("Najbliżej masz Thor") and line.endswith("Thor")
+    reply, line = a.handle("zaznacz to na mapie")  # "it": the last place she named
+    assert line.endswith("Thor") and reply == "Stawiam znacznik, Enter."
+    assert a.handle("usuń znacznik") == ("Zdejmuję znacznik, Enter.", "/wvt way clear")
+    a.cfg["assistant.auto_waypoint"] = False
+    assert a.handle("gdzie jest najbliższy mistrz lotów?")[1] == ""
+
+
+def test_reminders_session_and_loot_are_spoken():
+    a, ins, ui, voice, llm = kb_assistant()
+    reply, _ = a.handle("przypomnij mi na 13 poziomie, żeby kupić nowe czary")
+    assert reply == "Dobra, przypomnę ci na 13 poziomie, żeby kupić nowe czary."
+    assert a.handle("jakie mam przypomnienia?")[0] == "Masz 1: na 13 poziomie: żeby kupić nowe czary."
+    a.on_packet(state_pkt(level=13, xp=50, xp_max=1200, name="Mati"))
+    a._events.submit(lambda: None).result()  # her level-up comment runs off the reader thread
+    said = [t for t, *_ in voice.said]
+    assert "Przypominam, żeby kupić nowe czary." in said and a.reminders.pending() == []
+    assert said[-1] == "Poziom 13! Brawo, rośniesz w oczach."
+    assert a.handle("ile robię expa na godzinę?")[0].startswith("Sesja dopiero się zaczęła")
+    gloves = P.LootItem(roll_id=9, flags=P.LFLAG_NEED | P.LFLAG_GREED, quality=2, class_id=4, subclass_id=1,
+                        equip_loc="INVTYPE_HAND", name="Silk Gloves", stats={"int": 5, "spi": 3})
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=1, loot=gloves))
+    assert voice.said[-1][0] == ("Silk Gloves, rękawice, materiał. Nic tam nie nosisz, więc dla maga to czysty zysk. "
+                                 "Bierz need.")
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=2, loot=gloves))  # the same roll again: said once
+    assert sum(1 for t, *_ in voice.said if t.startswith("Silk Gloves")) == 1
+    assert a.handle("brać need czy greed?")[0].startswith("Silk Gloves")
+
+
+class FakeKB:
+    def __init__(self, cosine):
+        self.cosine = cosine
+        self.queries = []
+
+    def search(self, query, query_en="", k=5, kinds=None):
+        from wvt.kb.store import Hit
+
+        self.queries.append((query, query_en))
+        return [Hit(1, "Deadmines (Classic)", "Bosses", "Edwin VanCleef waits on the ship.", "", "wiki", None, 1.0,
+                    self.cosine)]
+
+
+class GuideTranslator(FakeTranslator):
+    EN = {"jak pokonać Edwina VanCleefa?": "How to defeat Edwin VanCleef?", "powiedz mi coś miłego": "tell me something nice"}
+
+    def translate(self, text, direction):
+        return Result(self.EN.get(text, "")) if direction == "pl-en" else super().translate(text, direction)
+
+
+def test_game_questions_are_answered_from_the_guides_and_small_talk_is_not():
+    a, ins, ui, voice, llm = make_assistant()
+    a.translator = GuideTranslator()
+    kb = FakeKB(0.84)
+    a.kb_getter = lambda: kb
+    a.handle("jak pokonać Edwina VanCleefa?")
+    system = llm.calls[-1][0]["content"]
+    assert "Edwin VanCleef waits on the ship" in system and "wyłącznie na podstawie" in system
+    a.handle("powiedz mi coś miłego")  # no game word, no name from the game: her usual small talk
+    assert "Fragmenty" not in llm.calls[-1][0]["content"]
+    a.kb_getter = lambda: FakeKB(0.70)  # nothing close in the base
+    a.handle("jak pokonać Edwina VanCleefa?")
+    assert "Fragmenty" not in llm.calls[-1][0]["content"]
+
+
+# --------------------------------------------------------------------------- notes, places, events, quest tips
+
+def flush(a):
+    a._events.submit(lambda: None).result()
+
+
+def test_notes_remind_in_a_city_with_an_auction_house():
+    a, ins, ui, voice, llm = kb_assistant()
+    reply, _ = a.handle("zanotuj, że chcę wystawić miecz na AH")
+    assert reply == "Zanotowane. Przypomnę ci przy domu aukcyjnym."
+    assert a.handle("jakie mam notatki?")[0] == "Masz 1: przy domu aukcyjnym: chcesz wystawić miecz na AH."
+    a.on_packet(state_pkt(level=12, zone="Westfall", name="Mati"))
+    a.on_packet(state_pkt(level=12, zone="Ironforge", subzone="The Commons", name="Mati"))
+    assert voice.said[-1][0] == "Hej, pamiętasz? Notowałeś: chcesz wystawić miecz na AH."
+    n = len(voice.said)
+    a.on_packet(state_pkt(level=12, zone="Ironforge", subzone="The Great Forge", name="Mati"))
+    assert len(voice.said) == n  # not again within half an hour
+    assert a.handle("usuń notatkę o mieczu")[0] == "Odhaczone."
+    assert a.reminders.pending(notes=True) == []
+
+
+def test_a_place_reminder_fires_once_on_arrival():
+    a, ins, ui, voice, llm = kb_assistant()
+    assert a.handle("przypomnij mi w Westfall, żeby zabić Hoggera")[0] == \
+        "Dobra, przypomnę ci w Westfall, żeby zabić Hoggera."
+    a.on_packet(state_pkt(level=12, zone="Elwynn Forest", name="Mati"))
+    a.on_packet(state_pkt(level=12, zone="Westfall", name="Mati"))
+    assert "Przypominam, żeby zabić Hoggera." in [t for t, *_ in voice.said]
+    assert a.reminders.pending(notes=None) == []
+
+
+def test_zone_level_and_bag_events(monkeypatch):
+    a, ins, ui, voice, llm = kb_assistant()
+    a._started -= 60  # past the start-up quiet time
+    a.on_packet(state_pkt(level=12, zone="Elwynn Forest", bag_free=1, bag_slots=16, name="Mati"))
+    a.on_packet(state_pkt(level=12, zone="Westfall", bag_free=1, bag_slots=16, name="Mati"))
+    flush(a)
+    assert voice.said[-1][0] == "Witaj w Westfall. Questy tu są na 12–12, czyli w sam raz dla ciebie."
+    a.on_packet(state_pkt(level=12, zone="Westfall", bag_free=0, bag_slots=16, name="Mati"))
+    assert voice.said[-1][0].startswith("Torby pełne")
+    a.on_packet(state_pkt(level=12, zone="Elwynn Forest", bag_free=0, bag_slots=16, name="Mati"))
+    a.on_packet(state_pkt(level=12, zone="Westfall", bag_free=0, bag_slots=16, name="Mati"))
+    flush(a)
+    assert sum(1 for t, *_ in voice.said if t.startswith("Witaj w Westfall")) == 1  # once per half hour
+
+
+def test_a_taken_quest_gets_a_verdict_and_can_be_asked_about():
+    a, ins, ui, voice, llm = kb_assistant()  # the log at start is empty
+    a.on_packet(quest_pkt(sync=2, index=1, total=1, quest_id=1, title="Report to Gryan", level=12))  # just taken
+    a.on_packet(quest_pkt(sync=2, index=1, total=1, quest_id=1, title="Report to Gryan", level=12))  # the minute resend
+    flush(a)  # the comment waits 2.5 s for more quests taken at once
+    said = [t for t, *_ in voice.said if t.startswith("Report to Gryan")]
+    assert len(said) == 1 and said[0].endswith("Może nie hit, ale exp to exp.")
+    assert a.handle("czy warto robić ten quest?")[0] == said[0]

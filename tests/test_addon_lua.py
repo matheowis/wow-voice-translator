@@ -26,6 +26,7 @@ function issecretvalue(v) return mock.secret[v] == true end
 function issecrettable(v) return false end
 strmatch = string.match
 strlower = string.lower
+strfind = string.find
 strupper = string.upper
 SlashCmdList = {}
 
@@ -657,3 +658,131 @@ def test_quest_log_and_position_reach_the_app(voice):
     assert sorted(q.quest_id for q in fresh) == [101, 102, 103] and {q.sync for q in fresh} == {mine.sync + 1}
     slash("questy")
     assert "3 questow, 2 ze znacznikiem" in str(list(mock.prints.values())[-1])
+
+
+
+# --------------------------------------------------------------------------- player, completed quests, waypoints, loot
+
+def test_lua_player_done_and_loot_encoders_match_python(lua):
+    rt, _, _ = lua
+    lp = _lua_protocol(rt)
+    pl = rt.table_from({"type": 9, "seq": 4, "classID": 8, "raceID": 95, "faction": 1, "sex": 3})
+    assert bytes(int(v) for v in lp.EncodePacket(pl).values()) == P.encode_packet(
+        P.Packet(type=9, seq=4, player=P.PlayerInfo(8, 95, 1, 3)))
+    ids = list(range(1000, 1300))  # more than one packet holds: the encoder keeps the first 154
+    done = rt.table_from({"type": 10, "seq": 5, "sync": 2, "part": 1, "parts": 2, "ids": rt.table_from(ids)})
+    assert bytes(int(v) for v in lp.EncodePacket(done).values()) == P.encode_packet(
+        P.Packet(type=10, seq=5, done=P.DoneChunk(2, 1, 2, ids[:P.MAX_DONE_IDS])))
+    stats = rt.table_from([rt.table_from([2, 6]), rt.table_from([3, -4]), rt.table_from([7, 127])])
+    worn = rt.table_from([rt.table_from({"itemLevel": 15, "subclassID": 2, "name": "Rough Leather Gloves",
+                                         "stats": rt.table_from([rt.table_from([6, 40])])})])
+    loot = rt.table_from({"type": 11, "seq": 6, "rollID": 77, "flags": 6, "quality": 2, "itemLevel": 24,
+                          "minLevel": 19, "classID": 4, "subclassID": 2, "equipLoc": 11, "count": 1,
+                          "name": "Gloves of the Monkey", "stats": stats, "equipped": worn})
+    lua_bytes = bytes(int(v) for v in lp.EncodePacket(loot).values())
+    item = P.LootItem(77, 6, 2, 24, 19, 4, 2, "INVTYPE_HAND", 1, "Gloves of the Monkey",
+                      {"agi": 6, "sta": -4, "dps": 12.7}, [P.WornItem(15, 2, "Rough Leather Gloves", {"armor": 40})])
+    assert lua_bytes == P.encode_packet(P.Packet(type=11, seq=6, loot=item))
+    assert P.decode_image(P.render_cells(P.packet_cells(P.Packet(type=11, seq=6, loot=item)))).loot == item
+
+
+WORLD_MOCK = r"""
+local mock = WVT_MOCK
+mock.calls = mock.calls or {}
+local function record(name) return function(...) mock.calls[#mock.calls + 1] = { name, ... } end end
+function UnitClass() return "Mage", "MAGE", 8 end
+function UnitRace() return "Skyborne", "Skyborne", 95 end
+function UnitFactionGroup() return "Alliance", "Alliance" end
+function UnitSex() return 3 end
+mock.completed = {}
+for i = 1, 200 do mock.completed[i] = 1600 - i * 3 end
+C_QuestLog = C_QuestLog or {}
+C_QuestLog.GetAllCompletedQuestIDs = function() return mock.completed end
+C_QuestLog.GetLogIndexForQuestID = function(id) if id == 101 then return 2 end end
+C_QuestLog.GetQuestWatchType = function(id) return nil end
+C_QuestLog.AddQuestWatch = record("AddQuestWatch")
+C_QuestLog.GetTitleForQuestID = function(id) return "The Fargodeep Mine" end
+C_Map = C_Map or {}
+C_Map.SetUserWaypoint = record("SetUserWaypoint")
+C_Map.ClearUserWaypoint = record("ClearUserWaypoint")
+C_Map.CanSetUserWaypointOnMap = function(id) return id ~= 999 end
+C_Map.GetMapInfo = function(id) return { name = "Westfall" } end
+UiMapPoint = { CreateFromCoordinates = function(m, x, y) return { uiMapID = m, x = x, y = y } end }
+C_SuperTrack = { SetSuperTrackedUserWaypoint = record("SetSuperTrackedUserWaypoint"),
+                 SetSuperTrackedQuestID = record("SetSuperTrackedQuestID") }
+"""
+
+
+@pytest.fixture()
+def world_addon(voice):
+    rt, g, mock, add_player, slash = voice
+    rt.execute(WORLD_MOCK)
+    return rt, g, mock, slash
+
+
+def test_player_info_and_completed_quests_reach_the_app(world_addon):
+    rt, g, mock, _ = world_addon
+    seen = _collect(g, mock, 8)
+    players = [p.player for p in seen if p.type == P.TYPE_PLAYER]
+    assert players and players[0] == P.PlayerInfo(class_id=8, race_id=95, faction=P.FACTION_ALLIANCE, sex=3)
+    parts = [p.done for p in seen if p.type == P.TYPE_DONE]
+    assert [(d.part, d.parts, len(d.ids)) for d in parts] == [(1, 2, 154), (2, 2, 46)]
+    ids = [i for d in parts for i in d.ids]
+    assert ids == sorted(1600 - i * 3 for i in range(1, 201))  # sorted, all of them
+    fire(mock, "QUEST_TURNED_IN", 4242, 100, 0)
+    added = [p.done for p in _collect(g, mock, 2) if p.type == P.TYPE_DONE]
+    assert added and added[0].parts == 0 and added[0].ids == [4242]
+
+
+def test_waypoint_and_track_commands(world_addon):
+    rt, g, mock, slash = world_addon
+    slash("way 1436 56.3 47.5 Gryan Stoutmantle")
+    calls = _calls(mock)
+    assert calls[-2][0] == "SetUserWaypoint" and calls[-1] == ("SetSuperTrackedUserWaypoint", True)
+    point = calls[-2][1]
+    assert (point["uiMapID"], round(point["x"], 3), round(point["y"], 3)) == (1436, 0.563, 0.475)
+    assert "znacznik: Gryan Stoutmantle (Westfall 56.3, 47.5)" in str(list(mock.prints.values())[-1])
+    slash("way 999 10 10 Nowhere")
+    assert "nie pozwala" in str(list(mock.prints.values())[-1]) and _calls(mock)[-1][0] != "SetUserWaypoint"
+    slash("way clear")
+    assert _calls(mock)[-1][0] == "ClearUserWaypoint"
+    slash("track 101")
+    assert _calls(mock)[-2] == ("AddQuestWatch", 101) and _calls(mock)[-1] == ("SetSuperTrackedQuestID", 101)
+    slash("track 5")
+    assert "nie ma w dzienniku" in str(list(mock.prints.values())[-1])
+
+
+LOOT_MOCK = r"""
+local mock = WVT_MOCK
+function GetLootRollItemLink(id) return "|cff1eff00|Hitem:15000::::::::|h[Gloves of the Monkey]|h|r" end
+function GetLootRollItemInfo(id) return 1337, "Gloves of the Monkey", 1, 2, false, true, true, false end
+C_Item = {
+  GetItemInfoInstant = function(link)
+    if link:find("15000") then return 15000, "Armor", "Leather", "INVTYPE_HAND", 1, 4, 2 end
+    return 2000, "Armor", "Leather", "INVTYPE_HAND", 1, 4, 2
+  end,
+  GetItemInfo = function(link)
+    if link:find("15000") then return "Gloves of the Monkey", link, 2, 24, 19 end
+    return "Rough Leather Gloves", link, 1, 15, 10
+  end,
+  GetItemStats = function(link)
+    if link:find("15000") then return { ITEM_MOD_AGILITY_SHORT = 6, ITEM_MOD_STAMINA_SHORT = 4, RESISTANCE0_NAME = 62 } end
+    return { RESISTANCE0_NAME = 40, ITEM_MOD_AGILITY_SHORT = 1, EMPTY_SOCKET_RED = 1 }
+  end,
+}
+function GetInventoryItemLink(unit, slot) if slot == 10 then return "|Hitem:2000|h[Rough Leather Gloves]|h" end end
+"""
+
+
+def test_a_loot_roll_is_described_with_the_worn_item(world_addon):
+    rt, g, mock, _ = world_addon
+    rt.execute(LOOT_MOCK)
+    fire(mock, "START_LOOT_ROLL", 77, 60000)
+    loot = [p.loot for p in _collect(g, mock, 2) if p.type == P.TYPE_LOOT]
+    assert len(loot) == 1
+    it = loot[0]
+    assert (it.roll_id, it.name, it.equip_loc, it.class_id, it.subclass_id, it.quality) == (
+        77, "Gloves of the Monkey", "INVTYPE_HAND", 4, 2, 2)
+    assert it.can_need and it.can_greed and not it.bop and (it.item_level, it.min_level) == (24, 19)
+    assert it.stats == {"agi": 6.0, "sta": 4.0, "armor": 62.0}
+    assert it.equipped == [P.WornItem(15, 2, "Rough Leather Gloves", {"agi": 1.0, "armor": 40.0})]

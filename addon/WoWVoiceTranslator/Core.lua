@@ -121,6 +121,10 @@ local POS_MIN_YARDS = 4 -- ...and only after moving this far
 local LOG_QUEUE_MAX = 12
 local STATE_MIN_SECONDS = 1.0 -- at most one state packet per second...
 local STATE_HEARTBEAT_SECONDS = 20 -- ...and at least one every 20 s, so a freshly started app knows
+local PLAYER_HEARTBEAT_SECONDS = 60 -- class / race / faction: rarely needed, cheap
+local DONE_FIRST_DELAY = 5 -- completed quests: the first list a few seconds after login...
+local DONE_FULL_SECONDS = 300 -- ...then the whole list every 5 minutes (a restarted app catches up)
+local LOOT_RETRIES = 4 -- item data of a roll can arrive a moment after START_LOOT_ROLL
 
 local db = defaults
 
@@ -990,8 +994,180 @@ local function PositionBytes(now)
 	return P.EncodePacket({ type = P.TYPE_POS, seq = posSeq, mapID = mapID, x = x, y = y, width = w, height = h })
 end
 
+---------------------------------------------------------------------------- assistant: player, completed quests, loot
+
+local playerSeq, lastPlayerAt, lastPlayerTry = 0, -1000, -1000
+local doneQueue, doneSync, doneSeq = {}, 0, 0
+local loginAt, lastDoneFull = nil, nil
+local doneStats = { count = 0, sent = 0 }
+local lootQueue, lootSeq = {}, 0
+
+local function PlayerBytes(now)
+	if now - lastPlayerAt < PLAYER_HEARTBEAT_SECONDS or now - lastPlayerTry < 5 then
+		return nil
+	end
+	lastPlayerTry = now
+	local _, _, classID = SafeCall(UnitClass, "player")
+	local _, _, raceID = SafeCall(UnitRace, "player")
+	classID, raceID = Plain(classID, "number") or 0, Plain(raceID, "number") or 0
+	if classID == 0 and raceID == 0 then
+		return nil -- not known yet (loading screen): ask again in 5 s
+	end
+	lastPlayerAt = now
+	local faction = Plain(SafeCall(UnitFactionGroup, "player"), "string")
+	playerSeq = (playerSeq + 1) % 65536
+	return P.EncodePacket({
+		type = P.TYPE_PLAYER,
+		seq = playerSeq,
+		classID = classID,
+		raceID = raceID,
+		faction = faction == "Alliance" and P.FACTION_ALLIANCE or faction == "Horde" and P.FACTION_HORDE or P.FACTION_NONE,
+		sex = Plain(SafeCall(UnitSex, "player"), "number") or 0,
+	})
+end
+
+-- the whole completed-quest list, sorted, in parts of MAX_DONE_IDS ids
+local function QueueDoneList()
+	local list = SafeCall(C_QuestLog and C_QuestLog.GetAllCompletedQuestIDs)
+	if type(list) ~= "table" or issecrettable(list) then
+		return
+	end
+	local ids = {}
+	for _, id in ipairs(list) do
+		id = Plain(id, "number")
+		if id and id > 0 then
+			ids[#ids + 1] = id
+		end
+	end
+	table.sort(ids)
+	doneStats.count = #ids
+	doneSync = (doneSync + 1) % 65536
+	local parts = math.max(1, math.ceil(#ids / P.MAX_DONE_IDS))
+	doneQueue = {}
+	for part = 1, parts do
+		local chunk = {}
+		for i = (part - 1) * P.MAX_DONE_IDS + 1, math.min(#ids, part * P.MAX_DONE_IDS) do
+			chunk[#chunk + 1] = ids[i]
+		end
+		doneQueue[#doneQueue + 1] = { type = P.TYPE_DONE, sync = doneSync, part = part, parts = parts, ids = chunk }
+	end
+end
+
+local function QueueDoneAdd(questID)
+	questID = Plain(questID, "number")
+	if questID and questID > 0 then
+		table.insert(doneQueue, 1, { type = P.TYPE_DONE, sync = doneSync, part = 0, parts = 0, ids = { questID } })
+	end
+end
+
+local function DoneBytes(now)
+	if loginAt and now - loginAt >= DONE_FIRST_DELAY and (not lastDoneFull or now - lastDoneFull >= DONE_FULL_SECONDS) then
+		lastDoneFull = now
+		QueueDoneList()
+	end
+	local d = table.remove(doneQueue, 1)
+	if d then
+		doneSeq = (doneSeq + 1) % 65536
+		d.seq = doneSeq
+		doneStats.sent = doneStats.sent + 1
+		return P.EncodePacket(d)
+	end
+	return nil
+end
+
+-- item stats as { { statCode, value }, ... } (Protocol.lua STAT codes; DPS x10)
+local STAT_PATTERNS = {
+	{ "STRENGTH", 1 }, { "AGILITY", 2 }, { "STAMINA", 3 }, { "INTELLECT", 4 }, { "SPIRIT", 5 },
+	{ "RESISTANCE0_NAME", 6 }, { "DAMAGE_PER_SECOND", 7 }, { "RANGED_ATTACK_POWER", 9 }, { "ATTACK_POWER", 8 },
+	{ "HEALING", 11 }, { "SPELL_DAMAGE", 10 }, { "SPELL_POWER", 10 }, { "CRIT_SPELL", 14 }, { "SPELL_CRIT", 14 },
+	{ "CRIT", 12 }, { "HIT_SPELL", 15 }, { "SPELL_HIT", 15 }, { "HIT", 13 }, { "DEFENSE", 16 },
+	{ "MANA_REGENERATION", 17 }, { "POWER_REGEN0", 17 }, { "BLOCK", 18 }, { "DODGE", 19 }, { "PARRY", 20 },
+}
+
+local function ItemStats(link)
+	local fn = (C_Item and C_Item.GetItemStats) or GetItemStats
+	local stats = SafeCall(fn, link)
+	local out = {}
+	if type(stats) ~= "table" or issecrettable(stats) then
+		return out
+	end
+	for key, value in pairs(stats) do
+		key, value = Plain(key, "string"), Plain(value, "number")
+		if key and value then
+			for _, sp in ipairs(STAT_PATTERNS) do
+				if strfind(key, sp[1], 1, true) then
+					out[#out + 1] = { sp[2], sp[2] == 7 and floor(value * 10 + 0.5) or floor(value + 0.5) }
+					break
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b) return a[1] < b[1] end)
+	return out
+end
+
+local function ItemBasics(link)
+	local info = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+	local _, _, _, equipLoc, _, classID, subclassID = SafeCall(info, link)
+	local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+	local name, _, quality, itemLevel, minLevel = SafeCall(getInfo, link)
+	return {
+		name = Plain(name, "string"),
+		quality = Plain(quality, "number") or 0,
+		itemLevel = Plain(itemLevel, "number") or 0,
+		minLevel = Plain(minLevel, "number") or 0,
+		equipLoc = Plain(equipLoc, "string") or "",
+		classID = Plain(classID, "number") or 0,
+		subclassID = Plain(subclassID, "number") or 0,
+	}
+end
+
+local function BuildLoot(rollID, attempt)
+	local link = Plain(SafeCall(GetLootRollItemLink, rollID), "string")
+	local _, rollName, count, quality, bop, canNeed, canGreed, canDE = SafeCall(GetLootRollItemInfo, rollID)
+	local item = link and ItemBasics(link)
+	if not item or not item.name then
+		if attempt < LOOT_RETRIES and C_Timer and C_Timer.After then
+			C_Timer.After(0.5, function() BuildLoot(rollID, attempt + 1) end)
+		end
+		return
+	end
+	local flags = 0
+	if IsTrue(bop) then flags = flags + P.LFLAG_BOP end
+	if IsTrue(canNeed) then flags = flags + P.LFLAG_NEED end
+	if IsTrue(canGreed) then flags = flags + P.LFLAG_GREED end
+	if IsTrue(canDE) then flags = flags + P.LFLAG_DE end
+	local equipped = {}
+	for _, slot in ipairs(P.SLOTS_FOR[item.equipLoc] or {}) do
+		local worn = Plain(SafeCall(GetInventoryItemLink, "player", slot), "string")
+		if worn then
+			local w = ItemBasics(worn)
+			equipped[#equipped + 1] = { itemLevel = w.itemLevel, subclassID = w.subclassID, name = w.name or "",
+				stats = ItemStats(worn) }
+		end
+	end
+	lootQueue[#lootQueue + 1] = {
+		type = P.TYPE_LOOT, rollID = rollID, flags = flags,
+		quality = Plain(quality, "number") or item.quality, itemLevel = item.itemLevel, minLevel = item.minLevel,
+		classID = item.classID, subclassID = item.subclassID, equipLoc = P.EQUIP_LOC_INDEX[item.equipLoc] or 0,
+		count = Plain(count, "number") or 1, name = item.name or Plain(rollName, "string") or "",
+		stats = ItemStats(link), equipped = equipped,
+	}
+end
+
+local function LootBytes()
+	local l = table.remove(lootQueue, 1)
+	if l then
+		lootSeq = (lootSeq + 1) % 65536
+		l.seq = lootSeq
+		return P.EncodePacket(l)
+	end
+	return nil
+end
+
 AssistantExtra = function(now)
-	local bytes = PositionBytes(now) -- time-sensitive and tiny: first
+	loginAt = loginAt or now
+	local bytes = LootBytes() or PositionBytes(now) -- a loot roll has a timer: first; position: time-sensitive, tiny
 	if bytes then
 		return bytes
 	end
@@ -1005,7 +1181,70 @@ AssistantExtra = function(now)
 		q.seq = questSeq
 		return P.EncodePacket(q)
 	end
-	return nil
+	return PlayerBytes(now) or DoneBytes(now)
+end
+
+---------------------------------------------------------------------------- assistant: map waypoints
+
+-- /wvt way <uiMapID> <x> <y> [label]   (x, y in percent, like the coordinates under the map)
+local function SetWaypoint(rest)
+	local mapID, x, y, label = strmatch(rest or "", "^(%d+)%s+([%d%.]+)%s+([%d%.]+)%s*(.-)$")
+	mapID, x, y = tonumber(mapID), tonumber(x), tonumber(y)
+	if not (mapID and x and y) or x < 0 or x > 100 or y < 0 or y > 100 then
+		Print("uzycie: /wvt way <mapa> <x> <y> [opis]  albo  /wvt way clear")
+		return
+	end
+	if not (C_Map and C_Map.SetUserWaypoint) then
+		Print("ta wersja gry nie ma znacznikow na mapie")
+		return
+	end
+	if C_Map.CanSetUserWaypointOnMap and not IsTrue(SafeCall(C_Map.CanSetUserWaypointOnMap, mapID)) then
+		Print("na tej mapie (" .. mapID .. ") gra nie pozwala postawic znacznika")
+		return
+	end
+	local point
+	if UiMapPoint and UiMapPoint.CreateFromCoordinates then
+		point = UiMapPoint.CreateFromCoordinates(mapID, x / 100, y / 100)
+	elseif CreateVector2D then
+		point = { uiMapID = mapID, position = CreateVector2D(x / 100, y / 100) }
+	end
+	if not point or not pcall(C_Map.SetUserWaypoint, point) then
+		Print("nie udalo sie postawic znacznika")
+		return
+	end
+	if C_SuperTrack and C_SuperTrack.SetSuperTrackedUserWaypoint then
+		pcall(C_SuperTrack.SetSuperTrackedUserWaypoint, true)
+	end
+	Print(("znacznik: %s (%s %.1f, %.1f)"):format(label ~= "" and label or "cel", MapName(mapID) or mapID, x, y))
+end
+
+local function ClearWaypoint()
+	if C_Map and C_Map.ClearUserWaypoint then
+		pcall(C_Map.ClearUserWaypoint)
+	end
+	Print("znacznik usuniety")
+end
+
+-- /wvt track <questID>: the game's own arrow and marker for a quest of the quest log
+local function TrackQuest(rest)
+	local id = tonumber(strmatch(rest or "", "(%d+)"))
+	if not id then
+		Print("uzycie: /wvt track <numer questa>")
+		return
+	end
+	local ql = C_QuestLog
+	if ql and ql.GetLogIndexForQuestID and not Plain(SafeCall(ql.GetLogIndexForQuestID, id), "number") then
+		Print("tego questa nie ma w dzienniku (" .. id .. ")")
+		return
+	end
+	if ql and ql.AddQuestWatch and SafeCall(ql.GetQuestWatchType, id) == nil then
+		pcall(ql.AddQuestWatch, id)
+	end
+	if C_SuperTrack and C_SuperTrack.SetSuperTrackedQuestID then
+		pcall(C_SuperTrack.SetSuperTrackedQuestID, id)
+	end
+	local title = ql and ql.GetTitleForQuestID and Plain(SafeCall(ql.GetTitleForQuestID, id), "string")
+	Print("prowadze do: " .. (title or ("quest " .. id)))
 end
 
 -- C_PartyInfo first (WoW Forever), the old globals as a fallback; true when the call went through
@@ -1293,11 +1532,24 @@ for _, ev in ipairs(QUEST_EVENTS) do
 	QUEST_EVENT_SET[ev] = true
 	pcall(events.RegisterEvent, events, ev)
 end
+pcall(events.RegisterEvent, events, "START_LOOT_ROLL")
 events:SetScript("OnEvent", function(_, event, ...)
+	if event == "START_LOOT_ROLL" then
+		if db.assistant then
+			local rollID = Plain((...), "number")
+			if rollID then
+				BuildLoot(rollID, 1)
+			end
+		end
+		return
+	end
 	if QUEST_EVENT_SET[event] then
 		questsDirty = true
 		if QUEST_SET_EVENTS[event] then
 			questSetChanged = true
+		end
+		if event == "QUEST_TURNED_IN" then
+			QueueDoneAdd((...))
 		end
 		if not STATE_EVENT_SET[event] then
 			return
@@ -1386,8 +1638,16 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 	elseif cmd == "inv" or cmd == "kick" or cmd == "lead" or cmd == "raid" or cmd == "leave" or cmd == "ready" then
 		GroupCommand(cmd, rest)
 	elseif cmd == "questy" or cmd == "quests" then
-		Print(("dziennik dla asystentki: %d questow, %d ze znacznikiem na mapie (wysylane: %s)"):format(
-			questStats.quests, questStats.withMarker, OnOff(db.assistant)))
+		Print(("dziennik dla asystentki: %d questow, %d ze znacznikiem na mapie, ukonczonych %d (wysylane: %s)"):format(
+			questStats.quests, questStats.withMarker, doneStats.count, OnOff(db.assistant)))
+	elseif cmd == "way" then
+		if strlower(rest or "") == "clear" then
+			ClearWaypoint()
+		else
+			SetWaypoint(rest)
+		end
+	elseif cmd == "track" then
+		TrackQuest(rest)
 	elseif cmd == "asystent" or cmd == "assistant" then
 		db.assistant = ParseOnOff(rest, db.assistant)
 		if not db.assistant then
@@ -1419,5 +1679,6 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 		)
 		Print("/wvt on | off | test | dwell <s> | say [on|off] | party [on|off] | lang en|pl | panel | voice | voicedebug")
 		Print("/wvt inv Imie1 Imie2 | kick Imie | lead Imie | raid | leave | ready | asystent [on|off] | questy")
+		Print("/wvt way <mapa> <x> <y> [opis] | way clear | track <numer questa>")
 	end
 end

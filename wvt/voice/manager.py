@@ -103,7 +103,7 @@ class VoiceManager:
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
-        for i in range(max(1, int(self.cfg.get("max_concurrent", 2)))):
+        for i in range(max(1, int(self.cfg.get("max_concurrent", 3)))):
             t = threading.Thread(target=self._work, name=f"wvt-voice-{i}", daemon=True)
             t.start()
             self._threads.append(t)

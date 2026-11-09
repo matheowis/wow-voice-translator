@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import collections
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -65,8 +66,50 @@ def analyze(x: np.ndarray, threshold: float, sr: int = TARGET_SR) -> SpeechStats
     )
 
 
-def trim_and_normalize(x: np.ndarray, threshold: float, sr: int = TARGET_SR, pad_ms: int = 250) -> np.ndarray:
-    """Cut leading/trailing silence and bring quiet speech to a sane level."""
+def dbfs(v: float) -> float:
+    return 20.0 * math.log10(max(float(v), 1e-9))
+
+
+def soft_clip(y: np.ndarray, knee: float = 0.9) -> np.ndarray:
+    """Leave samples below ``knee`` alone and squash louder ones smoothly into (-1, 1) - no hard clipping."""
+    out = np.asarray(y, dtype=np.float32).copy()
+    over = np.abs(out) > knee
+    if over.any():
+        s = np.sign(out[over])
+        a = np.abs(out[over]) - knee
+        out[over] = s * (knee + (1.0 - knee) * np.tanh(a / (1.0 - knee)))
+    return out
+
+
+def input_gain(x: np.ndarray, threshold: float, gain_db: float = 0.0, auto: bool = True, target: float = 0.05,
+               max_auto_db: float = 30.0, sr: int = TARGET_SR) -> tuple[np.ndarray, float]:
+    """Gain before speech detection: (amplified audio, applied gain in dB).
+
+    ``gain_db`` is a fixed boost (``audio.input_gain_db``).  ``auto`` lifts a quiet recording so its loudest
+    frames reach ``target`` RMS (at most ``max_auto_db``), but never lifts the noise floor above half the
+    silence threshold - a recording without speech stays silence.
+    """
+    g = 10.0 ** (gain_db / 20.0)
+    y = np.asarray(x, dtype=np.float32) * g
+    if auto and len(y):
+        r = frame_rms(y, sr)
+        if len(r):
+            loud, floor = float(np.percentile(r, 95)), float(np.percentile(r, 10))
+            if loud > 0:
+                a = min(10.0 ** (max_auto_db / 20.0), target / loud)
+                if floor > 0:
+                    a = min(a, 0.5 * threshold / floor)
+                if a > 1.0:
+                    y = y * a
+                    g *= a
+    if g > 1.0:
+        y = soft_clip(y)
+    return y, dbfs(g)
+
+
+def trim_and_normalize(x: np.ndarray, threshold: float, sr: int = TARGET_SR, pad_ms: int = 250,
+                       max_gain: float = 16.0) -> np.ndarray:
+    """Cut leading/trailing silence and bring quiet speech to a sane level (speech RMS ~0.08)."""
     rms = frame_rms(x, sr)
     voiced = np.where(rms > threshold)[0]
     if len(voiced) == 0:
@@ -78,9 +121,9 @@ def trim_and_normalize(x: np.ndarray, threshold: float, sr: int = TARGET_SR, pad
     y = x[start:end].astype(np.float32)
     speech_rms = float(np.sqrt(np.mean(rms[voiced] ** 2)))
     if speech_rms > 0:
-        gain = min(8.0, 0.08 / speech_rms)
+        gain = min(max_gain, 0.08 / speech_rms)
         if gain > 1.0:
-            y = np.clip(y * gain, -1.0, 1.0)
+            y = soft_clip(y * gain)
     return y
 
 

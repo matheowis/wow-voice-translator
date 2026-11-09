@@ -72,12 +72,43 @@ class QuestBook:
         self.updated_at = 0.0
         self.pos: Optional[protocol.PlayerPos] = None
         self.pos_at = 0.0
+        self.player: Optional[protocol.PlayerInfo] = None  # class, race, faction (TYPE_PLAYER)
+        self._done: set[int] = set()  # completed quest ids (TYPE_DONE)
+        self.done_known = False
+        self._done_parts: dict[int, list[int]] = {}
+        self._done_sync: Optional[int] = None
+        self._done_added: set[int] = set()  # turned in while a new full list was arriving
+
+    @property
+    def done(self) -> frozenset:
+        with self._lock:
+            return frozenset(self._done)
+
+    def _on_done(self, d: protocol.DoneChunk) -> None:
+        if d.parts == 0:  # a quest was just turned in
+            self._done.update(d.ids)
+            self._done_added.update(d.ids)
+            return
+        if d.sync != self._done_sync:
+            self._done_sync, self._done_parts, self._done_added = d.sync, {}, set()
+        self._done_parts[d.part] = d.ids
+        if len(self._done_parts) >= d.parts:
+            self._done = {i for ids in self._done_parts.values() for i in ids} | self._done_added
+            self.done_known = True
 
     def on_packet(self, pkt: protocol.Packet) -> None:
         now = time.time()
         if pkt.type == protocol.TYPE_POS and pkt.pos is not None:
             with self._lock:
                 self.pos, self.pos_at = pkt.pos, now
+            return
+        if pkt.type == protocol.TYPE_PLAYER and pkt.player is not None:
+            with self._lock:
+                self.player = pkt.player
+            return
+        if pkt.type == protocol.TYPE_DONE and pkt.done is not None:
+            with self._lock:
+                self._on_done(pkt.done)
             return
         if pkt.type != protocol.TYPE_QUEST or pkt.quest is None:
             return

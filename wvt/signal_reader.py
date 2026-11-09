@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 SEARCH = 3  # pixels of tolerance for the grid origin
 
 
+# everything the second (voice) grid carries
+ASSISTANT_GRID_TYPES = (protocol.TYPE_VOICE, protocol.TYPE_STATE, protocol.TYPE_CHAT, protocol.TYPE_QUEST,
+                        protocol.TYPE_POS, protocol.TYPE_PLAYER, protocol.TYPE_DONE, protocol.TYPE_LOOT)
+
 class ScreenCapture:
     """Reusable GDI capture of a small screen region -> RGB numpy array."""
 
@@ -105,7 +109,8 @@ class VoiceDeduper:
 
     def is_new(self, pkt: protocol.Packet) -> bool:
         # seq restarts after /reload, so not alone; state packets have their own counter
-        ident = (pkt.type, pkt.seq, pkt.sender, pkt.text, repr(pkt.state), repr(pkt.quest), repr(pkt.pos))
+        ident = (pkt.type, pkt.seq, pkt.sender, pkt.text, repr(pkt.state), repr(pkt.quest), repr(pkt.pos),
+                 repr(pkt.player), repr(pkt.done), repr(pkt.loot))
         if ident in self._seen:
             return False
         self._seen.append(ident)
@@ -166,8 +171,7 @@ class SignalReader:
                         except (OSError, protocol.DecodeError) as exc:
                             self.capture_errors += 1
                             log.debug("capture/decode failed: %s", exc)
-                if (voice is not None and voice.type in (protocol.TYPE_VOICE, protocol.TYPE_STATE, protocol.TYPE_CHAT,
-                                                         protocol.TYPE_QUEST, protocol.TYPE_POS)
+                if (voice is not None and voice.type in ASSISTANT_GRID_TYPES
                         and self.voice_dedup.is_new(voice)):
                     self.last_voice_at = time.time()
                     self.voice_packets += 1

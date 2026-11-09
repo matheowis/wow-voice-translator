@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__, protocol
-from .audio import AudioRecorder, analyze, trim_and_normalize
+from .audio import AudioRecorder, analyze, dbfs, input_gain, trim_and_normalize
 from .chat_insert import ChatInserter, build_chat_line, set_clipboard_text
 from .config import ROOT, Config
 from .hotkeys import Binding, HotkeyManager, KeySpec, keyspec_to_config, parse_key
@@ -261,6 +261,16 @@ class MainWindow(QWidget):
         self.threshold.setSingleStep(0.001)
         self.threshold.setValue(float(cfg.get("audio.silence_rms_threshold", 0.006)))
         f.addRow("Próg ciszy (RMS):", self.threshold)
+        self.gain_db = QDoubleSpinBox()
+        self.gain_db.setDecimals(0)
+        self.gain_db.setRange(0, 30)
+        self.gain_db.setSingleStep(3)
+        self.gain_db.setSuffix(" dB")
+        self.gain_db.setValue(float(cfg.get("audio.input_gain_db", 0.0) or 0.0))
+        f.addRow("Wzmocnienie mikrofonu:", self.gain_db)
+        self.auto_gain = QCheckBox("Automatycznie wzmacniaj cichą mowę (do +30 dB)")
+        self.auto_gain.setChecked(bool(cfg.get("audio.auto_gain", True)))
+        f.addRow("", self.auto_gain)
         test_row = QHBoxLayout()
         self.test_btn = QPushButton("Test: nagraj 4 s i rozpoznaj")
         self.test_btn.clicked.connect(self.on_mic_test)
@@ -356,8 +366,11 @@ class MainWindow(QWidget):
             try:
                 rec = AudioRecorder(self.mic_combo.currentData(), always_open=False)
                 x = rec.record_seconds(4.0)
+                raw = analyze(x, self.threshold.value())
+                x, gain = input_gain(x, self.threshold.value(), self.gain_db.value(), self.auto_gain.isChecked())
                 st = analyze(x, self.threshold.value())
-                msg = f"poziom RMS {st.rms:.4f}, mowa {st.speech_seconds:.1f}s"
+                msg = (f"poziom {dbfs(raw.rms):.0f} dBFS (szczyt {dbfs(raw.peak):.0f}), wzmocnienie {gain:+.0f} dB, "
+                       f"mowa {st.speech_seconds:.1f}s")
                 if self.app.stt is not None and self.app.stt.model is not None and st.speech_seconds > 0.2:
                     t0 = time.perf_counter()
                     text = self.app.stt.transcribe(trim_and_normalize(x, self.threshold.value()))
@@ -390,6 +403,8 @@ class MainWindow(QWidget):
         cfg.set("push_to_talk", bindings)
         cfg.set("audio.device", self.mic_combo.currentData())
         cfg.set("audio.silence_rms_threshold", round(self.threshold.value(), 5))
+        cfg.set("audio.input_gain_db", float(self.gain_db.value()))
+        cfg.set("audio.auto_gain", self.auto_gain.isChecked())
         cfg.set("wow.only_when_wow_active", self.only_wow.isChecked())
         cfg.set("insert.method", self.insert_method.currentData())
         cfg.set("hover.enabled", self.hover_enabled.isChecked())
@@ -477,6 +492,9 @@ class TranslatorApp:
         self.reader: Optional[SignalReader] = None
         self.voice = None  # VoiceManager, built in _init_voice
         self.assistant = None  # wvt.assistant.Assistant, built with the models
+        self.world = None  # wvt.kb.world.World (quests, NPCs, coordinates), loaded in the background
+        self.kb = None  # wvt.kb.store.KnowledgeBase (guides), loaded in the background
+        self.instances: list = []  # dungeons and raids with level ranges
         from .assistant import ChatLog
 
         self.chat_log = ChatLog()  # recent chat from the addon: the assistant's memory and the translator's context
@@ -561,10 +579,16 @@ class TranslatorApp:
             if self.cfg.get("assistant.enabled", True):
                 from .assistant import Assistant
 
+                reminders = str(self.cfg.get("assistant.reminders_file", "data/reminders.json") or "")
                 self.assistant = Assistant(self.cfg, self.translator, self.llm, self.inserter, QtPipelineUI(self.bridge),
                                            self.tracker.foreground_is_wow, voice_getter=lambda: self.voice,
-                                           set_voices_enabled=self.bridge.voices_enabled.emit, chat_log=self.chat_log)
+                                           set_voices_enabled=self.bridge.voices_enabled.emit, chat_log=self.chat_log,
+                                           world_getter=lambda: self.world, kb_getter=lambda: self.kb,
+                                           instances_getter=lambda: self.instances,
+                                           reminders_path=(ROOT / reminders) if reminders else None)
+                self.assistant.start()
                 self.pipeline.assistant = self.assistant
+                threading.Thread(target=self._load_knowledge, name="wvt-kb", daemon=True).start()
             self.pipeline.chat_log = self.chat_log
             self.pipeline.models_ready.set()
             self.bridge.models.emit(f"gotowe (STT: {self.stt.device}, LLM: {self.llm.model_name})", True)
@@ -627,6 +651,32 @@ class TranslatorApp:
             log.exception("chat log / assistant packet handler failed")
         if self.voice is not None and pkt.type == protocol.TYPE_VOICE:
             self.voice.on_packet(pkt)
+
+    def _load_knowledge(self) -> None:
+        """Quest/NPC data and the guide index for the assistant (data/kb, built by python -m wvt.kb.build)."""
+        if not self.cfg.get("assistant.knowledge_base", True):
+            return
+        try:
+            from .advisor import load_instances
+            from .kb import INSTANCES_PATH, WORLD_PATH
+            from .kb.world import World
+
+            if WORLD_PATH.exists():
+                self.world = World.load(WORLD_PATH)
+                self.instances = load_instances(INSTANCES_PATH)
+                log.info("world data: %d quests, %d NPCs, %d instances", len(self.world.quests), len(self.world.npcs),
+                         len(self.instances))
+            else:
+                log.info("no world data (data/kb/world.json.gz) - run: python -m wvt.kb.build")
+            from .kb.store import KnowledgeBase
+
+            if KnowledgeBase.available():
+                from .kb.embedder import Embedder
+
+                self.kb = KnowledgeBase(embedder=Embedder())
+                log.info("knowledge base: %d chunks (%s)", len(self.kb), self.kb.info.get("built", "?"))
+        except Exception:
+            log.exception("knowledge base not loaded")
 
     def _add_assistant_key(self) -> None:
         """Configs written before the assistant existed get her push-to-talk key once."""

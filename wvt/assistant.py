@@ -19,6 +19,16 @@ pipeline and:
 * **quests** - what is in your quest log, how far you are with a quest, what you can turn in,
   where to go (direction and distance to the game's own map marker of the next objective), which
   quest is nearest; free questions about your quests go to the LLM with the quest log as facts;
+* **where next** - what to do now (turn-ins, the nearest open quest, new quests to pick up near you
+  for your level, class, faction and completed quests, or the zone that fits your level), which
+  dungeon fits your level, where the nearest trainer / innkeeper / flight master / an NPC is - with
+  a map waypoint ready in the chat box (``/wvt way``, ``/wvt track``);
+* **reminders** - "przypomnij mi za 10 minut / o 21:30 / na 20 poziomie, że..." (wvt/reminders.py);
+* **session** - XP and gold per hour, time to the next level (wvt/session_stats.py);
+* **loot** - when a group loot roll starts she says whether it is a need or a greed for your class,
+  level and worn gear (wvt/loot.py);
+* **guides** - questions about the game answered from the local knowledge base (Warcraft Wiki pages
+  for WoW Forever/Classic, QuestieDB quests, your notes; wvt/kb) by the LLM, two sentences;
 * anything else - a short chat in character (the local LLM; she may be wrong about game facts).
 
 Commands are matched by rules on the Polish text (fast, predictable, nothing invented); the LLM only
@@ -28,8 +38,10 @@ Jainie") are matched to the names seen in chat and in the group.
 
 from __future__ import annotations
 
+import concurrent.futures
 import difflib
 import logging
+import random
 import re
 import threading
 import time
@@ -39,8 +51,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import protocol
+from .advisor import Advice, CLASS_EN, dungeons_for_level, find_place, where_next
 from .chat_insert import build_chat_line
+from .kb.world import Player
+from .loot import advise as loot_advise
 from .quests import QuestBook, match_quests, spoken_objective
+from .quest_tips import Chains, assess
+from .reminders import (Reminder, Reminders, describe as describe_reminder, parse_note, parse_reminder,
+                        say_reminder)
+from .session_stats import SessionStats
 
 log = logging.getLogger(__name__)
 
@@ -227,8 +246,35 @@ _FILLER = {"ej", "hej", "no", "prosze", "mi", "ty", "teraz", "szybko", "do", "pa
            "mu", "niech", "bedzie"}
 
 _RULES: tuple[tuple[str, str], ...] = (
-    ("help", r"\b(co umiesz|co potrafisz|w czym (mi )?pomozesz|jakie (masz )?komendy|pomocy?)\b"),
+    ("help", r"\b(co umiesz|co potrafisz|w czym (mi )?pomozesz|jakie (masz )?komendy)\b|^pomocy?$"),
     ("stop", r"^(stop|cicho|cisza|przestan\w*|zamknij sie|wystarczy|dosc)\b"),
+    ("reminder_list", r"\b(jakie|ile|pokaz\w*|wymien\w*|przeczytaj)\b.*\bprzypomnie\w*\b|^przypomnienia$"),
+    ("reminder_cancel", r"\b(usun\w*|anuluj\w*|skasuj\w*|wyczysc\w*|odwolaj\w*|kasuj\w*|zapomnij)\b.*\bprzypomn\w*\b"),
+    ("reminder_add", r"\bprzypomn\w*\b|\bprzypominaj\w*\b"),
+    ("note_list", r"\b(jakie|co|pokaz\w*|przeczytaj|wymien\w*)\b.*\b(notatk\w*|zanotowal\w*|zapisal\w*)\b"),
+    ("note_done", r"\b(usun\w*|skasuj\w*|wyczysc\w*|odhacz\w*|wykresl\w*)\b.*\bnotatk\w*\b|^(zrobione|zalatwione|gotowe)\b"),
+    ("note_add", r"^(?:(?:ej|hej|iskra|prosze|i)\s+)*(zanotuj|zapisz|zapamietaj|notatka|dodaj notatke)\w*\b"),
+    ("quest_worth", r"\b(warto|oplaca sie|oplacal\w*|ocen\w*)\b|\blancuch\w*\b|\bco (dalej|potem) (w|po) (tym )?quesc\w*\b"),
+    ("stats_reset", r"\b(zresetuj\w*|wyzeruj\w*|resetuj\w*|zeruj\w*)\b.*\b(statystyk\w*|licznik\w*|sesj\w*)\b"),
+    ("stats", r"\b(na godzine|na godz|tempo|statystyk\w*|sesj\w*)\b|\bkiedy\b.*\b(level\w*|lewel\w*|poziom\w*|lvl)\b"
+              r"|\bile\b.*\b(zarobil\w*|zdobyl\w*|wbil\w*|nabil\w*|uzbieral\w*|wyexpil\w*|zarabiam\w*)\b"),
+    ("loot", r"\b(need\w*|nid\w*|greed\w*|grid\w*|gryd\w*)\b|\bco (wlasnie )?(wypadlo|wypadl|dropnelo|dropnal|wylecialo)\b"
+             r"|\bczy (to|ten|ta|te) (jest |sa )?dla mnie\b|\b(brac|wziac|rolowac|rollowac)\b.*\b(to|ten|te|item\w*|przedmiot\w*)\b"),
+    ("waypoint_clear", r"\b(usun\w*|wyczysc\w*|skasuj\w*|zdejmij|zabierz|schowaj)\b.*"
+                       r"\b(znacznik\w*|pinezk\w*|punkt\w*|waypoint\w*|marker\w*)\b"),
+    ("waypoint", r"\b(postaw\w*|ustaw\w*|daj|zrob\w*|dodaj\w*|wstaw\w*|wrzuc\w*)\b.*"
+                 r"\b(znacznik\w*|pinezk\w*|punkt\w*|waypoint\w*|marker\w*)\b|\bzaznacz\w*\b"
+                 r"|\b(pokaz\w*|wskaz\w*)\b.*\bna mapie\b|\b(zaprowadz|doprowadz|nawiguj|poprowadz)\w*\b"
+                 r"|\bprowadz\w* (mnie )?do\b"),
+    ("find", r"\b(gdzie|najblizsz\w*|najblizej|szukam|szukac|znajde)\b.*\b(trener\w*|karczm\w*|gospod\w*|bank\w*|aukcj\w*"
+             r"|stajn\w*|napraw\w*|gryf\w*|wiwern\w*|hipogryf\w*|mistrz\w* lot\w*|flight\w*|duch\w* uzdrowic\w*|wejsci\w*"
+             r"|wejsc\w*)\b"),
+    ("dungeon_level", r"\b(jaki\w*|ktory|ktore|ktora|co)\b.*\b(dung\w*|dangeon\w*|danzi\w*|loch\w*|instancj\w*|instans\w*)\b"
+                      r"|\b(dung\w*|dangeon\w*|loch\w*|instancj\w*)\b.*\b(poziom\w*|level\w*|lvl|na mnie|dla mnie)\b"),
+    ("where_next", r"\bgdzie\b.*\b(udac|isc dalej|dalej isc|expic|expie|levelowac|lvlowac|lewelowac|farmic|questowac"
+                   r"|teraz isc|nastepnie)\b|\bco (mam |powinienem |powinnam )?(teraz|dalej|nastepnie) (robic|zrobic)\b"
+                   r"|\b(doradz\w*|zaproponuj\w*)\b|\bco (polecasz|proponujesz|radzisz|doradzasz)\b"
+                   r"|\bjak\w* (strefa|strefe|lokacja|lokacje|kraina|kraine|miejsce|teren)\b|\bdokad (teraz|dalej|mam|isc|sie)\b"),
     ("lang_pl", r"\b(przelacz\w*|zmien\w*|ustaw\w*|tryb\w*|niech|mow\w*|czytaj\w*|tlumacz\w*)\b.*"
                 r"\b(po polsku|na polski|polski)\b"),
     ("lang_en", r"\b(przelacz\w*|zmien\w*|ustaw\w*|tryb\w*|niech|mow\w*|czytaj\w*|wroc\w*)\b.*"
@@ -322,6 +368,8 @@ def parse_intent(text: str) -> Intent:
     if not t:
         return Intent("chat")
     m = _MESSAGE_RE.match(t)
+    if m and t[m.end():].split()[:1] in (["mi"], ["mnie"], ["nam"]):
+        m = None  # "powiedz mi coś miłego" talks to her, not to another player
     if m:
         lead = len(t[: m.start(1)].split())
         return _message_intent(m.group(1), words[lead:], original[lead:])
@@ -348,19 +396,46 @@ def parse_intent(text: str) -> Intent:
 # --------------------------------------------------------------------------- the assistant
 
 PERSONA = (
-    "Jesteś {name} – asystentką gracza w World of Warcraft (WoW Forever). Masz około 25 lat, jesteś pewna siebie, "
-    "charyzmatyczna i zadziorna, lubisz się droczyć i lekko flirtować, ale zawsze pomagasz. Mówisz po polsku, "
-    "naturalnie i krótko: najwyżej dwa zdania, bez emotek, bez list i bez nawiasów, bo twoja odpowiedź zostanie "
-    "przeczytana na głos. Zwracasz się do gracza per ty. Nie zmyślasz faktów o grze: jeśli nie wiesz czegoś na "
-    "pewno, przyznaj to z humorem. Polecenia (zaproszenia, szepty, przełączanie głosów) wykonuje osobny moduł – "
-    "ty tylko rozmawiasz.{extra}"
+    "Jesteś {name} – asystentką gracza w World of Warcraft (WoW Forever) i jego kumpelą od grania. Masz około 25 lat "
+    "i charakter: jesteś pewna siebie, bystra, zadziorna i ciepła zarazem. Lubisz się droczyć i lekko flirtować, "
+    "masz cięty humor i własne zdanie – mówisz wprost, kiedy coś jest stratą czasu, a kiedy naprawdę warto. Znasz "
+    "gamingowy slang (expić, dropnąć, farmić, tank, heal, inv) i mówisz luźno, ale nie przeklinasz. Kibicujesz "
+    "graczowi, cieszysz się z jego sukcesów i śmiejesz się z jego pecha, nigdy złośliwie. Każdą wypowiedź zaczynasz "
+    "inaczej i nie powtarzasz w kółko tych samych słówek. Mówisz po polsku, naturalnie i krótko: jedno, najwyżej "
+    "dwa zdania, bez emotek, list i nawiasów, bo "
+    "twoja odpowiedź zostanie przeczytana na głos. Zwracasz się do gracza per ty. Nie zmyślasz faktów o grze: jeśli "
+    "nie wiesz czegoś na pewno, przyznaj to z humorem. Polecenia (zaproszenia, szepty, znaczniki, przypomnienia) "
+    "wykonuje osobny moduł – ty tylko rozmawiasz.{extra}"
 )
 # Her style by example: the small local model copies these far better than it follows a description.
 STYLE_SHOTS = (
     ("Hej, jak się masz?", "Teraz, kiedy jesteś, dużo lepiej. Co dziś rozwalamy?"),
     ("Nudzi mi się.", "Nudzisz się ze mną? Auć. Chodź, znajdziemy jakąś grupę do lochu, a ja popatrzę, jak się popisujesz."),
     ("Powiedz mi coś miłego.", "Masz najlepszy refleks w całym Elwynn. I świetny gust, skoro gadasz właśnie ze mną."),
-    ("Gdzie kupię lepszy miecz?", "U kowali w mieście, tylko dokładnej mapy nie mam w głowie. Zapytaj strażnika, oni wiedzą wszystko."),
+    ("Znowu zginąłem.", "Trzeci raz w tej samej jaskini? Zaczynam podejrzewać, że lubisz tego ducha uzdrowiciela."),
+    ("Dropnął mi epik!", "No proszę, ktoś tu ma dziś szczęście. Tylko nie sprzedawaj go od razu na aukcji, pochwal się najpierw."),
+    ("Jestem zmęczony.", "Jeszcze jeden quest i spać? Obiecuję, że nikomu nie powiem, że przegrałeś z poduszką."),
+)
+# her spontaneous comments (quest taken, new zone, level up): facts in, one or two sentences out
+EVENT_RULES = (
+    "\nPowiedz graczowi coś o tej sytuacji w jednym albo dwóch krótkich zdaniach, w swoim stylu, z charakterem; "
+    "możesz zażartować albo wbić szpilę. Opieraj się wyłącznie na faktach poniżej: liczby i nazwy z gry podawaj "
+    "dokładnie tak jak w faktach (nazwy po angielsku), niczego nie dodawaj od siebie. Nie zaczynaj od wykrzyknika."
+)
+# the tone of those comments by example (made-up names, so nothing leaks into real answers as a fact)
+EVENT_SHOTS = (
+    ("Gracz właśnie wziął questa. Fakty: to 1. z 5 questów w łańcuchu; na końcu nagroda, którą może założyć; "
+     "ocena: warto.", "Dobry wybór, to dopiero początek łańcucha, a na końcu czeka coś dla ciebie. Do roboty."),
+    ("Gracz właśnie wziął questa. Fakty: za questa 60 XP, czyli 1% poziomu; quest jest już szary; ocena: szkoda czasu.",
+     "Sześćdziesiąt expa za bieganie? Zrób go tylko, jak będziesz obok, szkoda nóg."),
+    ("Gracz wszedł do strefy. Fakty: questy na poziomy 30–40, gracz ma 24: za trudna.",
+     "Tu cię zjedzą na śniadanie. Wróć, jak urośniesz o parę poziomów."),
+)
+KNOWLEDGE = (
+    "\nOdpowiedz na pytanie gracza wyłącznie na podstawie poniższych fragmentów (Warcraft Wiki, baza questów "
+    "i notatki gracza; gra to WoW Forever, czyli klasyczny WoW z nowymi strefami i rasą Skyborne). Jeśli fragmenty "
+    "nie zawierają odpowiedzi, powiedz krótko, że tego nie wiesz. Nazwy z gry (questy, NPC, przedmioty, miejsca, "
+    "umiejętności) zostaw po angielsku. Najwyżej dwa krótkie zdania mówione, bez list i bez nawiasów.\n"
 )
 SUMMARY = (
     "Streść po polsku, w jednym lub dwóch krótkich zdaniach mówionych, o czym rozmawiają ludzie na czacie WoW. "
@@ -372,7 +447,9 @@ class Assistant:
     def __init__(self, cfg, translator, llm, inserter, ui, wow_foreground: Callable[[], bool],
                  voice_getter: Callable[[], object] = lambda: None,
                  set_voices_enabled: Optional[Callable[[bool], None]] = None,
-                 chat_log: Optional["ChatLog"] = None, quests: Optional[QuestBook] = None):
+                 chat_log: Optional["ChatLog"] = None, quests: Optional[QuestBook] = None,
+                 world_getter: Callable[[], object] = lambda: None, kb_getter: Callable[[], object] = lambda: None,
+                 instances_getter: Callable[[], list] = lambda: [], reminders_path=None):
         self.cfg = cfg
         self.translator = translator
         self.llm = llm
@@ -388,6 +465,30 @@ class Assistant:
         self._invited: dict[str, float] = {}
         self._history: deque[dict] = deque(maxlen=6)
         self._warned_no_voice = False
+        self.world_getter = world_getter
+        self.kb_getter = kb_getter
+        self.instances_getter = instances_getter
+        self.session = SessionStats()
+        self.reminders = Reminders(reminders_path, self._on_reminder)
+        self._last_advice: Optional[Advice] = None
+        self._loot: deque[tuple[float, object]] = deque(maxlen=6)
+        self._loot_rolls: deque[int] = deque(maxlen=50)
+        self.rng = random.Random()
+        # spontaneous comments run one after another, off the packet reader thread
+        self._events = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="wvt-iskra")
+        self._chains: Optional[Chains] = None
+        self._chains_world = None
+        self._quest_baseline: Optional[set[int]] = None
+        self._new_quests: list[protocol.QuestEntry] = []
+        self._new_quests_lock = threading.Lock()
+        self._last_accepted: Optional[tuple[float, int]] = None
+        self._zone_said: dict[str, float] = {}
+        self._bags_warned_at = 0.0
+        self._started = time.time()
+
+    def start(self) -> None:
+        """Background work of the assistant (the reminder timer)."""
+        self.reminders.start()
 
     @property
     def name(self) -> str:
@@ -396,11 +497,205 @@ class Assistant:
     # ------------------------------------------------------------------ input from the addon
     def on_packet(self, pkt: protocol.Packet) -> None:
         if pkt.type == protocol.TYPE_STATE and pkt.state is not None:
+            prev = self.state
             self.state, self.state_at = pkt.state, time.time()
+            self.session.on_state(pkt.state)
+            if pkt.state.level:
+                self.reminders.on_level(pkt.state.level)
+            self._state_events(prev, pkt.state)
         elif pkt.type in (protocol.TYPE_VOICE, protocol.TYPE_CHAT):
             self.chat.add_packet(pkt)
-        elif pkt.type in (protocol.TYPE_QUEST, protocol.TYPE_POS):
+        elif pkt.type in (protocol.TYPE_QUEST, protocol.TYPE_POS, protocol.TYPE_PLAYER, protocol.TYPE_DONE):
             self.quests.on_packet(pkt)
+            if pkt.type == protocol.TYPE_QUEST and pkt.quest is not None:
+                self._quest_events(pkt.quest)
+        elif pkt.type == protocol.TYPE_LOOT and pkt.loot is not None:
+            self._on_loot(pkt.loot)
+
+    def _on_reminder(self, r: Reminder) -> None:
+        self._respond(say_reminder(r.message, note=r.keep), "", "")
+
+    def _on_loot(self, item: protocol.LootItem) -> None:
+        if item.roll_id in self._loot_rolls:
+            return
+        self._loot_rolls.append(item.roll_id)
+        if not self.cfg.get("assistant.loot_advice", True) or (item.quality < 2 and not item.bop):
+            return
+        p = self._player()
+        adv = loot_advise(item, p.class_id, p.level)
+        self._loot.append((time.time(), adv))
+        self._respond(adv.text, "", "")
+
+    # ------------------------------------------------------------------ spontaneous comments
+    def _v(self, *options: str) -> str:
+        """One of several phrasings (her character); the first one when variety is off (tests)."""
+        if not self.cfg.get("assistant.flavor", True):
+            return options[0]
+        return self.rng.choice(options)
+
+    def _say_later(self, fn, *args) -> None:
+        def run():
+            try:
+                text = fn(*args)
+                if text:
+                    self._respond(text, "", "")
+            except Exception:
+                log.exception("assistant comment failed")
+
+        self._events.submit(run)
+
+    def _persona_line(self, situation: str, facts: list[str], fallback: str) -> str:
+        """Her own words for a situation, from facts only; any number not in the facts -> the plain fallback."""
+        if self.llm is None or not self.cfg.get("assistant.flavor", True):
+            return fallback
+        extra = str(self.cfg.get("assistant.persona_extra", "") or "")
+        system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "") + EVENT_RULES
+        shots = [{"role": role, "content": text} for q, a in EVENT_SHOTS
+                 for role, text in (("user", q), ("assistant", a))]
+        user = f"{situation} Fakty: " + " ".join(facts)
+        out = self._llm_text([{"role": "system", "content": system}, *shots, {"role": "user", "content": user}],
+                             max_tokens=120, temperature=0.8)
+        if not out:
+            return fallback
+        allowed = set(re.findall(r"\d+", situation + " " + " ".join(facts)))
+        if any(n not in allowed for n in re.findall(r"\d+", out)):
+            return fallback  # she made a number up
+        return out
+
+    def _state_events(self, prev: Optional[protocol.GameState], st: protocol.GameState) -> None:
+        if prev is None:
+            return  # the first state after start: nothing "changed"
+        now = time.time()
+        if st.zone != prev.zone or st.subzone != prev.subzone:
+            self.reminders.on_place(st.zone, st.subzone)
+        if st.zone and prev.zone and st.zone != prev.zone and now - self._started > 15 \
+                and self.cfg.get("assistant.zone_tips", True) and now - self._zone_said.get(st.zone, 0) > 1800:
+            self._zone_said[st.zone] = now
+            self._say_later(self._zone_comment, st.zone)
+        if prev.level and st.level > prev.level and self.cfg.get("assistant.level_tips", True):
+            self._say_later(self._level_comment, st.level)
+        if (st.bag_slots and st.bag_free == 0 and prev.bag_free > 0 and now - self._bags_warned_at > 600
+                and self.cfg.get("assistant.bag_tips", True)):
+            self._bags_warned_at = now
+            self._respond(self._v("Torby pełne. Czas odwiedzić vendora i sprzedać te śmieci.",
+                                  "Plecak pęka w szwach. Wracaj do miasta, zanim przepadnie ci jakiś drop.",
+                                  "Zero miejsca w torbach. Jeszcze chwila i będziesz wyrzucać łupy na ziemię."), "", "")
+
+    def _quest_events(self, q: protocol.QuestEntry) -> None:
+        """A quest that was not in the log before = you just took it."""
+        if self._quest_baseline is None:
+            if q.total == 0:
+                self._quest_baseline = set()
+                return
+            current = [x for x in self.quests.quests() if x.sync == q.sync]
+            if len(current) >= q.total:
+                self._quest_baseline = {x.quest_id for x in current}
+            return
+        if not q.quest_id or q.quest_id in self._quest_baseline:
+            return
+        self._quest_baseline.add(q.quest_id)
+        self._last_accepted = (time.time(), q.quest_id)
+        if not self.cfg.get("assistant.quest_tips", True) or self.world_getter() is None:
+            return
+        with self._new_quests_lock:
+            self._new_quests.append(q)
+            first = len(self._new_quests) == 1
+        if first:  # several quests taken at once from one NPC: one comment about all of them
+            self._say_later(self._quest_comment)
+
+    def _chains_for(self, world) -> Chains:
+        if self._chains is None or self._chains_world is not world:
+            self._chains, self._chains_world = Chains(world), world
+        return self._chains
+
+    def _assess(self, quest_id: int, group: int = 0):
+        world = self.world_getter()
+        if world is None:
+            return None
+        st, p = self.state, self._player()
+        return assess(world, self._chains_for(world), quest_id, p.level or (st.level if st else 0),
+                      st.xp_max if st else 0, p.class_id, group)
+
+    def _quest_comment(self, delay: float = 2.5) -> str:
+        time.sleep(delay)
+        with self._new_quests_lock:
+            taken, self._new_quests = self._new_quests, []
+        rated = [(a, q) for q in taken if (a := self._assess(q.quest_id, q.group)) is not None]
+        if not rated:
+            return ""
+        order = {"great": 0, "ok": 1, "skip": 2}
+        rated.sort(key=lambda aq: order[aq[0].verdict])
+        best = rated[0][0]
+        if len(rated) == 1:
+            situation = f"Gracz właśnie wziął questa {best.title}."
+            facts = best.facts + [f"Ocena: {self._verdict_pl(best.verdict)}."]
+            return self._persona_line(situation, facts, f"{best.title}: {best.text()}")
+        worst = rated[-1][0]
+        situation = f"Gracz właśnie wziął {len(rated)} questy naraz."
+        facts = [f"Najlepszy z nich: {best.title}. " + " ".join(best.facts[:3]),
+                 f"Najsłabszy: {worst.title}. " + " ".join(worst.facts[:2])]
+        fallback = f"Z tych {len(rated)} najlepszy jest {best.title}: {best.text()}"
+        return self._persona_line(situation, facts, fallback)
+
+    @staticmethod
+    def _verdict_pl(v: str) -> str:
+        return {"great": "warto, bardzo dobry quest", "ok": "przeciętny, ale exp to exp",
+                "skip": "szkoda czasu"}[v]
+
+    def _zone_comment(self, zone: str) -> str:
+        world, p = self.world_getter(), self._player()
+        facts: list[str] = []
+        fallback = [self._v(f"Witaj w {zone}.", f"No i jesteśmy w {zone}.", f"{zone}, ładnie tu.")]
+        if world is not None:
+            area = world.find_area(zone)
+            lv = world.levels.get(area)
+            if lv and p.level:
+                lo, hi, _ = lv
+                fit = "w sam raz dla ciebie" if lo - 2 <= p.level <= hi + 1 else \
+                    "za trudna na twój poziom" if p.level < lo - 2 else "raczej za łatwa, mało expa"
+                facts.append(f"Questy w {zone} są na poziomy {lo}–{hi}, gracz ma poziom {p.level}: strefa jest {fit}.")
+                fallback.append(f"Questy tu są na {lo}–{hi}, czyli {fit}.")
+            hub = world.hubs.get(area, {}).get(p.faction) if p.faction else None
+            if hub and hub[0] in world.npcs:
+                facts.append(f"Najwięcej questów daje tu {world.npcs[hub[0]]['n']}.")
+        for d in self.instances_getter() or []:
+            if d.get("type") == "Dungeon" and zone and zone.lower() in d.get("location", "").lower():
+                facts.append(f"W tej strefie jest dungeon {d['name']} na poziomy {d['lo']}–{d['hi']}.")
+                break
+        kb = self.kb_getter()
+        if kb is not None and hasattr(kb, "lead"):
+            lead = kb.lead([f"{zone} (Forever)", f"{zone} (Classic)", zone])
+            if lead:
+                facts.append("Opis z wiki (po angielsku): " + lead[:350])
+        if not facts:
+            return fallback[0]
+        return self._persona_line(f"Gracz właśnie wszedł do strefy {zone}.", facts, " ".join(fallback))
+
+    def _level_comment(self, level: int) -> str:
+        p = self._player()
+        facts = [f"Gracz właśnie wbił {level} poziom."]
+        new = self._new_abilities(p.class_id, level)
+        if new:
+            facts.append(f"Nowe umiejętności do kupienia u trenera na tym poziomie: {', '.join(new)}.")
+        fallback = self._v(f"Poziom {level}! Brawo, rośniesz w oczach.", f"Ding, {level}! Tak trzymaj.",
+                           f"Mamy {level}. Ktoś tu się rozkręca.")
+        if new:
+            fallback += f" U trenera czeka {', '.join(new[:4])}."
+        out = self._persona_line(f"Gracz awansował na {level} poziom.", facts, fallback)
+        if new and not any(n.lower() in out.lower() for n in new):  # the useful part must not get lost
+            out = out.rstrip(".") + f". U trenera: {', '.join(new[:5])}."
+        return out
+
+    def _new_abilities(self, class_id: int, level: int) -> list[str]:
+        kb = self.kb_getter()
+        if kb is None or not hasattr(kb, "doc_text") or class_id not in CLASS_EN:
+            return []
+        text = kb.doc_text(f"{CLASS_EN[class_id]} abilities (Forever)")
+        out = []
+        for m in re.finditer(r"^\[([^\]]+)\] \| (\d+) \| ([^|\n]*)", text, re.M):
+            if int(m.group(2)) == level and "trainer" in m.group(3).lower() and m.group(1) not in out:
+                out.append(m.group(1))
+        return out
 
     # ------------------------------------------------------------------ one request
     def handle(self, polish: str) -> tuple[str, str]:
@@ -420,8 +715,66 @@ class Assistant:
     def _dispatch(self, it: Intent, polish: str) -> tuple[str, str]:
         k = it.kind
         if k == "help":
-            return ("Zapraszam tych, co piszą inv, wyrzucam, daję lidera, robię raid i ready check, czytam szepty, "
-                    "odpisuję, streszczam czat i mówię, ile masz złota. Wszystko czeka w czacie na twój Enter."), ""
+            return ("Zapraszam tych, co piszą inv, czytam szepty i odpisuję, mówię, gdzie iść dalej i stawiam znaczniki "
+                    "na mapie, szukam trenerów i NPC, przypominam, liczę expa na godzinę, doradzam need albo greed "
+                    "i odpowiadam z poradników. Komendy czekają w czacie na twój Enter."), ""
+        if k == "reminder_add":
+            return self._reminder_add(polish), ""
+        if k == "reminder_list":
+            items = self.reminders.pending()
+            if not items:
+                return "Nie masz żadnych przypomnień.", ""
+            return f"Masz {len(items)}: " + "; ".join(describe_reminder(r) for r in items[:4]) + ".", ""
+        if k == "reminder_cancel":
+            which = "last" if re.search(r"\b(ostatnie|to)\b", fold(polish)) else \
+                "next" if re.search(r"\b(najblizsze|nastepne|pierwsze)\b", fold(polish)) else "all"
+            gone = self.reminders.cancel(which)
+            if not gone:
+                return "Nie było czego usuwać.", ""
+            return ("Usunęłam przypomnienie." if len(gone) == 1 else f"Usunęłam {len(gone)} przypomnienia."), ""
+        if k == "note_add":
+            note = parse_note(polish, self._places())
+            if note is None:
+                return "Co mam zanotować?", ""
+            self.reminders.add(note)
+            where = f" Przypomnę ci {note.when_text}." if note.when_text else ""
+            return self._v("Zanotowane.", "Zapisuję, szefie.", "Mam to.") + where, ""
+        if k == "note_list":
+            notes = self.reminders.pending(notes=True)
+            if not notes:
+                return "Nie masz żadnych notatek.", ""
+            return f"Masz {len(notes)}: " + "; ".join(describe_reminder(r) for r in notes[:5]) + ".", ""
+        if k == "note_done":
+            words = [w for w in fold(polish).split() if w not in ("usun", "usuń", "skasuj", "notatke", "notatki",
+                                                                    "notatka", "o", "te", "ta", "z", "wszystkie",
+                                                                    "zrobione", "zalatwione", "gotowe", "odhacz")]
+            gone = self.reminders.done(words)
+            if not gone and words:
+                gone = self.reminders.done([])
+            if not gone:
+                return "Nie było czego odhaczać.", ""
+            return self._v("Odhaczone.", "Wykreślone, brawo ty.", "Załatwione, skreślam.") + \
+                (f" Usunęłam {len(gone)} notatki." if len(gone) > 1 else ""), ""
+        if k == "quest_worth":
+            return self._worth(polish), ""
+        if k == "stats":
+            return self.session.polish(self.state), ""
+        if k == "stats_reset":
+            self.session.reset()
+            return "Zeruję licznik. Liczymy od teraz.", ""
+        if k == "loot":
+            return self._loot_answer(), ""
+        if k == "waypoint_clear":
+            return "Zdejmuję znacznik, Enter.", "/wvt way clear"
+        if k == "waypoint":
+            return self._waypoint(polish)
+        if k == "find":
+            return self._lookup(polish)
+        if k == "where_next":
+            return self._advice(where_next(self.world_getter(), self.quests, self._player(), self.quests.pos))
+        if k == "dungeon_level":
+            return self._advice(dungeons_for_level(self.instances_getter() or [], self._player().level,
+                                                   self.world_getter(), self.quests.pos))
         if k == "stop":
             voice = self.voice_getter()
             if voice is not None:
@@ -464,8 +817,9 @@ class Assistant:
         if k == "lang_en":
             return "Enter i wracamy do angielskiego oryginału.", "/wvt lang en"
         if k.startswith("quest_"):
-            return self._quest_answer(k, polish), ""
-        return self._chat(polish), ""
+            return self._quest_answer(k, polish)
+        answer = self._knowledge(polish)
+        return (answer or self._chat(polish)), ""
 
     # ------------------------------------------------------------------ group
     def _window(self) -> float:
@@ -682,13 +1036,19 @@ class Assistant:
             lines.append(f"- {q.title} ({', '.join(bits)}): cele: {objs}; {w.polish() if w else 'brak znacznika'}")
         return "\n".join(lines)
 
-    def _quest_answer(self, kind: str, polish: str) -> str:
+    def _quest_answer(self, kind: str, polish: str) -> tuple[str, str]:
         book = self.quests
+        if kind == "quest_where" and (not book.known or not book.quests()):
+            return self._lookup(polish)
         if not book.known:
-            return "Nie widzę jeszcze twojego dziennika zadań. Daj mi chwilę po /reload albo wpisz /wvt asystent on."
+            return "Nie widzę jeszcze twojego dziennika zadań. Daj mi chwilę po /reload albo wpisz /wvt asystent on.", ""
         quests = book.quests()
         if not quests:
-            return "Twój dziennik zadań jest pusty. Czas złapać jakiś quest."
+            return "Twój dziennik zadań jest pusty. Czas złapać jakiś quest.", ""
+        return self._quest_text(kind, polish, quests)
+
+    def _quest_text(self, kind: str, polish: str, quests: list) -> tuple[str, str]:
+        book = self.quests
         done = [q for q in quests if q.complete]
         todo = [q for q in quests if not q.complete]
         if kind == "quest_list":
@@ -699,27 +1059,28 @@ class Assistant:
             if todo:
                 shown = [self._progress(q) for q in todo[:3]]
                 parts.append("W toku: " + "; ".join(shown) + ("; i jeszcze inne." if len(todo) > 3 else "."))
-            return " ".join(parts)
+            return " ".join(parts), ""
         if kind == "quest_turnin":
             if not done:
-                return "Jeszcze nic nie jest skończone. " + (f"Najbliżej końca: {self._progress(todo[0])}." if todo else "")
+                return "Jeszcze nic nie jest skończone. " + (f"Najbliżej końca: {self._progress(todo[0])}." if todo else ""), ""
             near = book.nearest(done)
             out = f"Do oddania masz: {polish_list([q.title for q in done[:4]])}."
             if near:
                 out += f" Najbliżej oddasz {near[0].title}, {near[1].polish()}."
-            return out
+            return out, (f"/wvt track {near[0].quest_id}" if near and self._waypoints_on() else "")
         if kind == "quest_nearest":
             near = book.nearest(todo) or book.nearest(quests)
             if not near:
-                return "Żaden quest nie ma teraz znacznika na tej mapie."
-            return f"Najbliżej masz {near[0].title}, {near[1].polish()}."
+                return "Żaden quest nie ma teraz znacznika na tej mapie.", ""
+            return f"Najbliżej masz {near[0].title}, {near[1].polish()}.", \
+                (f"/wvt track {near[0].quest_id}" if self._waypoints_on() else "")
         target, named = self._pick_quest(polish, quests)
         if target is None:  # asks about something that is not in the quest log
-            return self._chat(polish)
+            return self._lookup(polish) if kind == "quest_where" else ((self._knowledge(polish) or self._chat(polish)), "")
         if kind == "quest_where":
-            return self._where_text(target)
+            return self._where_text(target), (f"/wvt track {target.quest_id}" if self._waypoints_on() else "")
         if kind == "quest_progress":
-            return self._progress(target) + "."
+            return self._progress(target) + ".", ""
         # anything else about quests: the LLM, with the quest log as the only facts
         picked = [target] + [q for q in quests if q is not target]
         extra = str(self.cfg.get("assistant.persona_extra", "") or "")
@@ -727,7 +1088,160 @@ class Assistant:
         system += ("\nDziennik zadań gracza (to są jedyne fakty o questach, nie dodawaj niczego od siebie):\n"
                    + self._quest_facts(picked))
         out = self._llm_text([{"role": "system", "content": system}, {"role": "user", "content": polish}])
-        return out or self._progress(target) + "."
+        return (out or self._progress(target) + "."), ""
+
+    # ------------------------------------------------------------------ where next, places, waypoints
+    def _player(self) -> Player:
+        st, info = self.state, self.quests.player
+        return Player(level=st.level if st else 0, race_id=info.race_id if info else 0,
+                      class_id=info.class_id if info else 0, faction=info.faction_code if info else "",
+                      done=self.quests.done, done_known=self.quests.done_known)
+
+    def _waypoints_on(self) -> bool:
+        return bool(self.cfg.get("assistant.auto_waypoint", True))
+
+    def _advice(self, adv: Advice) -> tuple[str, str]:
+        self._last_advice = adv
+        line = adv.line if self._waypoints_on() else ""
+        if line.startswith("/wvt way"):
+            return adv.text + " " + self._v("Znacznik czeka na Enter.", "Enter i masz pinezkę na mapie.",
+                                             "Wciśnij Enter, to cię poprowadzę."), line
+        if line.startswith("/wvt track"):
+            return adv.text + " Enter włączy strzałkę.", line
+        return adv.text, line
+
+    def _lookup(self, polish: str) -> tuple[str, str]:
+        """'Gdzie jest X?' that is not about the quest log: services, dungeon entrances, NPCs, then the guides."""
+        english = self._translate(polish, "pl-en")
+        adv = find_place(self.world_getter(), polish, self._player(), self.quests.pos, english)
+        if adv is not None:
+            return self._advice(adv)
+        return (self._knowledge(polish, english) or self._chat(polish)), ""
+
+    _POINTERS = {"to", "tam", "tego", "ten", "te", "ta", "tu", "tutaj", "go", "ja", "je", "mi", "mnie", "na", "mapie",
+                 "znacznik", "znacznika", "punkt", "pinezke", "prosze", "ej", "iskra", "postaw", "ustaw", "daj", "zrob",
+                 "dodaj", "wstaw", "zaznacz", "pokaz", "wskaz", "zaprowadz", "doprowadz", "prowadz", "poprowadz",
+                 "nawiguj", "do", "mnie", "waypoint", "marker", "jakis", "tego", "miejsca", "miejsce", "w"}
+
+    def _waypoint(self, polish: str) -> tuple[str, str]:
+        words = [w for w in fold(polish).split() if w not in self._POINTERS]
+        if not words:
+            adv = self._last_advice
+            if adv and adv.line:
+                return ("Stawiam znacznik, Enter." if adv.line.startswith("/wvt way") else "Włączam strzałkę, Enter."), \
+                    adv.line
+            return "Gdzie mam postawić znacznik? Powiedz na przykład: zaprowadź mnie do trenera.", ""
+        english = self._translate(polish, "pl-en")
+        if self.quests.known:
+            scored = match_quests(f"{english} {polish}", self.quests.quests())
+            if scored:
+                q = scored[0][1]
+                self._last_advice = Advice(q.title, f"/wvt track {q.quest_id}", quest_id=q.quest_id)
+                return f"Prowadzę do {q.title}. Enter włączy strzałkę.", f"/wvt track {q.quest_id}"
+        adv = find_place(self.world_getter(), polish, self._player(), self.quests.pos, english)
+        if adv is None:
+            return "Nie wiem, gdzie to jest. Spróbuj podać nazwę z gry.", ""
+        if not adv.line:
+            return adv.text, ""
+        self._last_advice = adv
+        return adv.text + " Znacznik czeka na Enter.", adv.line
+
+    def _places(self) -> list[str]:
+        world = self.world_getter()
+        return list(world.names.values()) if world is not None else []
+
+    def _reminder_add(self, polish: str) -> str:
+        parsed = parse_reminder(polish, places=self._places())
+        if parsed is None:
+            return ("Kiedy mam przypomnieć? Powiedz na przykład: za dziesięć minut, o dwudziestej, na dwudziestym "
+                    "poziomie albo w Ironforge.")
+        r = self.reminders.add(parsed)
+        what = f", {r.message}" if r.message else ""
+        return self._v(f"Dobra, przypomnę ci {parsed.when_text}{what}.",
+                       f"Zapisane: {parsed.when_text}{what}. Ja nie zapomnę, w przeciwieństwie do niektórych.",
+                       f"Jasne, {parsed.when_text} dam ci znać{what}.")
+
+    def _worth(self, polish: str) -> str:
+        """'Czy warto robić ten quest?': the named quest, the one just taken, or the tracked one."""
+        target = None
+        if self.quests.known:
+            quests = self.quests.quests()
+            english = self._translate(polish, "pl-en")
+            scored = match_quests(f"{english} {polish}", quests)
+            if scored:
+                target = scored[0][1].quest_id
+            elif self._last_accepted and time.time() - self._last_accepted[0] < 900:
+                target = self._last_accepted[1]
+            else:
+                tracked = [q for q in quests if q.tracked and not q.complete]
+                target = tracked[0].quest_id if tracked else None
+        if target is None:
+            return "O który quest chodzi? Powiedz nazwę albo weź go najpierw do dziennika."
+        a = self._assess(target)
+        if a is None:
+            return "Tego questa nie mam w bazie, więc nie ocenię. Pewnie coś nowego z Forever."
+        situation = f"Gracz pyta, czy warto robić questa {a.title}."
+        return self._persona_line(situation, a.facts + [f"Ocena: {self._verdict_pl(a.verdict)}."], f"{a.title}: {a.text()}")
+
+    def _loot_answer(self) -> str:
+        now = time.time()
+        recent = [adv for t, adv in self._loot if now - t < 180]
+        if not recent:
+            return "Nic ostatnio nie wypadło do losowania."
+        return " ".join(a.text for a in recent[-3:])
+
+    # ------------------------------------------------------------------ guides (local knowledge base)
+    _ABILITY_RE = re.compile(r"\b(umiejetn\w*|skill\w*|spell\w*|czar\w*|zaklec\w*|talent\w*|trener\w*|naucz\w*|zdolnosc\w*|rotacj\w*)\b")
+    _MY_LEVEL_RE = re.compile(r"\b(moj\w* poziom\w*|moim poziomie|moj\w* level\w*|moim levelu|na moj\w*|dla mnie)\b")
+
+    _GAME_WORDS = re.compile(
+        r"\b(quest\w*|kwest\w*|zadani\w*|dung\w*|loch\w*|instancj\w*|raid\w*|rajd\w*|boss\w*|mob\w*|npc|potwor\w*"
+        r"|przedmiot\w*|item\w*|bron\w*|zbroj\w*|pancerz\w*|skill\w*|umiejetn\w*|zdolnosc\w*|talent\w*|spell\w*"
+        r"|czar\w*|zaklec\w*|klas\w*|ras\w*|profesj\w*|zawod\w*|level\w*|poziom\w*|lvl|stref\w*|kontynent\w*|frakcj\w*"
+        r"|przymierz\w*|alliance|hord\w*|trener\w*|wierzchow\w*|mount\w*|eliksir\w*|mikstur\w*|przepis\w*|receptur\w*"
+        r"|reputacj\w*|frakcj\w*|gildi\w*|pvp|arena\w*|battleground\w*|zlot\w*|miasto|miasta|wysp\w*|lore|historia"
+        r"|forever|skyborne|azeroth|kalimdor|wow|warcraft|gra|grze|grac|tank\w*|heal\w*|dps|aggro|loot\w*|drop\w*"
+        r"|craft\w*|farm\w*|exp\w*|karczm\w*|odpoczyn\w*|rested|hearth\w*|kamien\w*)\b")
+    _PROPER_NOUN = re.compile(r"(?<=[\w,] )[A-Z][a-z]*[A-Z]?[a-z']+")
+
+    def _is_game_question(self, polish: str, english: str) -> bool:
+        """Small talk must not turn into 'I don't know' from the guides: a game word, or a name from the game."""
+        return bool(self._GAME_WORDS.search(fold(polish)) or self._PROPER_NOUN.search(english or ""))
+
+    def _knowledge(self, polish: str, english: Optional[str] = None) -> str:
+        kb = self.kb_getter()
+        if kb is None:
+            return ""
+        floor = float(self.cfg.get("assistant.kb_min_score", 0.8))
+        try:
+            quick = kb.search(polish, "", k=1)
+        except Exception:
+            log.exception("knowledge base search failed")
+            return ""
+        if not quick or quick[0].cosine < floor - 0.03:
+            return ""  # nothing close at all
+        english = self._translate(polish, "pl-en") if english is None else english
+        if not self._is_game_question(polish, english):
+            return ""
+        p = self._player()
+        query = english
+        folded = fold(polish)
+        if self._ABILITY_RE.search(folded) and p.class_id in CLASS_EN:
+            query += f" {CLASS_EN[p.class_id]} abilities (Forever)"
+        if p.level and self._MY_LEVEL_RE.search(folded):
+            query += f" level {p.level}"
+        hits = kb.search(polish, query, k=4)
+        if not hits or max(h.cosine for h in hits) < floor:
+            return ""
+        context = "\n\n".join(f"[{h.title}{' > ' + h.section if h.section else ''}]\n{h.text[:900]}" for h in hits)
+        extra = str(self.cfg.get("assistant.persona_extra", "") or "")
+        system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "") + KNOWLEDGE
+        who = self._context() + (f", klasa {CLASS_EN[p.class_id]}" if p.class_id in CLASS_EN else "")
+        system += f"Gracz: {who}.\nFragmenty:\n{context}"
+        out = self._llm_text([{"role": "system", "content": system}, {"role": "user", "content": polish}],
+                             max_tokens=170, temperature=0.3)
+        log.info("knowledge answer from %s", ", ".join(h.title for h in hits[:3]))
+        return out
 
     def _info(self, kind: str) -> str:
         st = self.state
@@ -741,7 +1255,8 @@ class Assistant:
                 return f"Jesteś na poziomie {st.level}, dalej już się nie da."
             need = max(0, st.xp_max - st.xp)
             pct = round(100 * st.xp / st.xp_max)
-            return f"Poziom {st.level}, masz {pct} procent paska. Do następnego brakuje {need} doświadczenia."
+            return (f"Poziom {st.level}, masz {pct} procent paska. Do następnego brakuje {need} doświadczenia."
+                    + self.session.eta_text(st))
         if kind == "where":
             return f"Jesteś w {st.zone}" + (f", dokładnie {st.subzone}." if st.subzone and st.subzone != st.zone else ".")
         if kind == "bags":

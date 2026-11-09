@@ -710,3 +710,15 @@ def test_a_flooding_player_is_muted_for_a_while(tmp_path):
     assert m.on_packet(_pkt("spam number 3", distance=5, sender="Spammer-F")) == "flood"
     assert m.on_packet(_pkt("spam number 4", distance=5, sender="Spammer-F")) == "flood"
     assert m.on_packet(_pkt("hello, calm here", distance=5, sender="Calm-F")) is None
+
+
+def test_three_characters_can_speak_at_once(tmp_path):
+    from wvt.config import DEFAULTS
+
+    m = VoiceManager(dict(DEFAULTS["voice"]), FakeTTS(), VoiceResolver(_store(tmp_path)), FakeMixer(),
+                     TTSNormalizer({"mode": "rules"}), DailyBudget(tmp_path / "usage.json", 1000))
+    m.start()
+    try:
+        assert len(m._threads) == 3
+    finally:
+        m.stop()

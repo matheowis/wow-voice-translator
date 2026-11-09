@@ -30,6 +30,8 @@ LLMS = {
     "nemotron-nano-4b": ("nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf"),
     "gemma4-e4b": ("google/gemma-4-E4B-it-qat-q4_0-gguf", "gemma-4-E4B_q4_0-it.gguf"),
 }
+EMBED_REPO = "Xenova/multilingual-e5-small"  # MIT; ONNX int8 export of intfloat/multilingual-e5-small
+EMBED_FILES = ["onnx/model_quantized.onnx", "tokenizer.json", "config.json"]
 LLAMA_CPP_TAG = "b12177"
 LLAMA_CPP_ASSETS = [f"llama-{LLAMA_CPP_TAG}-bin-win-cuda-13.5-x64.zip", "cudart-llama-bin-win-cuda-13.5-x64.zip"]
 
@@ -106,8 +108,20 @@ def main() -> int:
     ap.add_argument("--skip-llama-cpp", action="store_true")
     ap.add_argument("--speaker-model", action="store_true",
                     help="WeSpeaker ResNet34 (26 MB) - only needed to design voices (python -m wvt.voice.design)")
+    ap.add_argument("--embed-model", action="store_true",
+                    help="only multilingual-e5-small (ONNX int8, ~120 MB) for the assistant's knowledge base, then stop")
     args = ap.parse_args()
     ok = True
+
+    if args.embed_model:  # the knowledge base's embedding model (MIT): Polish questions, English guides
+        print("multilingual-e5-small (ONNX int8, wektory bazy wiedzy):")
+        meta = hf_meta(EMBED_REPO)
+        for f in EMBED_FILES:
+            dest = ROOT / "models" / "embed" / "multilingual-e5-small" / Path(f).name
+            if not args.verify:
+                download(f"https://huggingface.co/{EMBED_REPO}/resolve/main/{f}", dest, meta[f]["size"])
+            ok &= check(dest, meta[f])
+        return 0 if ok else 1
 
     if args.speaker_model:
         repo, fname = "Wespeaker/wespeaker-voxceleb-resnet34", "voxceleb_resnet34.onnx"

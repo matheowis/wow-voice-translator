@@ -132,7 +132,12 @@ class PushToTalkPipeline:
         try:
             acfg = self.cfg["audio"]
             threshold = float(acfg.get("silence_rms_threshold", 0.006))
+            raw = audio_mod.analyze(audio, threshold)
+            audio, gain_db = audio_mod.input_gain(audio, threshold, float(acfg.get("input_gain_db", 0.0) or 0.0),
+                                                  bool(acfg.get("auto_gain", True)))
             stats = audio_mod.analyze(audio, threshold)
+            log.info("audio %.1fs: level %.0f dBFS (peak %.0f), gain %+.0f dB, speech %.1fs", raw.duration,
+                     audio_mod.dbfs(raw.rms), audio_mod.dbfs(raw.peak), gain_db, stats.speech_seconds)
             timings["audio_s"] = round(stats.duration, 2)
             if stats.duration < 0.25 or stats.speech_seconds < float(acfg.get("min_speech_seconds", 0.35)):
                 self.ui.status("info", "Nie usłyszałem mowy", [f"nagranie {stats.duration:.1f}s, poziom {stats.rms:.4f} – sprawdź mikrofon/próg ciszy"], timeout=3.5)

@@ -41,6 +41,16 @@ DEFAULTS: dict[str, Any] = {
         "llm_timeout_s": 8,
         "max_reply_chars": 240,
         "persona_extra": "",  # added to her character description, e.g. "mów do mnie Mati"
+        "auto_waypoint": True,  # answers about places prepare "/wvt way ..." (map waypoint) in the chat box
+        "loot_advice": True,  # say "need" or "greed" when a group loot roll starts
+        "knowledge_base": True,  # answer game questions from data/kb (python -m wvt.kb.build)
+        "kb_min_score": 0.8,  # cosine similarity a guide fragment needs to count as an answer
+        "reminders_file": "data/reminders.json",
+        "flavor": True,  # her character: varied phrasings and her own words for spontaneous comments
+        "quest_tips": True,  # say whether a quest you just took is worth it (chain, XP, rewards)
+        "zone_tips": True,  # a word about a zone when you enter it
+        "level_tips": True,  # level up: new abilities at the trainer
+        "bag_tips": True,  # bags full
     },
     "channels": {
         "say": "/s",
@@ -59,6 +69,8 @@ DEFAULTS: dict[str, Any] = {
         "min_speech_seconds": 0.35,
         "max_record_seconds": 30,
         "silence_rms_threshold": 0.006,  # below this the recording counts as silence
+        "input_gain_db": 0.0,  # fixed boost of the microphone before speech detection (0-30 dB)
+        "auto_gain": True,  # lift a quiet recording (up to +30 dB) without lifting the noise above the threshold
     },
     "stt": {
         "model_dir": "models/parakeet-tdt-0.6b-v3-onnx",
@@ -139,7 +151,7 @@ DEFAULTS: dict[str, Any] = {
         "max_chars_per_message": 220,
         "daily_char_budget": 30000,  # characters sent to ElevenLabs per day (~0.5 credit each on v4 Turbo)
         "max_queue": 6,
-        "max_concurrent": 2,  # utterances playing at the same time
+        "max_concurrent": 3,  # characters speaking at the same time (people often write at once)
         "stale_after_s": 20,  # older lines are dropped instead of read late
         "dedup_window_s": 15,  # same sender + same text within this window is read once
         # /say safety valve for crowded places (cities): the nearest player is always read first;
