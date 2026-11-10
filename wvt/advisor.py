@@ -32,6 +32,7 @@ class Advice:
     line: str = ""
     spot: Optional[Spot] = None
     quest_id: int = 0
+    item: str = ""  # find_item: the item the answer is about
 
 
 def waypoint_line(spot: Spot, label: str = "") -> str:
@@ -342,6 +343,77 @@ def find_place(world: Optional[World], polish: str, player: Player, pos=None, en
     if lvl and spot.kind == "npc" and not world.npcs[spot.eid].get("f"):
         extra = f" Poziom {lvl[0]}" + (f"–{lvl[1]}" if lvl[1] != lvl[0] else "") + "."
     return Advice(f"{spot.name}: {spot_where(world, spot, pos)}.{extra}", waypoint_line(spot, spot.name), spot)
+
+
+# --------------------------------------------------------------------------- items
+def _place(world: World, spot: Spot, pos) -> str:
+    """'około 120 jardów na północ' on your map, otherwise 'w Dun Morogh, 47, 52'."""
+    if spot.distance is not None and pos is not None and pos.width:
+        return spot_where(world, spot, pos)
+    zone = world.area_name(spot.area)
+    return f"w {zone}, {spot.x:.0f}, {spot.y:.0f}" if zone else f"na mapie {spot.x:.0f}, {spot.y:.0f}"
+
+
+def _by_distance(spots: list[Spot]) -> list[Spot]:
+    return sorted(spots, key=lambda s: s.distance if s.distance is not None else 1e9)
+
+
+def find_item(world: Optional[World], polish: str, player: Player, pos=None, english: str = "") -> Optional[Advice]:
+    """Where to get an item named in the question: the nearest vendor, the mobs that drop it, the chests
+    it is in (QuestieDB items of quests) and the quest it is for - with a waypoint to the nearest one."""
+    if world is None or not hasattr(world, "find_item_in"):
+        return None
+    ids = world.find_item_in(f"{polish} {english}".strip())
+    if not ids:
+        return None
+    iid = ids[0]
+    it = world.items[iid]
+    name = it["n"]
+    sold = [n for n in it.get("v", []) if n in world.npcs]
+    vendors = [n for n in sold if _friendly(world.npcs[n], player.faction)] or sold
+    drops = [n for n in it.get("nd", []) if n in world.npcs and n not in sold]
+    chests = [o for o in it.get("od", []) if o in world.objects]
+    sentences: list[str] = []
+    best: Optional[Spot] = None
+    if vendors:
+        spots = _by_distance([s for n in vendors if (s := world.nearest("npc", n, pos))])
+        if spots:
+            best = spots[0]
+            sub = world.npcs[best.eid].get("sub", "")
+            who = f"{best.name}, {sub}," if sub else best.name
+            sentences.append(f"{name} kupisz u {who} {_place(world, best, pos)}.")
+            more = [f"{s.name} w {world.area_name(s.area)}" for s in spots[1:3] if world.area_name(s.area)]
+            if more:
+                sentences.append(f"Jest też u {_join(more)}.")
+            if not any(_friendly(world.npcs[n], player.faction) for n in sold):
+                sentences.append("Uwaga, sprzedaje go tylko druga frakcja.")
+    if drops:
+        spots = _by_distance([s for n in drops if (s := world.nearest("npc", n, pos))])
+        if spots:
+            mob = spots[0]
+            lvl = world.npcs.get(mob.eid, {}).get("lv")
+            lv = (f", poziom {lvl[0]}" + (f"–{lvl[1]}" if lvl[1] != lvl[0] else "")) if lvl else ""
+            others = [s.name for s in spots[1:3] if s.name != mob.name]
+            sentences.append(f"{'Wypada' if sentences else name + ' wypada'} z {mob.name}{lv}, "
+                             f"najbliżej {_place(world, mob, pos)}." + (f" Też z {_join(others)}." if others else ""))
+            best = best or mob
+    if chests:
+        spots = _by_distance([s for o in chests if (s := world.nearest("object", o, pos))])
+        if spots:
+            sentences.append(f"{'Zbierzesz' if sentences else name + ' zbierzesz'} z {spots[0].name}, "
+                             f"najbliżej {_place(world, spots[0], pos)}.")
+            best = best or spots[0]
+    # the same quest often exists twice (one per faction or race): name it once
+    for_quests = list(dict.fromkeys(q["n"] for q in world.quests.values()
+                                    if any(i == iid for i, *_ in q.get("loot", []))))[:2]
+    if for_quests:
+        sentences.append(f"Potrzebne do questa {_join(for_quests)}.")
+    rewards = list(dict.fromkeys(q["n"] for q in world.quests.values() if iid in q.get("rw", [])))[:2]
+    if rewards:
+        sentences.append(f"Dostaniesz to też w nagrodę za {_join(rewards)}.")
+    if not sentences:
+        return None
+    return Advice(" ".join(sentences), waypoint_line(best, f"{name}: {best.name}") if best else "", best, item=name)
 
 
 # --------------------------------------------------------------------------- dungeons by level

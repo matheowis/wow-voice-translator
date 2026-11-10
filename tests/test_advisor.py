@@ -7,8 +7,8 @@ import pytest
 
 from tests.test_kb import world
 from wvt import protocol as P
-from wvt.advisor import dungeons_for_level, find_place, waypoint_line, where_next
-from wvt.kb.world import Player, Spot
+from wvt.advisor import dungeons_for_level, find_item, find_place, waypoint_line, where_next
+from wvt.kb.world import Player, Spot, World
 from wvt.loot import advise, best_armor
 from wvt.quests import QuestBook
 from wvt.reminders import Reminders, parse_reminder, say_reminder
@@ -72,6 +72,37 @@ def test_places_services_and_npcs():
     assert find_place(w, "gdzie jest Pillagera Defiasów", me, pos, english="where is the Defias Pillager") is not None
     assert find_place(w, "gdzie jest coś zupełnie innego", me, pos) is None
     assert waypoint_line(Spot("npc", 1, "A|B\nC", 40, 1.25, 2.0, 1436)) == "/wvt way 1436 1.2 2.0 A B C"
+
+
+def item_world():
+    """Rhapsody Malt as QuestieDB has it: sold by two innkeepers (also listed as its 'drops'), for a quest."""
+    return World({
+        "quests": {"384": {"n": "Beer Basted Boar Ribs", "loot": [[2894, 1], [2886, 6]]}},
+        "npcs": {"1247": {"n": "Innkeeper Belm", "sub": "Innkeeper", "f": "A", "sp": {"1": [[47.4, 52.5]]}},
+                 "1682": {"n": "Yanni Stoutheart", "sub": "General Supplies", "f": "A", "sp": {"38": [[34.8, 48.6]]}},
+                 "1125": {"n": "Crag Boar", "lv": [5, 6], "sp": {"1": [[40.0, 50.0], [60.0, 45.0]]}}},
+        "items": {"2894": {"n": "Rhapsody Malt", "v": [1247, 1682], "nd": [1247, 1682]},
+                  "2886": {"n": "Crag Boar Rib", "nd": [1125]}},
+        "zones": {"names": {"1": "Dun Morogh", "38": "Loch Modan"}, "map": {"1": 1426, "38": 1432}},
+    })
+
+
+def test_items_name_who_sells_or_drops_them_nearest_first():
+    w = item_world()
+    me = mage(level=6)
+    far = P.PlayerPos(map_id=1453, x=0.5, y=0.5, width=1000, height=700)  # Stormwind: another map
+    adv = find_item(w, "gdzie kupię rhapsody malt?", me, far)
+    assert adv.item == "Rhapsody Malt"
+    assert adv.text == ("Rhapsody Malt kupisz u Innkeeper Belm, Innkeeper, w Dun Morogh, 47, 52. Jest też u Yanni "
+                        "Stoutheart w Loch Modan. Potrzebne do questa Beer Basted Boar Ribs.")
+    assert adv.line == "/wvt way 1426 47.4 52.5 Rhapsody Malt: Innkeeper Belm"
+    near = P.PlayerPos(map_id=1426, x=0.41, y=0.50, width=4000, height=2700)
+    adv = find_item(w, "skąd wziąć crag boar rib", me, near)
+    assert adv.text.startswith("Crag Boar Rib wypada z Crag Boar, poziom 5–6, najbliżej około 40 jardów")
+    assert adv.line == "/wvt way 1426 40.0 50.0 Crag Boar Rib: Crag Boar"
+    # speech recognition spells English names its own way
+    assert find_item(w, "gdzie znajdę rapsody malt", me, far).item == "Rhapsody Malt"
+    assert find_item(w, "gdzie jest najbliższy karczmarz", me, far) is None
 
 
 def test_dungeons_for_the_level_use_the_wiki_table_and_classic_ranges():

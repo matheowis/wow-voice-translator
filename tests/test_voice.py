@@ -275,9 +275,16 @@ def test_polish_mode_translates_and_own_lines_follow_the_mode(mgr):
     assert _wait(lambda: m.stats["spoken"] == 1)
     # translated, then respelled for the Polish voice ("pullujemy" -> "pulujemy")
     assert tr.calls == [("r u rdy? pull in 5", "en-pl")] and tts.calls[0][1:] == ("Gotowi? Pulujemy za 5", "pl")
-    assert m.on_packet(_pkt(text="my own line", flags=P.VFLAG_SELF | P.VFLAG_LANG_PL)) == "own"
-    assert m.on_packet(_pkt(text="my own line", flags=P.VFLAG_SELF, distance=0.0)) is None  # EN: my character repeats it
+    # PL: my character repeats my line in Polish (the original I spoke is remembered by the translator)
+    assert m.on_packet(_pkt(text="my own line", flags=P.VFLAG_SELF | P.VFLAG_LANG_PL, distance=0.0)) is None
     assert _wait(lambda: m.stats["spoken"] == 2)
+    assert tr.calls[-1] == ("my own line", "en-pl") and tts.calls[1][2] == "pl"
+    # EN: my character repeats it in English
+    assert m.on_packet(_pkt(text="my other line", flags=P.VFLAG_SELF, distance=0.0)) is None
+    assert _wait(lambda: m.stats["spoken"] == 3)
+    assert tts.calls[2][1:] == ("my other line", "en")
+    m.cfg["speak_own_messages"] = False  # the checkbox in the Voices tab
+    assert m.on_packet(_pkt(text="silent line", flags=P.VFLAG_SELF | P.VFLAG_LANG_PL, distance=0.0)) == "own"
 
 
 def test_duplicates_budget_and_errors(mgr, tmp_path):
@@ -661,6 +668,22 @@ def test_assistant_lines_are_never_spoken_and_her_answers_use_her_voice(mgr):
     assert _wait(lambda: m.stats["spoken"] == 1)
     assert tts.calls == [("voice-iskra", "Mam trzech chętnych, Enter i zapraszam.", "pl")]
     assert not m.say("", "voice-iskra") and not m.say("tekst", "")
+
+
+def test_her_long_answers_are_spoken_to_the_end(tmp_path):
+    from wvt.config import DEFAULTS
+
+    tts = FakeTTS()
+    m = VoiceManager(dict(DEFAULTS["voice"]), tts, VoiceResolver(_store(tmp_path)), FakeMixer(),
+                     TTSNormalizer({"mode": "rules"}), DailyBudget(tmp_path / "usage.json", 5000))
+    m.start()
+    try:
+        plan = ("Najpierw oddaj Beer Basted Boar Ribs u Ragnara, trzydzieści jardów na północny zachód. " * 6).strip()
+        assert len(plan) > 500 and m.say(plan, "voice-iskra", "pl", 1.0, speaker="Iskra")
+        assert _wait(lambda: m.stats["spoken"] == 1)
+        assert tts.calls[0][1] == plan  # all of it - a chat line would be cut at max_chars_per_message (220)
+    finally:
+        m.stop()
 
 
 # --------------------------------------------------------------------------- /say safety valve

@@ -185,7 +185,7 @@ class VoiceManager:
         text = (pkt.text or "").strip()
         if pkt.is_secret or not text:
             return "empty", None
-        if pkt.is_self and (pkt.lang_pl or not self.cfg.get("speak_own_messages", True)):
+        if pkt.is_self and not self.cfg.get("speak_own_messages", True):
             return "own", None
         _, _, norm = split_sender(pkt.sender, "")
         blocked = {unicodedata.normalize("NFKC", b).casefold() for b in self.cfg.get("blocked_players", [])}
@@ -214,7 +214,8 @@ class VoiceManager:
         if not self.budget.allows(min(len(text), int(self.cfg.get("max_chars_per_message", 220)))):
             return "budget", None
         self._recent[key] = now
-        lang = "pl" if (pkt.lang_pl and not pkt.is_self) else "en"
+        # PL mode: your own line too - its Polish original is remembered when you spoke it, so it costs no model call
+        lang = "pl" if pkt.lang_pl else "en"
         return None, VoiceJob(pkt, channel, gain, lang)
 
     def _say_valve(self, speaker: str, distance: Optional[float], now: float) -> Optional[str]:
@@ -305,7 +306,8 @@ class VoiceManager:
         """(text to speak, language code, how it was prepared)."""
         text = job.pkt.text.strip()
         if job.prepared:
-            return (self.normalizer.respell_pl(text) if job.lang == "pl" else text), job.lang, "prepared"
+            own = int(self.cfg.get("assistant_max_chars", 900)) if job.channel == "assistant" else None
+            return (self.normalizer.respell_pl(text, own) if job.lang == "pl" else text), job.lang, "prepared"
         if job.lang == "pl" and self.translator is not None:
             try:
                 res = self.translator.translate(text, "en-pl")
@@ -327,7 +329,10 @@ class VoiceManager:
                 return
             voice_id = assignment.voice_id
         speak, lang_code, prep = self._speech_text(job)
-        limit = int(self.cfg.get("max_chars_per_message", 220))
+        # chat lines are cut to save credits; the assistant's answers are already as long as she means them to be
+        # (up to ~600 characters for a plan) - cutting them at 220 stopped her mid-sentence
+        limit = int(self.cfg.get("assistant_max_chars", 900) if job.channel == "assistant"
+                    else self.cfg.get("max_chars_per_message", 220))
         if len(speak) > limit:
             speak = speak[:limit].rsplit(" ", 1)[0]
         if not speak or not self.budget.allows(len(speak)):
@@ -364,6 +369,8 @@ class VoiceManager:
     # ------------------------------------------------------------------ bookkeeping
     def _skip(self, pkt: protocol.Packet, reason: str) -> None:
         self.stats[f"skipped:{reason}"] += 1
+        if reason not in ("channel", "log-only"):  # why a /say or party line was not read (no text: privacy)
+            log.info("voice: %s line not read (%s)", pkt.chat_kind_name, reason)
         if reason not in ("off", "channel", "duplicate", "log-only"):
             self._record(pkt, f"skipped:{reason}")
 

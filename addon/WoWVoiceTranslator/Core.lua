@@ -19,7 +19,9 @@
 --     leave, ready check - the normal party API, refused politely during combat, boss
 --     fights, M+ and PvP matches (Midnight addon restrictions).
 --     She also gets your quest log (titles, objectives, progress, the game's own map marker
---     of the next objective) and where you stand, so she can say where to go.
+--     of the next objective) and where you stand, so she can say where to go; guild, instance
+--     and public channel chat (Trade, General, LFG - sent last, so they never hold anything up);
+--     your own loot and money, and every wearable item you loot with what you wear in its slot.
 --
 -- What it does NOT do: no protected/secure calls, no chat sending, no automation.
 -- Messages that the game marks as "secret values" (Midnight rules, e.g. during
@@ -29,6 +31,7 @@ local ADDON_NAME, ns = ...
 local P = ns.Protocol
 
 local floor, sqrt = math.floor, math.sqrt
+local strsub, strgsub = string.sub, string.gsub
 local GetTime = GetTime
 local issecretvalue = issecretvalue or function()
 	return false
@@ -49,7 +52,7 @@ local defaults = {
 	voiceSay = false, -- read /say aloud (costs ElevenLabs credits) - off until you switch it on
 	voiceParty = false, -- read /party aloud
 	voiceLang = "en", -- "en": hear the English original (your character repeats your line)
-	--                    "pl": hear others translated to Polish (your own lines stay silent)
+	--                    "pl": hear everybody in Polish - your character repeats your line in Polish
 	panelShown = true,
 	voiceDebug = false,
 	assistant = true, -- pass chat lines and the player's state to the voice assistant (never spoken, free)
@@ -79,6 +82,8 @@ local KIND = {
 	CHAT_MSG_MONSTER_YELL = 21,
 	CHAT_MSG_MONSTER_WHISPER = 22,
 	CHAT_MSG_COMMUNITIES_CHANNEL = 23,
+	CHAT_MSG_LOOT = 24,
+	CHAT_MSG_MONEY = 25,
 }
 
 -- chat events that can be spoken, and which toggle controls them
@@ -99,12 +104,27 @@ local ASSISTANT_EVENTS = {
 	CHAT_MSG_PARTY_LEADER = true,
 	CHAT_MSG_RAID = true,
 	CHAT_MSG_RAID_LEADER = true,
+	CHAT_MSG_RAID_WARNING = true,
+	CHAT_MSG_GUILD = true,
+	CHAT_MSG_OFFICER = true,
+	CHAT_MSG_INSTANCE_CHAT = true,
+	CHAT_MSG_INSTANCE_CHAT_LEADER = true,
+	CHAT_MSG_CHANNEL = true, -- General, Trade, LookingForGroup...: a queue of its own, sent last
+	-- NPC speech: who talks to you and what names fall in the dialogue (the app's names of the moment);
+	-- say and yell go with the public channels (last), a whisper to you with the other lines
+	CHAT_MSG_MONSTER_SAY = true,
+	CHAT_MSG_MONSTER_YELL = true,
+	CHAT_MSG_MONSTER_WHISPER = true,
 }
+local LOW_PRIORITY_EVENTS = { CHAT_MSG_CHANNEL = true, CHAT_MSG_MONSTER_SAY = true, CHAT_MSG_MONSTER_YELL = true }
+-- the player's own loot and money: what you picked up, and whether an item beats your gear
+local LOOT_EVENTS = { CHAT_MSG_LOOT = true, CHAT_MSG_MONEY = true }
 -- anything that changes what the state packet says
 local STATE_EVENTS = {
 	"PLAYER_ENTERING_WORLD", "PLAYER_MONEY", "PLAYER_XP_UPDATE", "PLAYER_LEVEL_UP", "ZONE_CHANGED",
 	"ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED_INDOORS", "BAG_UPDATE_DELAYED", "GROUP_ROSTER_UPDATE",
 	"PARTY_LEADER_CHANGED", "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED", "ADDON_RESTRICTION_STATE_CHANGED",
+	"PLAYER_EQUIPMENT_CHANGED",
 }
 -- quest log changes: scan again (at most every QUEST_SCAN_SECONDS)
 local QUEST_EVENTS = {
@@ -125,6 +145,7 @@ local PLAYER_HEARTBEAT_SECONDS = 60 -- class / race / faction: rarely needed, ch
 local DONE_FIRST_DELAY = 5 -- completed quests: the first list a few seconds after login...
 local DONE_FULL_SECONDS = 300 -- ...then the whole list every 5 minutes (a restarted app catches up)
 local LOOT_RETRIES = 4 -- item data of a roll can arrive a moment after START_LOOT_ROLL
+local CHANNEL_QUEUE_MAX = 10 -- public channels: only the newest lines, and only when nothing else waits
 
 local db = defaults
 
@@ -502,6 +523,7 @@ end
 
 local voiceQueue = {}
 local logQueue = {} -- assistant-only lines: shown when no spoken line is waiting
+local channelQueue = {} -- public channels (Trade, General...): shown when nothing else is waiting
 local voiceShownUntil = 0
 local voiceSeq = 0
 local voiceStats = { sent = 0, dropped = 0, last = nil }
@@ -521,6 +543,9 @@ local function VoiceTick(now)
 	end
 	if not nextBytes and db.assistant and AssistantExtra then
 		nextBytes = AssistantExtra(now)
+	end
+	if not nextBytes then
+		nextBytes = table.remove(channelQueue, 1) -- last: busy city channels must never hold up the rest
 	end
 	if nextBytes then
 		voiceGrid:ShowBytes(nextBytes)
@@ -545,6 +570,13 @@ local function EnqueueLog(bytes)
 		table.remove(logQueue, 1)
 	end
 	logQueue[#logQueue + 1] = bytes
+end
+
+local function EnqueueChannel(bytes)
+	if #channelQueue >= CHANNEL_QUEUE_MAX then
+		table.remove(channelQueue, 1)
+	end
+	channelQueue[#channelQueue + 1] = bytes
 end
 
 local function GuidOf(unit)
@@ -595,15 +627,18 @@ local function DistanceTo(unit, viaNameplate)
 		local dx, dy = px - ux, py - uy
 		return sqrt(dx * dx + dy * dy), P.DIST_EXACT
 	end
-	-- interaction ranges: 3 = duel (~10 yd), 2 = trade (~11 yd), 4 = follow (~28 yd)
-	if IsTrue(SafeCall(CheckInteractDistance, unit, 3)) then
-		return 8, P.DIST_RANGE
-	end
-	if IsTrue(SafeCall(CheckInteractDistance, unit, 2)) then
-		return 11, P.DIST_RANGE
-	end
-	if IsTrue(SafeCall(CheckInteractDistance, unit, 4)) then
-		return 20, P.DIST_RANGE
+	-- interaction ranges: 3 = duel (~7-10 yd), 2 = trade (~8-11 yd), 4 = follow (~28 yd).
+	-- Protected in combat for friendly units since retail 10.2.0: never asked then (distance unknown)
+	if not IsTrue(SafeCall(InCombatLockdown)) then
+		if IsTrue(SafeCall(CheckInteractDistance, unit, 3)) then
+			return 8, P.DIST_RANGE
+		end
+		if IsTrue(SafeCall(CheckInteractDistance, unit, 2)) then
+			return 11, P.DIST_RANGE
+		end
+		if IsTrue(SafeCall(CheckInteractDistance, unit, 4)) then
+			return 20, P.DIST_RANGE
+		end
 	end
 	if viaNameplate then
 		return 35, P.DIST_NAMEPLATE
@@ -620,7 +655,18 @@ local function VoiceChannelEnabled(channel)
 	return false
 end
 
-local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languageID, _, guid)
+-- "2. Trade - City" / "Trade - City" -> "Trade"; a custom channel keeps its own name
+local function ChannelShortName(channelBase, channelName)
+	local name = Plain(channelBase, "string")
+	if not name or name == "" then
+		name = Plain(channelName, "string") or ""
+	end
+	name = strgsub(name, "^%d+%.%s*", "")
+	name = strmatch(name, "^(.-)%s+%-%s+.+$") or name
+	return P.Utf8Truncate(name, P.MAX_RACE_BYTES)
+end
+
+local function OnVoiceChat(event, text, playerName, _, channelName, _, _, _, _, channelBase, languageID, _, guid)
 	local channel = VOICE_EVENTS[event]
 	local speak = channel ~= nil and VoiceChannelEnabled(channel)
 	local forAssistant = db.assistant and ASSISTANT_EVENTS[event]
@@ -639,12 +685,6 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 	local me = GuidOf("player")
 	-- an outgoing whisper names its recipient as the "sender"; it is still your own line
 	local isSelf = (guid ~= nil and guid == me) or event == "CHAT_MSG_WHISPER_INFORM"
-	if speak and isSelf and db.voiceLang == "pl" then
-		speak = false -- Polish mode: you already said it yourself
-		if not forAssistant then
-			return
-		end
-	end
 	if not isSelf then
 		local lid = Plain(languageID, "number")
 		if lid and lid > 0 and C_ChatInfo and C_ChatInfo.CanPlayerSpeakLanguage then
@@ -683,6 +723,9 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 	if db.voiceLang == "pl" then
 		flags = flags + P.VFLAG_LANG_PL
 	end
+	if event == "CHAT_MSG_CHANNEL" then
+		race = ChannelShortName(channelBase, channelName) -- never spoken: the race field names the channel
+	end
 	voiceSeq = (voiceSeq + 1) % 65536
 	local sender = Plain(playerName, "string") or ""
 	local bytes = P.EncodePacket({
@@ -698,7 +741,11 @@ local function OnVoiceChat(event, text, playerName, _, _, _, _, _, _, _, languag
 		text = text,
 	})
 	if not speak then
-		EnqueueLog(bytes)
+		if LOW_PRIORITY_EVENTS[event] then
+			EnqueueChannel(bytes)
+		else
+			EnqueueLog(bytes)
+		end
 		return
 	end
 	EnqueueVoice(bytes)
@@ -1122,6 +1169,20 @@ local function ItemBasics(link)
 	}
 end
 
+-- what the player wears in the slot(s) an item would take
+local function WornFor(equipLoc)
+	local equipped = {}
+	for _, slot in ipairs(P.SLOTS_FOR[equipLoc] or {}) do
+		local worn = Plain(SafeCall(GetInventoryItemLink, "player", slot), "string")
+		if worn then
+			local w = ItemBasics(worn)
+			equipped[#equipped + 1] = { itemLevel = w.itemLevel, subclassID = w.subclassID, name = w.name or "",
+				stats = ItemStats(worn) }
+		end
+	end
+	return equipped
+end
+
 local function BuildLoot(rollID, attempt)
 	local link = Plain(SafeCall(GetLootRollItemLink, rollID), "string")
 	local _, rollName, count, quality, bop, canNeed, canGreed, canDE = SafeCall(GetLootRollItemInfo, rollID)
@@ -1137,15 +1198,7 @@ local function BuildLoot(rollID, attempt)
 	if IsTrue(canNeed) then flags = flags + P.LFLAG_NEED end
 	if IsTrue(canGreed) then flags = flags + P.LFLAG_GREED end
 	if IsTrue(canDE) then flags = flags + P.LFLAG_DE end
-	local equipped = {}
-	for _, slot in ipairs(P.SLOTS_FOR[item.equipLoc] or {}) do
-		local worn = Plain(SafeCall(GetInventoryItemLink, "player", slot), "string")
-		if worn then
-			local w = ItemBasics(worn)
-			equipped[#equipped + 1] = { itemLevel = w.itemLevel, subclassID = w.subclassID, name = w.name or "",
-				stats = ItemStats(worn) }
-		end
-	end
+	local equipped = WornFor(item.equipLoc)
 	lootQueue[#lootQueue + 1] = {
 		type = P.TYPE_LOOT, rollID = rollID, flags = flags,
 		quality = Plain(quality, "number") or item.quality, itemLevel = item.itemLevel, minLevel = item.minLevel,
@@ -1155,8 +1208,214 @@ local function BuildLoot(rollID, attempt)
 	}
 end
 
+-- an item you just looted that you could wear: the app says when it beats your gear
+local function BuildPickup(link, count, attempt)
+	local item = ItemBasics(link)
+	if not item.name then
+		if attempt < LOOT_RETRIES and C_Timer and C_Timer.After then
+			C_Timer.After(0.5, function() BuildPickup(link, count, attempt + 1) end)
+		end
+		return
+	end
+	if not P.EQUIP_LOC_INDEX[item.equipLoc] or item.quality < 1 then
+		return -- nothing to wear, or grey junk
+	end
+	lootQueue[#lootQueue + 1] = {
+		type = P.TYPE_LOOT, rollID = 0, flags = P.LFLAG_PICKED,
+		quality = item.quality, itemLevel = item.itemLevel, minLevel = item.minLevel,
+		classID = item.classID, subclassID = item.subclassID, equipLoc = P.EQUIP_LOC_INDEX[item.equipLoc],
+		count = count or 1, name = item.name, stats = ItemStats(link), equipped = WornFor(item.equipLoc),
+	}
+end
+
+-- "You receive loot: " and friends, taken from the client's own strings (so any language works)
+local SELF_LOOT_KEYS = { "LOOT_ITEM_SELF", "LOOT_ITEM_SELF_MULTIPLE", "LOOT_ITEM_PUSHED_SELF",
+	"LOOT_ITEM_PUSHED_SELF_MULTIPLE", "LOOT_ITEM_CREATED_SELF", "LOOT_ITEM_CREATED_SELF_MULTIPLE" }
+local selfLootPrefixes
+
+local function IsOwnLoot(text, guid)
+	if not selfLootPrefixes then
+		selfLootPrefixes = {}
+		for _, key in ipairs(SELF_LOOT_KEYS) do
+			local fmt = _G[key]
+			local prefix = type(fmt) == "string" and strmatch(fmt, "^([^%%]+)%%") or nil
+			if prefix and #prefix >= 4 then
+				selfLootPrefixes[#selfLootPrefixes + 1] = prefix
+			end
+		end
+	end
+	if #selfLootPrefixes == 0 then
+		return guid ~= nil and guid == GuidOf("player")
+	end
+	for _, prefix in ipairs(selfLootPrefixes) do
+		if strsub(text, 1, #prefix) == prefix then
+			return true
+		end
+	end
+	return false
+end
+
+-- your own loot and money -> the assistant's log; a wearable item also as a TYPE_LOOT "picked up" packet
+local function OnLootChat(event, text, _, _, _, _, _, _, _, _, _, _, guid)
+	local raw = Plain(text, "string")
+	if not raw then
+		return
+	end
+	local plain = P.Trim(P.StripMarkup(raw))
+	if plain == "" then
+		return
+	end
+	if event == "CHAT_MSG_LOOT" then
+		if not IsOwnLoot(plain, Plain(guid, "string")) then
+			return -- somebody else's loot
+		end
+		local link = strmatch(raw, "|c[^|]*|Hitem:.-|h.-|h|r") or strmatch(raw, "|Hitem:.-|h.-|h")
+		if link then
+			BuildPickup(link, tonumber(strmatch(plain, "%]x(%d+)")) or 1, 1)
+		end
+	end
+	voiceSeq = (voiceSeq + 1) % 65536
+	EnqueueLog(P.EncodePacket({
+		type = P.TYPE_CHAT, seq = voiceSeq, flags = P.VFLAG_SELF, kind = KIND[event] or 0, sex = 0,
+		distance = nil, distMethod = P.DIST_NONE, race = "",
+		sender = Plain(SafeCall(UnitName, "player"), "string") or "", text = plain,
+	}))
+end
+
 local function LootBytes()
 	local l = table.remove(lootQueue, 1)
+	if l then
+		lootSeq = (lootSeq + 1) % 65536
+		l.seq = lootSeq
+		return P.EncodePacket(l)
+	end
+	return nil
+end
+
+---------------------------------------------------------------------------- assistant: bags
+
+-- what is in your bags, for questions like "czy ten kij, który znalazłem, jest lepszy?" and "co mam w plecaku?":
+-- TYPE_CHAT lines of kind BAG (race = "sync:part/parts", one item per text line), and every wearable item once
+-- as TYPE_LOOT with LFLAG_BAG (its stats and what you wear in that slot)
+local BAG_MIN_SECONDS = 3 -- a change in the bags is sent at most every 3 s...
+local BAG_FULL_SECONDS = 300 -- ...and everything again every 5 minutes, so a restarted app catches up
+local BAG_TEXT_BYTES = 380 -- one packet carries as many item lines as fit
+local bagQueue, bagLootQueue = {}, {}
+local bagSync, bagDirty, lastBagScan, lastBagFull, bagSig = 0, true, -1000, nil, nil
+local bagWorn = {} -- item ids whose stats were sent (again after 5 minutes or a change of gear)
+local bagStats = { items = 0, sent = 0 }
+
+local function BagItems()
+	local c = C_Container or {}
+	local slotsFn = c.GetContainerNumSlots or GetContainerNumSlots
+	local items, order, missing = {}, {}, false
+	for bag = 0, 4 do
+		local n = Plain(SafeCall(slotsFn, bag), "number") or 0
+		for slot = 1, n do
+			local id, count, link
+			if c.GetContainerItemInfo then
+				local info = SafeCall(c.GetContainerItemInfo, bag, slot)
+				if type(info) == "table" and not issecrettable(info) then
+					id, count = Plain(info.itemID, "number"), Plain(info.stackCount, "number")
+					link = Plain(info.hyperlink, "string")
+				end
+			elseif GetContainerItemInfo then
+				local _, cnt, _, _, _, _, lnk, _, _, iid = SafeCall(GetContainerItemInfo, bag, slot)
+				id, count, link = Plain(iid, "number"), Plain(cnt, "number"), Plain(lnk, "string")
+			end
+			if id and link then
+				local it = items[id]
+				if it then
+					it.count = it.count + (count or 1)
+				else
+					local b = ItemBasics(link)
+					if b.name then
+						items[id] = { id = id, count = count or 1, link = link, basics = b }
+						order[#order + 1] = id
+					else
+						missing = true -- the client has not cached this item yet: look again in a moment
+					end
+				end
+			end
+		end
+	end
+	return items, order, missing
+end
+
+local function QueueBags(full)
+	local items, order, missing = BagItems()
+	if missing then
+		bagDirty = true
+	end
+	table.sort(order)
+	local sig = {}
+	for _, id in ipairs(order) do
+		sig[#sig + 1] = id .. ":" .. items[id].count
+	end
+	sig = table.concat(sig, ",")
+	bagStats.items = #order
+	if full or sig ~= bagSig then
+		bagSig = sig
+		bagSync = (bagSync + 1) % 10000
+		local chunks, cur, size = {}, {}, 0
+		for _, id in ipairs(order) do
+			local it, b = items[id], items[id].basics
+			local line = table.concat({ id, it.count, b.quality, b.classID, b.subclassID,
+				P.EQUIP_LOC_INDEX[b.equipLoc] or 0, P.Utf8Truncate(b.name, P.MAX_LOOT_NAME_BYTES) }, "\t")
+			if size + #line + 1 > BAG_TEXT_BYTES and #cur > 0 then
+				chunks[#chunks + 1] = cur
+				cur, size = {}, 0
+			end
+			cur[#cur + 1] = line
+			size = size + #line + 1
+		end
+		if #cur > 0 or #chunks == 0 then
+			chunks[#chunks + 1] = cur -- an empty bag is one empty part
+		end
+		bagQueue = {}
+		for part, lines in ipairs(chunks) do
+			voiceSeq = (voiceSeq + 1) % 65536
+			bagQueue[#bagQueue + 1] = P.EncodePacket({
+				type = P.TYPE_CHAT, seq = voiceSeq, flags = P.VFLAG_SELF, kind = P.KIND_BAG, sex = 0,
+				distance = nil, distMethod = P.DIST_NONE, race = ("%d:%d/%d"):format(bagSync, part, #chunks),
+				sender = "", text = table.concat(lines, "\n"),
+			})
+		end
+	end
+	for _, id in ipairs(order) do
+		local it = items[id]
+		local b = it.basics
+		if not bagWorn[id] and P.SLOTS_FOR[b.equipLoc] and b.quality >= 1 then
+			bagWorn[id] = true
+			bagLootQueue[#bagLootQueue + 1] = {
+				type = P.TYPE_LOOT, rollID = 0, flags = P.LFLAG_BAG,
+				quality = b.quality, itemLevel = b.itemLevel, minLevel = b.minLevel,
+				classID = b.classID, subclassID = b.subclassID, equipLoc = P.EQUIP_LOC_INDEX[b.equipLoc] or 0,
+				count = it.count, name = b.name, stats = ItemStats(it.link), equipped = WornFor(b.equipLoc),
+			}
+		end
+	end
+end
+
+local function BagBytes(now)
+	if not loginAt or now - loginAt < DONE_FIRST_DELAY then
+		return nil -- right after login item names are not cached yet
+	end
+	local full = not lastBagFull or now - lastBagFull >= BAG_FULL_SECONDS
+	if full or (bagDirty and now - lastBagScan >= BAG_MIN_SECONDS) then
+		lastBagScan, bagDirty = now, false
+		if full then
+			lastBagFull = now
+			bagWorn = {}
+		end
+		QueueBags(full)
+	end
+	local b = table.remove(bagQueue, 1)
+	if b then
+		bagStats.sent = bagStats.sent + 1
+		return b
+	end
+	local l = table.remove(bagLootQueue, 1)
 	if l then
 		lootSeq = (lootSeq + 1) % 65536
 		l.seq = lootSeq
@@ -1181,7 +1440,7 @@ AssistantExtra = function(now)
 		q.seq = questSeq
 		return P.EncodePacket(q)
 	end
-	return PlayerBytes(now) or DoneBytes(now)
+	return PlayerBytes(now) or DoneBytes(now) or BagBytes(now)
 end
 
 ---------------------------------------------------------------------------- assistant: map waypoints
@@ -1533,6 +1792,9 @@ for _, ev in ipairs(QUEST_EVENTS) do
 	pcall(events.RegisterEvent, events, ev)
 end
 pcall(events.RegisterEvent, events, "START_LOOT_ROLL")
+for ev in pairs(LOOT_EVENTS) do
+	pcall(events.RegisterEvent, events, ev)
+end
 events:SetScript("OnEvent", function(_, event, ...)
 	if event == "START_LOOT_ROLL" then
 		if db.assistant then
@@ -1557,6 +1819,21 @@ events:SetScript("OnEvent", function(_, event, ...)
 	end
 	if STATE_EVENT_SET[event] then
 		stateDirty = true
+		if event == "BAG_UPDATE_DELAYED" then
+			bagDirty = true
+		elseif event == "PLAYER_EQUIPMENT_CHANGED" then
+			bagDirty, bagWorn = true, {} -- the comparisons of what you carry changed
+		end
+		return
+	end
+	if LOOT_EVENTS[event] then
+		if db.assistant then
+			local ok, err = pcall(OnLootChat, event, ...)
+			if not ok and not voiceErrorReported then
+				voiceErrorReported = true
+				Print("blad odczytu lupu (zglaszam tylko raz): " .. tostring(err))
+			end
+		end
 		return
 	end
 	if VOICE_EVENTS[event] or ASSISTANT_EVENTS[event] then
@@ -1638,8 +1915,8 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 	elseif cmd == "inv" or cmd == "kick" or cmd == "lead" or cmd == "raid" or cmd == "leave" or cmd == "ready" then
 		GroupCommand(cmd, rest)
 	elseif cmd == "questy" or cmd == "quests" then
-		Print(("dziennik dla asystentki: %d questow, %d ze znacznikiem na mapie, ukonczonych %d (wysylane: %s)"):format(
-			questStats.quests, questStats.withMarker, doneStats.count, OnOff(db.assistant)))
+		Print(("dziennik dla asystentki: %d questow, %d ze znacznikiem na mapie, ukonczonych %d, w torbach %d rzeczy (wysylane: %s)"):format(
+			questStats.quests, questStats.withMarker, doneStats.count, bagStats.items, OnOff(db.assistant)))
 	elseif cmd == "way" then
 		if strlower(rest or "") == "clear" then
 			ClearWaypoint()
@@ -1651,7 +1928,7 @@ SlashCmdList["WOWVOICETRANSLATOR"] = function(msg)
 	elseif cmd == "asystent" or cmd == "assistant" then
 		db.assistant = ParseOnOff(rest, db.assistant)
 		if not db.assistant then
-			logQueue = {}
+			logQueue, bagQueue, bagLootQueue = {}, {}, {}
 		end
 		Print("asystentka (czat i stan dla aplikacji): " .. OnOff(db.assistant))
 	elseif cmd == "voicedebug" then

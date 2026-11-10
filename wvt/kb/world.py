@@ -400,6 +400,9 @@ class World:
         self._quest_names: dict[str, list[int]] = defaultdict(list)
         for qid, q in self.quests.items():
             self._quest_names[fold(q["n"])].append(qid)
+        self._item_names: dict[str, list[int]] = defaultdict(list)
+        for iid, it in self.items.items():
+            self._item_names[fold(it["n"])].append(iid)
 
     @classmethod
     def load(cls, path: Path) -> "World":
@@ -544,6 +547,28 @@ class World:
             friendly = [n for n in hits if faction in self.npcs[n].get("f", faction)]
             hits = friendly or hits
         return hits
+
+    def find_item_in(self, text: str) -> list[int]:
+        """Ids of the item named somewhere in ``text`` ("gdzie kupię Rhapsody Malt?"): the longest exact
+        name first, then a close match of 2-4 words (speech recognition spells English names its own way)."""
+        import difflib
+
+        words = re.findall(r"[a-z0-9']+", fold(text))
+        for n in range(min(6, len(words)), 0, -1):
+            hits = [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
+            hits = [g for g in hits if g in self._item_names and (n > 1 or len(g) >= 5)]
+            if hits:
+                return list(self._item_names[max(hits, key=len)])
+        names = list(self._item_names)
+        for n in (4, 3, 2):
+            for i in range(len(words) - n + 1):
+                gram = " ".join(words[i:i + n])
+                if len(gram) < 8:
+                    continue
+                close = difflib.get_close_matches(gram, names, n=1, cutoff=0.84)
+                if close:
+                    return list(self._item_names[close[0]])
+        return []
 
     def find_quests(self, query: str) -> list[int]:
         key = fold(query).strip(" ?!.")

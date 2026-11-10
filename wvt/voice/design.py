@@ -104,8 +104,12 @@ def load_stt(cfg: Config):
     try:
         from ..stt import SpeechToText
 
-        stt = SpeechToText(cfg["stt"]["model_dir"], cfg["stt"].get("model_name", "nemo-parakeet-tdt-0.6b-v3"),
-                           device="cpu")
+        # the judge was tuned on Parakeet's WER: keep using it, on the CPU (the fallback model of the app)
+        s = cfg["stt"]
+        fb = s.get("cpu_fallback") or {}
+        model_dir = fb.get("model_dir") or s["model_dir"]
+        model_name = fb.get("model_name") or s.get("model_name", "nemo-parakeet-tdt-0.6b-v3")
+        stt = SpeechToText(model_dir, model_name, device="cpu")
         stt.load()
         return stt
     except Exception as exc:

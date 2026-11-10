@@ -51,6 +51,22 @@ DEFAULTS: dict[str, Any] = {
         "zone_tips": True,  # a word about a zone when you enter it
         "level_tips": True,  # level up: new abilities at the trainer
         "bag_tips": True,  # bags full
+        "loot_tips": True,  # an item you loot is better than what you wear: say so
+        # "co teraz robić?": how much Gemini thinks about the computed route (low / medium / high); measured: low
+        # 4.4 s, medium 12.3 s for equally good plans (the route, chains and what to let go are computed already)
+        "plan_thinking": "low",
+        "max_knowledge_chars": 480,  # answers from the guides and the quest base may be longer than small talk
+        "log_file": "logs/assistant.jsonl",  # what you asked and what she answered (privacy.log_assistant)
+        # "gemini": she talks through Google Gemini (key in .env, section "gemini"); translations stay local and
+        # the local model answers whenever Gemini fails
+        "llm": "local",
+    },
+    "gemini": {
+        "model": "gemini-3.8-flash",
+        "thinking_level": "low",  # 3.8 Flash: low | medium | high (thinking cannot be switched off)
+        "timeout_s": 15,
+        "max_output_tokens": 4096,  # includes thinking tokens; the answer length comes from the prompt
+        "api_key_env": "GOOGLE_AI_API_KEY",  # read from the git-ignored .env
     },
     "channels": {
         "say": "/s",
@@ -73,13 +89,45 @@ DEFAULTS: dict[str, Any] = {
         "auto_gain": True,  # lift a quiet recording (up to +30 dB) without lifting the noise above the threshold
     },
     "stt": {
-        "model_dir": "models/parakeet-tdt-0.6b-v3-onnx",
-        "model_name": "nemo-parakeet-tdt-0.6b-v3",
-        # auto: GPU if (after the LLM is loaded) it leaves vram_reserve_mb free for the game,
-        # otherwise CPU int8 (measured: 160 ms vs 80 ms per utterance, same WER on clean speech)
-        "device": "auto",  # auto | cuda | cpu
-        "cpu_quantization": "int8",  # used only when running on CPU
+        # Whisper large-v3-turbo, fp16 on CUDA, Polish forced: 10.4 % wrong words on the user's recordings against
+        # Parakeet's 12.0 %, and 2.5 GB of VRAM instead of 3.7 (wvt/stt.py); Parakeet takes over when it cannot run
+        "model_dir": "models/whisper-large-v3-turbo-onnx",
+        "model_name": "whisper",
+        "language": "pl",  # Whisper: set on every call, otherwise it guesses the language of each utterance
+        # auto: GPU if (after the LLM is loaded) it leaves vram_reserve_mb free for the game, otherwise the fallback
+        "device": "auto",  # auto | cuda | cpu (cpu = the fallback model)
+        "gpu_quantization": "fp16",
+        "gpu_need_mb": 2600,  # measured +2488 MB on RTX 5080
+        "cpu_quantization": "int8",
         "vram_reserve_mb": 2500,
+        "cpu_fallback": {"model_dir": "models/parakeet-tdt-0.6b-v3-onnx", "model_name": "nemo-parakeet-tdt-0.6b-v3",
+                         "cpu_quantization": "int8", "gpu_need_mb": 3800},
+        "drop_phrases": None,  # null = wvt.stt.DEFAULT_DROP_PHRASES (Whisper's typical hallucinations)
+        # local speech-to-text service for other apps on this PC (127.0.0.1 only): one Whisper in VRAM; 0 = off
+        "server_port": 39283,
+        # Whisper's prompt (the names of the moment, wvt/lexicon.py) is cut to this many tokens, its start first
+        "prompt_max_tokens": 200,
+    },
+    # the names of the moment (wvt/lexicon.py): your quests, people and places around you, your loot and bags -
+    # Whisper's prompt, a sound-alike correction of misheard names, a small vector index, the LLMs' context
+    "lexicon": {
+        "enabled": True,
+        "whisper_prompt": True,  # give Whisper the names (52 -> 62 of 82 names right in the bench)
+        "prompt_terms": 60,
+        "prompt_lead": "Rozmowa w World of Warcraft.",
+        "prompt_words": "",  # fixed words added at the end of Whisper's prompt
+        "correct": True,  # "Targasa" -> "Thargas", "gnome Regan" -> "Gnomeregan" before Iskra and the translator
+        "vector": True,  # "ten kij, który znalazłem", "quest z trollami": search the entries by meaning
+        # whose vectors: "auto" = Google's while Iskra talks through Gemini (same key), else the local e5;
+        # "google" / "local" to choose.  Measured: Google 11/12 items and 10/10 quests first, e5-small 8/12 and 5/10
+        "embedder": "auto",
+        "embedder_model": "gemini-embedding-2",
+        "item_min": 0.65,  # Google's score from which an item / a quest description counts as found
+        "quest_min": 0.69,
+        "translate_names": 20,  # names given to the translator's prompt (0 = none)
+        "nearby_yards": 300,
+        "nearby_max": 30,
+        "user_file": "data/slownik.txt",  # your own words, one per line ("Name = what it is"); data/ is not in git
     },
     "llm": {
         "server_exe": "runtime/llama.cpp/llama-server.exe",
@@ -127,6 +175,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "privacy": {
         "log_texts": False,  # transcripts/translations are not written to logs by default
+        "log_assistant": False,  # true: questions to the assistant and her answers go to assistant.log_file
         "keep_history": True,  # last 10 PTT translations kept in memory (never on disk)
     },
     "logging": {"level": "INFO", "dir": "logs"},
@@ -149,6 +198,7 @@ DEFAULTS: dict[str, Any] = {
         "unknown_distance": "play_quiet",  # play_normal | play_quiet | mute
         "quiet_gain": 0.35,
         "max_chars_per_message": 220,
+        "assistant_max_chars": 900,  # Iskra's answers (a plan is up to ~600 characters): never cut mid-sentence
         "daily_char_budget": 30000,  # characters sent to ElevenLabs per day (~0.5 credit each on v4 Turbo)
         "max_queue": 6,
         "max_concurrent": 3,  # characters speaking at the same time (people often write at once)

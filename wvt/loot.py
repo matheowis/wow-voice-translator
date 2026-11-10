@@ -226,3 +226,67 @@ def advise(it: LootItem, class_id: int, level: int) -> LootAdvice:
     downs = [d for d in deltas if d[1] < 0]
     what = _stat_phrase(downs)
     return LootAdvice("greed", f"{head} Słabsze od twojego" + (f" ({what})" if what else "") + ". Daj greed.", name, gain)
+
+
+def pickup_tip(it: LootItem, class_id: int, level: int) -> Optional[str]:
+    """A spoken tip when an item you just looted beats what you wear; None when there is nothing to say
+    (most loot is not an upgrade, and she should not comment on every grey sword)."""
+    if not class_id or it.class_id not in (WEAPON_CLASS, ARMOR_CLASS) or it.equip_loc in NOT_GEAR:
+        return None
+    ok, _ = usable(it, class_id, level)
+    if not ok:
+        return None
+    ranged = it.equip_loc in RANGED_LOCS
+    new = score(it.stats, class_id, ranged)
+    if it.class_id == ARMOR_CLASS and it.subclass_id in (CLOTH, LEATHER, MAIL) and \
+            it.subclass_id < best_armor(class_id, level) and it.equip_loc != "INVTYPE_CLOAK":
+        new *= 0.8  # lighter armour than the class can wear
+    if new <= 0.5:
+        return None
+    name = it.name or "ten przedmiot"
+    wear = f" Założysz od {it.min_level} poziomu." if it.min_level > level else " Załóż."
+    base, worn = _compare_base(it, class_id, ranged)
+    if base is None:
+        return f"Nowy łup: {name}. Na tym miejscu nic nie nosisz, więc to czysty zysk.{wear}"
+    if new - base < max(1.0, 0.05 * abs(base)):
+        return None
+    ups = [d for d in _deltas(it.stats, worn.stats if worn else {}, class_id, ranged) if d[1] > 0]
+    what = _stat_phrase(ups)
+    than = f"niż {worn.name}" if worn and worn.name else "niż to, co nosisz"
+    return f"Nowy łup: {name}. Lepsze {than}" + (f": {what}." if what else ".") + wear
+
+
+def item_verdict(it: LootItem, class_id: int, level: int) -> str:
+    """The answer to "czy ten kij jest lepszy?" for any item you carry: better, about the same or worse than
+    what you wear (with the stats that differ most), or why you cannot use it."""
+    name = it.name or "ten przedmiot"
+    kind = kind_text(it)
+    head = f"{name}, {kind}." if kind else f"{name}."
+    if it.class_id not in (WEAPON_CLASS, ARMOR_CLASS) or it.equip_loc in NOT_GEAR:
+        return f"{head} Tego się nie zakłada."
+    if not class_id:
+        return f"{head} Nie wiem jeszcze, jaką masz klasę, więc nie porównam. Po /reload już będę wiedziała."
+    ok, why = usable(it, class_id, level)
+    if not ok:
+        return f"{head} Nie dla ciebie: {why}. Sprzedaj albo oddaj komuś."
+    ranged = it.equip_loc in RANGED_LOCS
+    new = score(it.stats, class_id, ranged)
+    if it.class_id == ARMOR_CLASS and it.subclass_id in (CLOTH, LEATHER, MAIL) and \
+            it.subclass_id < best_armor(class_id, level) and it.equip_loc != "INVTYPE_CLOAK":
+        new *= 0.8
+    later = f" Założysz od {it.min_level} poziomu." if it.min_level > level else ""
+    if new <= 0.5:
+        return f"{head} Nie ma statystyk, które przydają się {CLASS_DAT.get(class_id, 'tobie')}. Raczej do sprzedania."
+    base, worn = _compare_base(it, class_id, ranged)
+    if base is None:
+        return f"{head} Na tym miejscu nic nie nosisz, więc to czysty zysk." + (later or " Załóż.")
+    gain = new - base
+    deltas = _deltas(it.stats, worn.stats if worn else {}, class_id, ranged)
+    mine = worn.name if worn and worn.name else "to, co nosisz"
+    if gain >= max(1.0, 0.05 * abs(base)):
+        what = _stat_phrase([d for d in deltas if d[1] > 0])
+        return f"{head} Lepsze niż {mine}" + (f": {what}." if what else ".") + (later or " Załóż.")
+    if gain > -max(1.0, 0.05 * abs(base)):
+        return f"{head} Prawie to samo, co {mine}. Możesz zostać przy swoim."
+    what = _stat_phrase([d for d in deltas if d[1] < 0])
+    return f"{head} Słabsze niż {mine}" + (f": {what}." if what else ".") + " Zostań przy swoim, a to sprzedaj."

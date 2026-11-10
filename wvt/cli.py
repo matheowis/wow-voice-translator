@@ -105,9 +105,7 @@ def make_llm(cfg: Config, model: str | None = None):
 def make_stt(cfg: Config):
     from .stt import SpeechToText
 
-    s = cfg["stt"]
-    return SpeechToText(s["model_dir"], s["model_name"], s.get("device", "auto"), s.get("cpu_quantization"),
-                        int(s.get("vram_reserve_mb", 2500)))
+    return SpeechToText.from_config(cfg["stt"])
 
 
 # --------------------------------------------------------------------------- commands
@@ -124,8 +122,10 @@ def cmd_check(cfg: Config, _args) -> int:
         print("onnxruntime:", ort.__version__, ort.get_available_providers())
     except Exception as exc:
         print("onnxruntime: BŁĄD", exc)
-    for label, p in (("Parakeet", cfg.get("stt.model_dir")), ("llama-server", cfg.get("llm.server_exe")),
-                     ("Model LLM", cfg.get("llm.model_path"))):
+    for label, p in (("STT", cfg.get("stt.model_dir")), ("STT zapas", cfg.get("stt.cpu_fallback.model_dir")),
+                     ("llama-server", cfg.get("llm.server_exe")), ("Model LLM", cfg.get("llm.model_path"))):
+        if not p:
+            continue
         path = resolve_path(p)
         print(f"{label}: {'OK' if path.exists() else 'BRAK'} – {path}")
     try:
@@ -145,7 +145,7 @@ def cmd_check(cfg: Config, _args) -> int:
 def cmd_stt(cfg: Config, args) -> int:
     stt = make_stt(cfg)
     stt.load()
-    print(f"STT na {stt.device}, ładowanie {stt.load_seconds:.1f}s")
+    print(f"STT: {stt.describe()}, ładowanie {stt.load_seconds:.1f}s")
     for f in args.files:
         x = load_wav(f)
         t0 = time.perf_counter()
@@ -210,7 +210,7 @@ def cmd_bench(cfg: Config, args) -> int:
         stt.load()
         stt.warmup()
         report["stt"] = {"device": stt.device, "load_s": round(stt.load_seconds, 2), "vram_after_load": _vram()}
-        print(f"== STT Parakeet TDT 0.6B v3 na {stt.device} (ładowanie {stt.load_seconds:.1f}s)")
+        print(f"== STT {stt.describe()} (ładowanie {stt.load_seconds:.1f}s)")
         rows = []
         for noisy in (False, True):
             lat, wers = [], []

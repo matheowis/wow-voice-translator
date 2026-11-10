@@ -30,6 +30,14 @@ LLMS = {
     "nemotron-nano-4b": ("nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf"),
     "gemma4-e4b": ("google/gemma-4-E4B-it-qat-q4_0-gguf", "gemma-4-E4B_q4_0-it.gguf"),
 }
+# speech recognition (MIT): Whisper large-v3-turbo, fp16 for CUDA; Parakeet above is the CPU fallback
+WHISPER_REPO = "onnx-community/whisper-large-v3-turbo"
+WHISPER_REVISION = "360ebcde2559d60bb474678be3c1de9ef347d01a"  # the files measured on 2026-11-09
+WHISPER_FILES = [
+    "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_merged_fp16.onnx", "added_tokens.json", "config.json",
+    "generation_config.json", "merges.txt", "normalizer.json", "preprocessor_config.json", "special_tokens_map.json",
+    "tokenizer.json", "tokenizer_config.json", "vocab.json",
+]
 EMBED_REPO = "Xenova/multilingual-e5-small"  # MIT; ONNX int8 export of intfloat/multilingual-e5-small
 EMBED_FILES = ["onnx/model_quantized.onnx", "tokenizer.json", "config.json"]
 LLAMA_CPP_TAG = "b12177"
@@ -44,8 +52,9 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def hf_meta(repo: str) -> dict[str, dict]:
-    r = httpx.get(f"https://huggingface.co/api/models/{repo}?blobs=true", timeout=30, follow_redirects=True)
+def hf_meta(repo: str, revision: str = "") -> dict[str, dict]:
+    rev = f"/revision/{revision}" if revision else ""
+    r = httpx.get(f"https://huggingface.co/api/models/{repo}{rev}?blobs=true", timeout=30, follow_redirects=True)
     r.raise_for_status()
     out = {}
     for s in r.json().get("siblings", []):
@@ -110,6 +119,8 @@ def main() -> int:
                     help="WeSpeaker ResNet34 (26 MB) - only needed to design voices (python -m wvt.voice.design)")
     ap.add_argument("--embed-model", action="store_true",
                     help="only multilingual-e5-small (ONNX int8, ~120 MB) for the assistant's knowledge base, then stop")
+    ap.add_argument("--skip-whisper", action="store_true",
+                    help="no Whisper large-v3-turbo (1.6 GB); speech recognition then uses Parakeet")
     args = ap.parse_args()
     ok = True
 
@@ -132,7 +143,17 @@ def main() -> int:
             download(f"https://huggingface.co/{repo}/resolve/main/{fname}", dest, meta[fname]["size"])
         ok &= check(dest, meta[fname])
 
-    print("Parakeet TDT 0.6B v3 (ONNX):")
+    if not args.skip_whisper:
+        print("Whisper large-v3-turbo (ONNX fp16, rozpoznawanie mowy):")
+        meta = hf_meta(WHISPER_REPO, WHISPER_REVISION)
+        for f in WHISPER_FILES:
+            dest = ROOT / "models" / "whisper-large-v3-turbo-onnx" / f
+            if not args.verify:
+                download(f"https://huggingface.co/{WHISPER_REPO}/resolve/{WHISPER_REVISION}/{f}", dest,
+                         meta[f]["size"])
+            ok &= check(dest, meta[f])
+
+    print("Parakeet TDT 0.6B v3 (ONNX, zapas na CPU):")
     meta = hf_meta(PARAKEET_REPO)
     for f in PARAKEET_FILES:
         dest = ROOT / "models" / "parakeet-tdt-0.6b-v3-onnx" / f

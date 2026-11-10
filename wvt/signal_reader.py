@@ -7,6 +7,7 @@ foreground window. No process memory is touched.
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import logging
 import threading
@@ -21,6 +22,9 @@ from .wow_window import WowWindow, WowWindowTracker
 log = logging.getLogger(__name__)
 
 SEARCH = 3  # pixels of tolerance for the grid origin
+TYPE_NAMES = {protocol.TYPE_VOICE: "voice", protocol.TYPE_STATE: "state", protocol.TYPE_CHAT: "chat",
+              protocol.TYPE_QUEST: "quest", protocol.TYPE_POS: "pos", protocol.TYPE_PLAYER: "player",
+              protocol.TYPE_DONE: "done", protocol.TYPE_LOOT: "loot"}
 
 
 # everything the second (voice) grid carries
@@ -136,6 +140,11 @@ class SignalReader:
         self.last_voice_at = 0.0
         self.voice_packets = 0
         self.capture_errors = 0
+        # once a minute in the log: what was read, how long WoW was in front (no texts - privacy)
+        self.counts: collections.Counter = collections.Counter()
+        self._beat_at = time.monotonic()
+        self._front_s = 0.0
+        self._frames = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -155,40 +164,66 @@ class SignalReader:
         try:
             while not self._stop.is_set():
                 t0 = time.perf_counter()
-                pkt = None
-                voice = None
-                if self.enabled:
-                    win = self.tracker.find(max_age=2.0)
-                    if win is not None and (not self.require_foreground or self.tracker.foreground_is_wow()):
-                        self._window = win
-                        x, y, w, h = win.client
-                        width = (protocol.CAPTURE_W if self.on_voice else protocol.REGION_W) + SEARCH + 1
-                        try:
-                            img = cap.grab(x, y, min(w, width), min(h, protocol.REGION_H + SEARCH + 1))
-                            pkt = protocol.try_decode(img, search=SEARCH)
-                            if self.on_voice and img.shape[1] >= protocol.CAPTURE_W:
-                                voice = protocol.try_decode_at(img, protocol.VOICE_ORIGIN_X, search=SEARCH)
-                        except (OSError, protocol.DecodeError) as exc:
-                            self.capture_errors += 1
-                            log.debug("capture/decode failed: %s", exc)
-                if (voice is not None and voice.type in ASSISTANT_GRID_TYPES
-                        and self.voice_dedup.is_new(voice)):
-                    self.last_voice_at = time.time()
-                    self.voice_packets += 1
-                    try:
-                        self.on_voice(voice)
-                    except Exception:
-                        log.exception("voice handler failed")
-                if pkt is not None and pkt.type == protocol.TYPE_VOICE:
-                    pkt = None  # never treat a voice packet as a hover
-                if pkt is not None:
-                    self.last_packet_at = time.time()
-                    self.last_packet = pkt
-                try:
-                    self.machine.feed(pkt)
+                try:  # nothing may end this thread: hover, voices and Iskra's game data all come through it
+                    self._step(cap)
                 except Exception:
-                    log.exception("hover handler failed")
+                    self.counts["errors"] += 1
+                    log.exception("signal reader step failed")
+                self._heartbeat()
                 dt = time.perf_counter() - t0
                 self._stop.wait(max(0.0, self.interval - dt))
         finally:
             cap.close()
+
+    def _step(self, cap: "ScreenCapture") -> None:
+        pkt = None
+        voice = None
+        if self.enabled:
+            win = self.tracker.find(max_age=2.0)
+            if win is not None and (not self.require_foreground or self.tracker.foreground_is_wow()):
+                self._window = win
+                self._frames += 1
+                self._front_s += self.interval
+                x, y, w, h = win.client
+                width = (protocol.CAPTURE_W if self.on_voice else protocol.REGION_W) + SEARCH + 1
+                try:
+                    img = cap.grab(x, y, min(w, width), min(h, protocol.REGION_H + SEARCH + 1))
+                    pkt = protocol.try_decode(img, search=SEARCH)
+                    if self.on_voice and img.shape[1] >= protocol.CAPTURE_W:
+                        voice = protocol.try_decode_at(img, protocol.VOICE_ORIGIN_X, search=SEARCH)
+                except (OSError, protocol.DecodeError) as exc:
+                    self.capture_errors += 1
+                    log.debug("capture/decode failed: %s", exc)
+        if (voice is not None and voice.type in ASSISTANT_GRID_TYPES
+                and self.voice_dedup.is_new(voice)):
+            self.last_voice_at = time.time()
+            self.voice_packets += 1
+            kind = voice.chat_kind_name if voice.type in (protocol.TYPE_CHAT, protocol.TYPE_VOICE) else ""
+            self.counts[TYPE_NAMES.get(voice.type, str(voice.type)) + (f":{kind}" if kind else "")] += 1
+            try:
+                self.on_voice(voice)
+            except Exception:
+                log.exception("voice handler failed")
+        if pkt is not None and pkt.type == protocol.TYPE_VOICE:
+            pkt = None  # never treat a voice packet as a hover
+        if pkt is not None:
+            if self.last_packet is None or pkt.seq != self.last_packet.seq:
+                self.counts["hover"] += 1
+            self.last_packet_at = time.time()
+            self.last_packet = pkt
+        try:
+            self.machine.feed(pkt)
+        except Exception:
+            log.exception("hover handler failed")
+
+    def _heartbeat(self, every: float = 60.0) -> None:
+        now = time.monotonic()
+        if now - self._beat_at < every:
+            return
+        span = now - self._beat_at
+        if self._frames or self.counts:
+            parts = ", ".join(f"{k} {n}" for k, n in sorted(self.counts.items())) or "nothing"
+            log.info("signal: WoW in front %.0f%% of %.0f s, %d frames, read: %s, capture errors %d",
+                     min(100.0, 100.0 * self._front_s / span), span, self._frames, parts, self.capture_errors)
+        self.counts.clear()
+        self._beat_at, self._front_s, self._frames = now, 0.0, 0

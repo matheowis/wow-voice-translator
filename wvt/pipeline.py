@@ -1,7 +1,11 @@
-"""Push-to-talk pipeline: record -> Parakeet (PL) -> LLM (EN) -> WoW chat input.
+"""Push-to-talk pipeline: record -> speech recognition (Whisper, PL) -> LLM (EN) -> WoW chat input.
 
 UI-agnostic: progress is reported through the ``ui`` callbacks object, which the Qt
 app implements with thread-safe signals.  One job at a time (spec: single-task queue).
+
+With the names of the moment (``lexicon``, wvt/lexicon.py) Whisper gets them as its prompt, misheard names
+are put right before the line is translated ("Targasa" -> "Thargas"), and the translator is told how the
+game spells them; the overlay shows what was heard when a name was changed.
 """
 
 from __future__ import annotations
@@ -55,6 +59,31 @@ class PushToTalkPipeline:
         self.last_timings: dict = {}
         self.assistant = None  # wvt.assistant.Assistant: the "assistant" push-to-talk channel goes to her
         self.chat_log = None  # wvt.assistant.ChatLog: recent chat, the context of what you say next
+        self.lexicon = None  # wvt.lexicon.Lexicon: the names of the moment (Whisper's prompt, name fixes)
+
+    def _prompt(self) -> str:
+        if self.lexicon is None or not getattr(self.stt, "prompt_ok", False):
+            return ""
+        try:
+            return self.lexicon.whisper_prompt()
+        except Exception:
+            log.exception("lexicon prompt failed")
+            return ""
+
+    def _correct(self, polish: str):
+        if self.lexicon is None:
+            return None
+        try:
+            return self.lexicon.correct(polish, strict=True)  # the line goes out: only close matches
+        except Exception:
+            log.exception("lexicon correction failed")
+            return None
+
+    @staticmethod
+    def _heard(corr) -> list[str]:
+        if corr is None or not corr.fixes:
+            return []
+        return ["usłyszane: " + ", ".join(f"{f.heard} → {f.name}" for f in corr.fixes)]
 
     # ------------------------------------------------------------------ hotkey events
     @property
@@ -146,7 +175,8 @@ class PushToTalkPipeline:
 
             self.ui.status("busy", "Rozpoznawanie mowy…")
             t0 = time.perf_counter()
-            polish = self.stt.transcribe(clip)
+            prompt = self._prompt()
+            polish = self.stt.transcribe(clip, prompt=prompt) if prompt else self.stt.transcribe(clip)
             timings["stt_ms"] = round((time.perf_counter() - t0) * 1000)
             if not polish:
                 self.ui.status("info", "Nic nie rozpoznano", timeout=3)
@@ -161,16 +191,24 @@ class PushToTalkPipeline:
                 reply, line = self.assistant.handle(polish)
                 timings["assistant_ms"] = round((time.perf_counter() - t1) * 1000)
                 self.last_timings = timings
-                item = HistoryItem(channel, polish, reply, line, timings, "assistant")
+                corr = getattr(self.assistant, "last_correction", None)
+                shown = corr.text if corr is not None and corr.fixes else polish
+                item = HistoryItem(channel, shown, reply, line, timings, "assistant")
                 if self.cfg.get("privacy.keep_history", True):
                     self.history.appendleft(item)
                 self.ui.result(item)
                 return item
 
-            self.ui.status("busy", "Tłumaczenie…", [f"PL: {polish}"])
+            corr = self._correct(polish)
+            if corr is not None and corr.fixes:
+                timings["names_fixed"] = len(corr.fixes)
+                polish = corr.text
+            self.ui.status("busy", "Tłumaczenie…", [f"PL: {polish}"] + self._heard(corr))
             t1 = time.perf_counter()
             context = self.conversation(channel)
-            res = self.translator.translate(polish, "pl-en", context=context)
+            names = self.lexicon.translation_names(corr) if self.lexicon is not None else []
+            res = self.translator.translate(polish, "pl-en", context=context, names=names) if names else \
+                self.translator.translate(polish, "pl-en", context=context)
             timings["context_lines"] = len(context)
             timings["translate_ms"] = round((time.perf_counter() - t1) * 1000)
             english = res.text
@@ -201,9 +239,10 @@ class PushToTalkPipeline:
                 "copied": "Skopiowano do schowka (WoW nie był aktywny) – wklej Ctrl+V",
                 "preview": "Podgląd",
             }.get(status, status)
-            self.ui.status("ok", footer, [f"PL: {polish}", f"EN: {chat_line}",
-                                          f"⏱ STT {timings.get('stt_ms', 0)} ms · tłumaczenie {timings.get('translate_ms', 0)} ms"],
-                           timeout=float(self.cfg.get("hud.show_seconds", 6)))
+            self.ui.status("ok", footer, [f"PL: {polish}"] + self._heard(corr) + [
+                f"EN: {chat_line}",
+                f"⏱ STT {timings.get('stt_ms', 0)} ms · tłumaczenie {timings.get('translate_ms', 0)} ms"],
+                timeout=float(self.cfg.get("hud.show_seconds", 6)))
             self.ui.result(item)
             return item
         except Exception as exc:

@@ -1,157 +1,264 @@
 # WoW Voice Translator
 
-Głosowy tłumacz czatu do **World of Warcraft Forever**: mówisz po polsku, w czacie pojawia się tekst po angielsku.
+A voice chat translator for **World of Warcraft Forever**, made for Polish players: you speak Polish, and English text appears in the chat box.
 
-- Przytrzymujesz klawisz i mówisz po polsku → w polu czatu WoW pojawia się tekst po angielsku. Wysyłasz go sam Enterem.
-- Najeżdżasz myszą na angielską wiadomość w czacie → widzisz ją po polsku.
-- Rozumie slang z czatu WoW (mb, wc, ty, LFM, WTS…).
-- Rozpoznawanie mowy i tłumaczenie działają na Twoim komputerze: bez internetu, kont i opłat.
-- Opcjonalnie: **głosy postaci**. Wiadomości z `/say` i `/party` czytane głosem pasującym do rasy i płci postaci (ElevenLabs, płatne). Dźwięk z `/say` jest cichszy, im dalej stoi postać.
-- **Asystentka głosowa**: na osobnym klawiszu mówisz do niej po polsku („zaproś tych, co piszą inv”, „gdzie mam się teraz udać?”, „gdzie jest trener magów?”, „przypomnij mi za 10 minut…”), a ona odpowiada głosem, stawia znaczniki na mapie i przygotowuje komendy w czacie. Przy losowaniu łupu sama mówi, czy brać need, czy greed. Na pytania o grę odpowiada z lokalnej bazy wiedzy (Warcraft Wiki i baza questów WoW Forever).
+- **Push-to-talk translation.** Hold a key and speak Polish. The English translation is pasted into the WoW chat box, and you send it yourself with Enter.
+- **Hover translation.** Hover the mouse over an English chat line to see it in Polish.
+- **WoW chat slang.** It understands slang such as mb, wc, ty, LFM and WTS.
+- **Local and offline.** Speech recognition and translation run on your own PC and GPU, with no internet, account or fees.
+- **Character voices (optional).** `/say` and `/party` lines are read aloud with a voice that fits each character's race and sex (ElevenLabs, paid). `/say` gets quieter the farther away the speaker stands.
+- **Voice assistant "Iskra" (optional).** On a separate key you talk to her in Polish:
+  - She invites the players who asked for an invite and summarises chat and whispers.
+  - She knows your quest log, plans what to do next and sets map waypoints.
+  - She compares loot with what you wear and answers game questions from a local knowledge base.
 
-## Czego potrzebujesz
+> The app's window, its on-screen messages and the assistant are in Polish. The chat you send is always English.
 
-- Windows 10 lub 11.
-- Karta graficzna NVIDIA RTX z aktualnym sterownikiem (testowane na RTX 5080 16 GB).
-- [Python 3.12](https://www.python.org/downloads/) – w instalatorze zostaw zaznaczone *py launcher*.
-- Ok. 12 GB wolnego miejsca na dysku.
-- Mikrofon.
+## Requirements
 
-## Instalacja (raz)
+- Windows 10 or 11, 64-bit.
+- **An NVIDIA GPU** (RTX series) with a current driver. It was tested on an RTX 5080 with 16 GB.
+  - Speech recognition and translation run on the GPU next to the game.
+  - When there isn't enough free VRAM, speech recognition falls back to the CPU.
+- **[Python 3.12](https://www.python.org/downloads/).** Keep *py launcher* ticked in the installer. You don't need the CUDA toolkit, because the Python packages bring the CUDA libraries.
+- About **12 GB** of free disk space. Setup downloads about 8 GB.
+- A microphone.
+- WoW Forever, installed with Battle.net.
 
-1. Pobierz projekt: zielony przycisk **Code → Download ZIP** i rozpakuj go, np. do `C:\WoWVoiceTranslator`.
-2. Otwórz rozpakowany folder, kliknij w pasek adresu Eksploratora, wpisz `powershell` i naciśnij Enter.
-3. W oknie, które się otworzy, wklej i zatwierdź Enterem:
+Optional:
+- an [ElevenLabs](https://elevenlabs.io) account for character voices and the assistant's voice;
+- a [Google AI Studio](https://aistudio.google.com) key for a smarter assistant;
+- MongoDB for voice assignments. Without it they are kept in local files.
+
+## Installation (once)
+
+1. **Get the code.** Either clone it:
+
+   ```
+   git clone https://github.com/matheowis/wow-voice-translator.git
+   ```
+
+   or use **Code → Download ZIP** on GitHub and unzip it, for example to `C:\WoWVoiceTranslator`. Avoid folders that need admin rights, such as `Program Files`.
+
+2. **Open PowerShell in that folder.** In File Explorer, click the address bar, type `powershell` and press Enter.
+
+3. **Run the setup script:**
 
    ```
    powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
    ```
 
-   Skrypt sam zainstaluje biblioteki, pobierze modele (ok. 8 GB, to chwilę potrwa) i doda addon do WoW.
+   The script:
+   - creates a virtual environment `.venv` with Python 3.12 (`py -3.12`) and installs `requirements.txt`;
+   - downloads the models into `models\` and llama.cpp into `runtime\` (about 8 GB, resumable, every file SHA-256 verified):
+     - Whisper large-v3-turbo (ONNX), for speech recognition;
+     - Parakeet TDT 0.6B v3 (ONNX), the fallback recognizer;
+     - NVIDIA Nemotron 3.5 Bolt E4B (GGUF), the translator;
+     - llama.cpp b12177 for CUDA, which runs the translator;
+   - installs the addon into `<WoW folder>\_forever_\Interface\AddOns\WoWVoiceTranslator`. It finds the game through the Battle.net registry entry;
+   - creates `.env` from `.env.example`. That is where optional keys go.
 
-## Uruchamianie
+   If a download fails, run the script again; it continues where it stopped. Options:
 
-1. Kliknij dwa razy `scripts\run.bat`. Przy zegarku pojawi się ikona aplikacji. Modele ładują się 1–2 minuty.
-2. Włącz WoW i w **Options → Graphics** ustaw **Display Mode: Windowed (Fullscreen)**.
-3. Na ekranie wyboru postaci kliknij **AddOns** i zaznacz **WoW Voice Translator**.
-4. W grze wpisz `/wvt test`. Na środku ekranu powinien pojawić się napis „✓ połączenie z addonem działa”.
+   | Option | Meaning |
+   |---|---|
+   | `-Wow "D:\Games\World of Warcraft"` | the WoW folder (the one that contains `_forever_`), when it isn't found automatically |
+   | `-SkipAddon` | don't install the addon |
+   | `-Python "py -3.12"` | how to start Python 3.12 |
 
-## Jak używać
+4. **Check the installation** (optional). This prints what is installed and what is missing:
 
-| Klawisz | Co robi |
+   ```
+   .venv\Scripts\python -m wvt.cli check
+   ```
+
+## Starting
+
+1. **Start the app.** Double-click **`scripts\run.bat`**. An icon appears in the system tray next to the clock.
+   - Loading the models takes 1–2 minutes, or several minutes from a slow (USB) drive.
+   - Double-click the icon to open the window. `scripts\run.bat --show` opens it right away.
+   - The first start creates `config.json` with all settings.
+2. **Set the display mode.** Start WoW Forever and, in **Options → Graphics**, set **Display Mode: Windowed (Fullscreen)**.
+   - The addon talks to the app through a small grid of coloured squares in the top-left corner of the game.
+   - The app reads that grid with an ordinary screen capture, and only while WoW is the active window.
+   - In plain *Windowed* mode the grid can come out scaled, and exclusive *Fullscreen* can hide it from screen capture. *Windowed (Fullscreen)* works.
+3. **Enable the addon.** At the character selection screen, click **AddOns** and make sure **WoW Voice Translator** is enabled.
+4. **Test the connection.** In the game, type `/wvt test`. The app shows **„✓ połączenie z addonem działa”** ("the connection to the addon works") in the middle of the screen.
+
+## Using it
+
+| Key | What it does |
 |---|---|
-| przytrzymaj **`** (tylda, pod Esc) | mówisz → tekst po angielsku na **/say** |
-| przytrzymaj **Caps Lock** | mówisz → tekst po angielsku na **/party** |
-| przytrzymaj **boczny przycisk myszy 5** | rozmowa z asystentką (niżej) |
-| **Esc** w trakcie mówienia | anuluje |
-| **Enter** | wysyła tekst (aplikacja nigdy nie wysyła sama) |
+| hold **`** (backtick, under Esc) | speak Polish → English text for **/say** |
+| hold **Caps Lock** | speak Polish → English text for **/party** |
+| hold **mouse button 5** (side button) | talk to the assistant |
+| **Esc** while speaking | cancel |
+| **Enter** | send the text. The app never sends anything by itself: it only pastes into the chat box. |
 
-Najedź myszą na wiadomość w czacie i potrzymaj chwilę – nad nią pojawi się tłumaczenie na polski.
+- **Hover translations.** Hover the mouse over a chat line for a moment and the Polish translation appears above it.
+- **Settings.** Keys, microphone and other settings are in the app window. The keys react only while WoW is the active window.
 
-Klawisze, mikrofon i inne ustawienia zmienisz w oknie aplikacji (dwuklik ikony przy zegarku).
+Addon commands in the game:
 
-## Głosy postaci (opcjonalne, ElevenLabs)
+| Command | What it does |
+|---|---|
+| `/wvt test` | test the connection to the app |
+| `/wvt on`, `/wvt off` | hover translations on/off |
+| `/wvt say on/off`, `/wvt party on/off` | read /say or /party aloud (character voices, off by default) |
+| `/wvt lang en`, `/wvt lang pl` | hear other players in English, or translated to Polish |
+| `/wvt panel` | show/hide the voice panel above the chat (Shift-drag moves it) |
+| `/wvt voice` | voice status: what is on, how many lines were sent or skipped |
+| `/wvt voicedebug on` | print the race, sex and measured distance for every line that is read |
+| `/wvt asystent off` | stop sending chat and game state to the assistant |
 
-1. Skopiuj plik `.env.example` jako `.env` i wpisz w nim swój klucz: `ELEVENLABS_API_KEY=...`. Plik `.env` nigdy nie trafia do repozytorium.
-2. Raz utwórz głosy (90 głosów w Twoim koncie ElevenLabs: 9 ras WoW Forever, w tym Skyborne z jedną pulą na obie odmiany, po 5 na każdą płeć):
+## Character voices (optional, ElevenLabs)
+
+1. Put your key in `.env`: `ELEVENLABS_API_KEY=...`. The `.env` file is git-ignored; never commit it.
+2. Create the voices once, in your own ElevenLabs account. The default is 90 voices: 9 races × 2 sexes × 5 voices each.
 
    ```
    .venv\Scripts\python -m wvt.voice.design
    ```
 
-3. W grze nad czatem jest panel **WVT: Say | Party | Glos**:
-   - **Say / Party** włączają czytanie danego kanału. Domyślnie są wyłączone, więc nic nie kosztują.
-   - **Glos EN**: słyszysz oryginał po angielsku, a Twoja postać powtarza Twoją wiadomość swoim głosem.
-   - **Glos PL**: słyszysz innych po polsku (tłumaczenie lokalne). Czat zostaje po angielsku.
+   With a smaller plan, use `--slots 1` or `--slots 2`.
+3. Restart the app. In the game, switch on **Say** and/or **Party** on the panel above the chat. They are off by default, so nothing is spent until you do.
 
-   To samo robią komendy: `/wvt say`, `/wvt party`, `/wvt lang pl`. Panel przesuniesz, przeciągając go z wciśniętym Shift.
+The full guide is in **[docs/VOICES.md](docs/VOICES.md)**: permissions for the key, credits, re-rolling voices you don't like, rating voices, the assistant's voice and how `/say` volume follows distance.
 
-Postać, której rasy gra nie poda, mówi głosem człowieka swojej płci, a gdy rasa się wyjaśni, raz przechodzi na głos swojej rasy.
+### Who speaks and writes in which language
 
-Przypisania głosów do postaci zapisują się w lokalnym MongoDB, jeśli jest zainstalowane, a jeśli nie, w folderze `data`. Dzienny limit znaków i głośność ustawisz w zakładce **Głosy** w oknie aplikacji.
-
-## Języki – kto mówi i pisze w jakim języku
-
-| Co | Język | Jak zmienić |
+| What | Language | How to change |
 |---|---|---|
-| To, co wysyłasz na czat (` i Caps Lock) | zawsze **angielski** – mówisz po polsku, aplikacja tłumaczy | – |
-| Tłumaczenie po najechaniu myszą na czat | **polski** | `/wvt on` / `/wvt off` |
-| Głosy innych graczy (/say, /party) | **EN** – oryginał po angielsku albo **PL** – tłumaczenie na polski | przycisk **Glos EN/PL** na panelu nad czatem, `/wvt lang pl` / `/wvt lang en` albo powiedz asystentce „przełącz na polski” |
-| Twoja postać (Twoje wiadomości) | w trybie EN powtarza Twoją wiadomość po angielsku swoim głosem, w trybie PL milczy | jak wyżej |
-| Asystentka | zawsze **polski** | – |
+| What you send to chat (` and Caps Lock) | always **English**: you speak Polish, the app translates | – |
+| Hover translation | **Polish** | `/wvt on` / `/wvt off` |
+| Other players' voices (/say, /party) | **EN**: the English original, or **PL**: translated to Polish | **Glos EN/PL** button on the panel, `/wvt lang pl` / `/wvt lang en` |
+| Your own character | repeats your line in its voice: in English in EN mode, in your own Polish words in PL mode | as above; turn it off in the app's **Voices** tab |
+| The assistant | always **Polish** | – |
 
-Czytanie /say i /party włączasz osobno (**Say** / **Party** na panelu, `/wvt say on`, `/wvt party on`); wyłączone kanały nic nie kosztują.
+## The assistant (Iskra, Polish only)
 
-**Bezpiecznik /say** (np. w mieście): zawsze najpierw czytana jest osoba najbliżej Ciebie. Gdy w ciągu 15 s pisze na /say 4 lub więcej osób (albo przychodzi 6 linii), czytani są tylko gracze w promieniu 10 jardów, najwyżej 6 linii na minutę. Gracz, który wysyła więcej niż 3 linie w 20 s, jest na 30 s wyciszany. Pominięte linie nic nie kosztują. Zakładka **Głosy** pokazuje je z powodem („tłok”, „zalew”), a progi zmienisz w `config.json` (`voice.say_valve`).
+Hold **mouse button 5** and say what you want in Polish.
+- She answers aloud with an ElevenLabs voice (`assistant.voice_id`). Without a voice she answers in text on screen.
+- When something has to happen in the game, she types a ready command into the chat box, for example `/wvt inv Ann Bob`. **It runs only when you press Enter**; Esc cancels.
 
-## Asystentka (Iskra)
-
-Przytrzymaj **boczny przycisk myszy 5** i powiedz po polsku, czego chcesz. Odpowie Ci głosem (ElevenLabs), a jeśli trzeba coś zrobić w grze, wpisze gotową komendę do czatu, np. `/wvt inv Ann Bob Cid`. **Wykonuje się dopiero po Twoim Enterze** (Esc anuluje).
-
-| Powiedz na przykład | Co się stanie |
+| Say, for example | What happens |
 |---|---|
-| „zaproś ich”, „wyzapraszaj tych, co piszą inv” | zaprasza wszystkich, którzy w ostatnich 5 minutach pisali „inv me / inv pls” na say/yell albo w szepcie, ile zmieści się w party |
-| „zaproś Artasa”, „wyrzuć Bolka”, „daj lidera Jainie” | dobiera imię z czatu i grupy (rozumie odmianę: Artasa → Arthas) |
-| „zrób raid”, „opuść grupę”, „ready check” | komendy grupy (w walce i podczas bossa gra ich nie pozwala – powie Ci to) |
-| „kto chce inv?”, „co mi napisał?”, „co oni piszą?” | czyta po polsku szepty i streszcza czat |
-| „odpisz mu, że zaraz będę”, „napisz na party, że idę po wodę” | tłumaczy na angielski i wpisuje do czatu (`/w`, `/p`, `/s`…) |
-| „ile mam złota?”, „ile do levelu?”, „gdzie jestem?”, „ile miejsca w torbach?”, „kto jest w party?” | odpowiada z danych gry |
-| „co mam do zrobienia?”, „ile mi zostało świec?”, „gdzie mam iść?”, „co mogę oddać?”, „który quest najbliżej?”, „o co chodzi w tym queście?” | odpowiada z Twojego dziennika zadań; kierunek i odległość liczy do znacznika celu, który gra pokazuje na mapie |
-| „wycisz głosy”, „przełącz na polski”, „wyłącz głosy na say”, „cicho” | steruje głosami postaci |
-| „gdzie mam się teraz udać?”, „co teraz robić?”, „gdzie expić na moim poziomie?” | najpierw questy do oddania, potem najbliższy quest z dziennika, potem nowe questy w pobliżu (pasujące do Twojego poziomu, klasy, frakcji i ukończonych questów), a gdy nic nie ma obok – strefa na Twój poziom i jej główny questodawca. Enter stawia znacznik na mapie |
-| „gdzie jest trener magów / karczmarz / mistrz lotów / bank?”, „gdzie jest Hogger?”, „gdzie jest wejście do Deadmines?” | najbliższy na Twojej mapie (kierunek i odległość), a gdy go tu nie ma – w stolicy Twojej frakcji. Enter stawia znacznik |
-| „zaprowadź mnie do…”, „zaznacz to na mapie”, „usuń znacznik” | znacznik na mapie (`/wvt way`) albo strzałka gry do questa z dziennika (`/wvt track`); „to” = ostatnie miejsce, o którym mówiła |
-| „jaki dungeon na mój poziom?” | dungeony pasujące do poziomu (poziomy z Warcraft Wiki, także nowe z WoW Forever) i znacznik przy wejściu do pierwszego |
-| „przypomnij mi za 10 minut / o 21:30 / na 20 poziomie, że…”, „jakie mam przypomnienia?”, „usuń przypomnienia” | przypomina głosem we właściwej chwili; przypomnienia przetrwają restart aplikacji |
-| „przypomnij mi w Ironforge / jak będę w Orgrimmarze / w mieście / przy aukcji, żeby…” | przypomina, gdy wejdziesz w to miejsce („przy aukcji” = każde miasto z domem aukcyjnym) |
-| „zanotuj, że chcę wystawić miecz na AH”, „jakie mam notatki?”, „usuń notatkę o mieczu”, „zrobione” | notatki zostają, aż je odhaczysz; notatka o AH, sprzedaży albo konkretnym mieście przypomina się, gdy tam wejdziesz (najwyżej co pół godziny) |
-| *(sama, gdy weźmiesz questa)*, „czy warto robić ten quest?”, „co dalej w tym łańcuchu?” | mówi, czy warto: ile daje expa (część poziomu), który to quest w łańcuchu, ile expa do końca łańcucha, nagroda na końcu (czy możesz ją założyć), dungeon po drodze, elity – albo szczerze, że szkoda czasu |
-| *(sama, przy zdarzeniach)* | wejście do nowej strefy (poziomy questów, czy pasuje, kto daje najwięcej questów, dungeon w strefie, krótko z wiki), nowy poziom (nowe umiejętności u trenera), pełne torby |
-| „ile expa robię na godzinę?”, „kiedy wbiję poziom?”, „zresetuj statystyki” | tempo tej sesji: doświadczenie i złoto na godzinę, czas do następnego poziomu (przerwy nie liczą się do czasu) |
-| *(samo, gdy w grupie zaczyna się losowanie łupu)*, „brać need czy greed?” | porównuje przedmiot z tym, co nosisz, dla Twojej klasy i poziomu: ulepszenie – need, przedmiot nie dla Ciebie albo słabszy – greed |
-| pytania o grę: „jak pokonać VanCleefa?”, „co to są Skyborne?”, „czego uczy trener maga na 20 poziomie?” | odpowiedź z lokalnej bazy wiedzy (niżej), dwa zdania |
-| „co umiesz?” albo cokolwiek innego | krótka rozmowa (lokalny model – w faktach o grze może się mylić) |
+| „zaproś ich”, „weź go doproś do party”, „zaproś Artasa” | invites everyone who wrote "inv me" lately, the last player who asked or spoke, or a named player (Polish declensions are understood) |
+| „wyrzuć Bolka”, „daj lidera Jainie”, „zrób raid”, „ready check” | group commands; the game blocks some of them in combat |
+| „co mi napisał?”, „co piszą na trade?”, „kto szuka grupy?” | reads whispers and summarises chat channels in Polish |
+| „odpisz mu, że zaraz będę” | translates your reply to English and types it into the chat box |
+| „co teraz robić?”, „a potem?” | a plan for now: the shortest route through your quests, what matters most, what to skip |
+| „czy warto robić ten quest?”, „gdzie go oddać?” | quest advice: XP, chain, reward; she remembers what you are talking about for 15 minutes |
+| „gdzie jest trener magów?”, „zaprowadź mnie tam” | nearest NPC or place, plus a map waypoint |
+| „czy ten kij, który znalazłem, jest lepszy?”, „co mogę sprzedać?” | compares loot with what you wear; lists what is in your bags |
+| „przypomnij mi za 10 minut…”, „zanotuj, że…” | reminders by time, level or place, and notes |
+| „ile expa na godzinę?”, „brać need czy greed?” | session stats; loot roll advice |
+| game questions („jak pokonać VanCleefa?”) | answers from the local knowledge base |
 
-**Charakter.** Iskra to bystra, zadziorna kumpela od grania: ma własne zdanie, droczy się, mówi wprost, kiedy coś jest stratą czasu, i używa gamingowego slangu. Swoje komentarze (quest, strefa, poziom) układa sama z faktów: lokalny model dostaje tylko fakty z bazy, a jeśli doda liczbę spoza faktów, zamiast jego wersji pada zwykła, sprawdzona odpowiedź. Każdy rodzaj komentarzy wyłączysz w `config.json`: `assistant.quest_tips`, `zone_tips`, `level_tips`, `bag_tips`. `assistant.flavor: false` daje stałe, rzeczowe odpowiedzi bez jej komentarzy.
+**A smarter assistant with Gemini (optional).**
+- Put `GOOGLE_AI_API_KEY=...` (from Google AI Studio) in `.env` and set `"assistant": {"llm": "gemini"}` in `config.json`. Only the assistant uses Gemini; chat translation stays local.
+- Her answers take 2–3 seconds instead of under a second, but they are much better in Polish.
+- If Gemini fails, the local model answers.
+- **Privacy:** the assistant's questions, facts from your game and names from your game (quests, items, people in chat) are then sent to Google. A free key also has a small daily limit. `"lexicon": {"embedder": "local"}` keeps the name vectors on your PC.
 
-Jej głos wybierasz na stronie ocen głosów (sekcja *Asystentka*, daj 5 temu, który chcesz). Imię, klawisz i charakter zmienisz w `config.json` (sekcja `assistant`, np. `"persona_extra": "mów do mnie Mati"`) i w oknie aplikacji (*Ustawienia → Push-to-talk*, kanał `assistant`). W grze `/wvt asystent off` przestaje przekazywać jej czat i stan postaci.
-
-### Baza wiedzy asystentki (jednorazowo, ok. 20 minut)
-
-Żeby Iskra znała WoW Forever (questy, NPC, dungeony, klasy, nowe strefy), zbuduj lokalną bazę wiedzy:
+**Game knowledge (once).** The knowledge base lets her know WoW Forever: quests, NPCs, dungeons, classes and zones.
 
 ```
 .venv\Scripts\python scripts\download.py --embed-model
 .venv\Scripts\python -m wvt.kb.build
 ```
 
-- Pierwsze budowanie pobiera ok. 600 stron z Warcraft Wiki (jedna strona na sekundę, ok. 12 minut) i dane questów WoW Forever z QuestieDB (13 MB), a potem liczy wektory na procesorze (ok. 4 minut). Wszystko trafia do `data/kb` i działa bez internetu.
-- Questy są w bazie po angielsku i po polsku. Opisy questów przetłumaczył raz lokalny model, a tytuły dostały polskie objaśnienie, np. „Bounty on Murlocs (po polsku: Nagroda za murloków)”. Nazwy z gry, czyli NPC, przedmioty, miejsca i tytuły questów, zostają po angielsku. Dlatego „gdzie zebrać świece koboldów” trafia w „Kobold Candles”. Pierwsze tłumaczenie trwa ok. 40 minut, potem budowanie tłumaczy już tylko nowe questy (`--no-translate` pomija ten krok).
-- **Swoje poradniki** wrzuć jako pliki `.md` albo `.txt` do `data/kb/guides` i przebuduj bez pobierania: `.venv\Scripts\python -m wvt.kb.build --offline`. Twoje notatki mają pierwszeństwo przed wiki.
-- Sprawdzenie bez gry: `.venv\Scripts\python -m wvt.kb.build --search "jak pokonać VanCleefa"`.
-- Bez bazy asystentka działa jak dotąd, tylko nie zna faktów o grze i nie doradza, dokąd iść.
+- **What the first build does:**
+  - It downloads about 600 Warcraft Wiki pages, at one page per second (about 12 minutes).
+  - It downloads the WoW Forever quest data from QuestieDB.
+  - It computes vectors on the CPU (about 4 minutes).
+  - It translates quest texts to Polish with the local model. That takes about 40 minutes the first time; later builds translate only new quests, and `--no-translate` skips this step.
+- Everything is stored in `data\kb` and works offline.
+- **Your own guides:** put `.md` or `.txt` files in `data\kb\guides` and rebuild with `--offline`.
 
-## Coś nie działa?
+**Names from your game.** The app keeps a list of the names that matter right now: your quests, nearby NPCs, people in chat, your loot and bags.
+- Speech recognition gets them as a hint.
+- Misheard names are corrected by sound before translation ("Targasa" → Thargas).
+- Add your own words (friends, guild, nicknames) to `data\slownik.txt`, one per line.
 
-- **Nie widać tłumaczeń w grze** – ustaw w WoW *Windowed (Fullscreen)* zamiast *Fullscreen*.
-- **Instalator nie znalazł WoW** – podaj folder gry (ten, w którym jest `_forever_`):
+**Her log.** With `"privacy": {"log_assistant": true}` in `config.json`, every question, how she understood it and her answer go to `logs\assistant.jsonl`. This is off by default.
 
-  ```
-  powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Wow "D:\Gry\World of Warcraft"
-  ```
+## Configuration
 
-- **Nie rozpoznaje mowy** – w oknie aplikacji: *Ustawienia → Mikrofon*, wybierz właściwy i zrób test.
-- **Cichy mikrofon** – aplikacja sama wzmacnia cichą mowę (do +30 dB) przed rozpoznawaniem; szum nie jest przy tym wzmacniany ponad próg ciszy. Możesz dodać stałe wzmocnienie: *Ustawienia → Mikrofon → Wzmocnienie mikrofonu*. Test mikrofonu pokazuje poziom mowy w dBFS: dobrze, gdy jest między −30 a −15. Najlepiej podnieść poziom u źródła: w ustawieniach dźwięku Windows (*Nagrywanie → Poziomy*) albo w aplikacji producenta (np. RØDE Central).
-- **Długo się ładuje** – modele są duże, a z wolnego dysku (np. na USB 2.0) start trwa kilka minut. Zostaw aplikację włączoną w tle.
-- **Głosy milczą** – sprawdź zakładkę *Głosy* (klucz, liczba głosów, limit dzienny) i czy w grze włączony jest Say/Party. Po aktualizacji addonu wpisz w grze `/reload`.
-- **Diagnostyka**: `.venv\Scripts\python -m wvt.cli check`; logi są w folderze `logs`.
+`config.json` is created on the first start. Most settings are also in the app window.
+- `push_to_talk`: keys and channels.
+- `audio`: microphone and auto gain.
+- `voice`: volumes, distance curve, daily character budget, `/say` safety valve.
+- `assistant`: name, voice, LLM, which comments she makes.
+- `lexicon`: names from your game.
+- `privacy`: what is logged.
 
-## Bezpieczeństwo
+Every key is described (in Polish) in [docs/SZCZEGOLY.md](docs/SZCZEGOLY.md).
 
-Aplikacja nie czyta pamięci gry, niczego do niej nie wstrzykuje i nigdy nie wysyła wiadomości za Ciebie – tylko wkleja tekst do pola czatu. Nagrania nie są zapisywane. Głosy postaci wysyłają do ElevenLabs tylko tekst wiadomości z włączonych kanałów. Treść rozmów nie jest zapisywana; w bazie są tylko przypisania „postać → głos”. Mimo to używasz aplikacji na własną odpowiedzialność: sprawdź zasady Blizzarda dotyczące programów zewnętrznych.
+## Updating
 
-## Więcej
+```
+git pull
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+```
 
-Jak to działa, pomiary, wybór modeli i konfiguracja: [docs/SZCZEGOLY.md](docs/SZCZEGOLY.md).
+The setup script only installs what is new and copies the current addon into the game. Then restart the app and type `/reload` in the game.
 
-Licencja kodu: MIT (plik [LICENSE](LICENSE)). Modele pobiera instalator (nie ma ich w repozytorium) i mają własne licencje: NVIDIA Parakeet TDT 0.6B v3 (CC‑BY‑4.0), NVIDIA Nemotron 3.5 Bolt E4B (OpenMDW‑1.1), multilingual-e5-small (MIT), llama.cpp (MIT). Głosy ElevenLabs podlegają warunkom Twojego planu ElevenLabs. Baza wiedzy powstaje na Twoim komputerze i nie trafia do repozytorium: teksty z Warcraft Wiki są na licencji CC BY-SA 4.0, a dane QuestieDB nie mają jednej jasnej licencji, więc służą tylko do Twojego prywatnego użytku.
+## Troubleshooting
+
+- **No hover translations, and `/wvt test` shows nothing.**
+  - Use *Windowed (Fullscreen)*, and keep WoW the active window.
+  - Make sure the app has finished loading: `logs\wvt.log` says when the models are ready.
+  - Keep the top-left corner of the game free of overlays: FPS counters, Discord or Steam overlays.
+- **Setup didn't find WoW.** Run it with `-Wow "D:\Games\World of Warcraft"`, the folder that contains `_forever_`.
+- **Speech isn't recognised.** In the app window, go to *Settings → Microphone*, pick the right microphone and run the test.
+- **The microphone is quiet.**
+  - The app boosts quiet speech by up to +30 dB before recognition. The microphone test shows the speech level; −30 to −15 dBFS is good.
+  - It is better to raise the level at the source: Windows sound settings, *Recording → Levels*.
+- **Voices are silent.**
+  - Check the app's **Voices** tab: the key, the number of voices and the daily limit.
+  - Check that **Say** or **Party** is on in the game (`/wvt voice`).
+  - After an addon update, type `/reload`.
+- **Starting is slow.** The models are large. From a slow or USB 2.0 drive, starting takes a few minutes. Leave the app running in the background.
+- **Diagnostics.** Run `.venv\Scripts\python -m wvt.cli check`. Logs are in the `logs` folder.
+
+## Safety and privacy
+
+- **Nothing touches the game.** The app doesn't read game memory, injects nothing into the game and never sends chat messages for you. It only pastes text into the chat box, and you press Enter.
+- **The addon** uses only the official addon API. It draws the signal grid in the corner of the screen.
+- **Recordings and chat.** Recordings are not saved. Chat content is not saved, unless you turn on the assistant's log.
+- **Your keys** live only in `.env`, which is git-ignored.
+- **ElevenLabs** receives only the text of the lines from channels you switched on.
+- **Google** receives data only when you choose Gemini for the assistant (see above).
+- **Your responsibility.** Use the app at your own risk, and check Blizzard's rules on third-party software.
+
+## Tests
+
+```
+.venv\Scripts\python -m pytest
+```
+
+The addon's Lua code is tested with `lupa` (Lua 5.1, like WoW). `tests\test_capture_integration.py` draws on the screen, so it fails while the app's overlay is running.
+
+## More
+
+- [docs/VOICES.md](docs/VOICES.md): creating the character voices (ElevenLabs).
+- [docs/SZCZEGOLY.md](docs/SZCZEGOLY.md): how it works, measurements, model choice and all settings (in Polish).
+
+## License
+
+The code is MIT; see [LICENSE](LICENSE).
+
+The models are downloaded by the setup script. They are not part of this repository and have their own licenses:
+- OpenAI Whisper large-v3-turbo: MIT;
+- NVIDIA Parakeet TDT 0.6B v3: CC-BY-4.0;
+- NVIDIA Nemotron 3.5 Bolt E4B: OpenMDW-1.1;
+- multilingual-e5-small: MIT;
+- WeSpeaker ResNet34: Apache-2.0;
+- llama.cpp: MIT.
+
+ElevenLabs voices are covered by the terms of your ElevenLabs plan.
+
+The knowledge base is built on your PC and is not part of the repository:
+- Warcraft Wiki texts are CC BY-SA 4.0.
+- QuestieDB data has no single clear license, so use it only privately.

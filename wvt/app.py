@@ -459,7 +459,7 @@ class MainWindow(QWidget):
         sig = a.reader.last_packet_at if a.reader else 0
         lines = [
             f"Modele:      {a.model_state}",
-            f"STT:         Parakeet TDT 0.6B v3 na {a.stt.device if a.stt else '-'}  (ładowanie {a.stt.load_seconds if a.stt else 0:.1f}s)",
+            f"STT:         {a.stt.describe() if a.stt else '-'}  (ładowanie {a.stt.load_seconds if a.stt else 0:.1f}s)",
             f"LLM:         {a.llm.model_name if a.llm else '-'}  (start {a.llm.load_seconds if a.llm else 0:.1f}s)",
             f"VRAM:        {v['used']:.0f} / {v['total']:.0f} MB ({v['name']})" if v else "VRAM:        brak danych NVML",
             f"WoW:         {'aktywny' if a.tracker.foreground_is_wow() else 'nieaktywny / nie znaleziono'}",
@@ -485,6 +485,7 @@ class TranslatorApp:
 
         self.tracker = WowWindowTracker(cfg.get("wow.process_names", []), [SIM_TITLE] if "--sim" in sys.argv else [])
         self.stt = None
+        self.stt_server = None  # local speech-to-text service for other apps (wvt/stt_server.py)
         self.llm = None
         self.translator = None
         self.pipeline: Optional[PushToTalkPipeline] = None
@@ -546,6 +547,12 @@ class TranslatorApp:
         self.reader.enabled = bool(self.cfg.get("hover.enabled", True))
         self.reader.require_foreground = "--sim" not in sys.argv
         self.reader.start()
+        port = int(self.cfg.get("stt.server_port", 0) or 0)
+        if port:  # answers "not ready" until the model is loaded, so other apps can wait for it
+            from .stt_server import SttServer
+
+            self.stt_server = SttServer(lambda: self.stt, port)
+            self.stt_server.start()
         threading.Thread(target=self._init_voice, name="wvt-voice-init", daemon=True).start()
         threading.Thread(target=self._load_models, name="wvt-load", daemon=True).start()
         if self.cfg.get("audio.mic_always_open", True):
@@ -570,7 +577,7 @@ class TranslatorApp:
             if self.voice is not None:  # PL voice mode and the LLM step of the normalizer
                 self.voice.translator = translator
                 self.voice.normalizer.llm = self.llm
-            self.bridge.models.emit("ładowanie Parakeet (STT)…", False)
+            self.bridge.models.emit("ładowanie rozpoznawania mowy (STT)…", False)
             self.stt = make_stt(self.cfg)
             self.stt.load()
             self.stt.warmup()
@@ -580,18 +587,42 @@ class TranslatorApp:
                 from .assistant import Assistant
 
                 reminders = str(self.cfg.get("assistant.reminders_file", "data/reminders.json") or "")
-                self.assistant = Assistant(self.cfg, self.translator, self.llm, self.inserter, QtPipelineUI(self.bridge),
+                from .gemini import assistant_llm
+
+                journal = str(self.cfg.get("assistant.log_file", "logs/assistant.jsonl") or "") \
+                    if self.cfg.get("privacy.log_assistant", False) else ""
+                self.assistant_llm = assistant_llm(self.cfg, self.llm)  # Gemini only for her; translations stay local
+                log.info("assistant LLM: %s", self.assistant_llm.model_name)
+                from .gemini import lexicon_embedder
+
+                remote_vectors = lexicon_embedder(self.cfg)  # Google's vectors for the names of the moment
+                log.info("names of the moment: vectors %s", f"{remote_vectors.model_name} (zapas: e5)"
+                         if remote_vectors is not None else "e5 (lokalnie)")
+                self.assistant = Assistant(self.cfg, self.translator, self.assistant_llm, self.inserter,
+                                           QtPipelineUI(self.bridge),
                                            self.tracker.foreground_is_wow, voice_getter=lambda: self.voice,
                                            set_voices_enabled=self.bridge.voices_enabled.emit, chat_log=self.chat_log,
                                            world_getter=lambda: self.world, kb_getter=lambda: self.kb,
                                            instances_getter=lambda: self.instances,
-                                           reminders_path=(ROOT / reminders) if reminders else None)
+                                           reminders_path=(ROOT / reminders) if reminders else None,
+                                           journal_path=(ROOT / journal) if journal else None,
+                                           remote_embedder=remote_vectors)
                 self.assistant.start()
                 self.pipeline.assistant = self.assistant
+                self.pipeline.lexicon = self.assistant.lexicon  # names of the moment: Whisper, fixes, translator
                 threading.Thread(target=self._load_knowledge, name="wvt-kb", daemon=True).start()
+            else:
+                from .config import resolve_path
+                from .lexicon import Lexicon
+
+                user_file = str(self.cfg.get("lexicon.user_file", "data/slownik.txt") or "")
+                self.pipeline.lexicon = Lexicon(self.cfg, chat_log=self.chat_log, world_getter=lambda: self.world,
+                                                user_file=resolve_path(user_file) if user_file else None)
             self.pipeline.chat_log = self.chat_log
             self.pipeline.models_ready.set()
-            self.bridge.models.emit(f"gotowe (STT: {self.stt.device}, LLM: {self.llm.model_name})", True)
+            iskra = getattr(self, "assistant_llm", None)
+            extra = f", Iskra: {iskra.model_name}" if iskra is not None and iskra is not self.llm else ""
+            self.bridge.models.emit(f"gotowe (STT: {self.stt.describe()}, LLM: {self.llm.model_name}{extra})", True)
         except Exception as exc:
             log.exception("model loading failed")
             self.bridge.models.emit(f"BŁĄD: {exc}", False)
@@ -796,6 +827,8 @@ class TranslatorApp:
                 self.hotkeys.stop()
             if self.reader:
                 self.reader.stop()
+            if self.stt_server is not None:
+                self.stt_server.stop()
             if self.voice is not None:
                 self.voice.stop()
                 self.voice.mixer.close()

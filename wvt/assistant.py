@@ -9,9 +9,16 @@ pipeline and:
   These become ONE line in the chat box ("/wvt inv Ann Bob") that runs only when you press Enter -
   nothing is ever sent by itself.  Kick, lead, raid and ready check are refused by the game during
   combat, boss fights, M+ and PvP matches (Midnight addon restrictions) - she says so;
-* **chat** - who asked for an invite, what the last whispers said (in Polish), what people around
-  are talking about, a reply to a whisper or a line for /p, /s, /g, /ra (translated to English,
-  waiting in the chat box);
+* **chat** - who asked for an invite, what the last whispers said (in Polish), what people are
+  talking about (say, party, guild, Trade, General, who is looking for a group), a reply to a whisper
+  or a line for /p, /s, /g, /ra (translated to English, waiting in the chat box);
+* **items** - "gdzie kupię / skąd wezmę Rhapsody Malt?": who sells it, what drops it, where the
+  nearest one is, with a map waypoint (QuestieDB items of quests);
+* **your loot** - what you picked up in the last minutes, and a word when a looted item beats what
+  you wear;
+* **your bags** - "czy ten kij, który znalazłem, jest lepszy?" (the item is found by its kind, colour,
+  name or the small vector index of the names of the moment, and compared with what you wear), "co mam
+  w plecaku?", "co mogę sprzedać?", "czy mam Rhapsody Malt?";
 * **you** - gold, level and XP to the next level, where you are, free bag slots, who is in the
   group (from the addon's state packet);
 * **voices** - mute or unmute the character voices, Polish/English voice mode, /say and /party
@@ -28,18 +35,23 @@ pipeline and:
 * **loot** - when a group loot roll starts she says whether it is a need or a greed for your class,
   level and worn gear (wvt/loot.py);
 * **guides** - questions about the game answered from the local knowledge base (Warcraft Wiki pages
-  for WoW Forever/Classic, QuestieDB quests, your notes; wvt/kb) by the LLM, two sentences;
+  for WoW Forever/Classic, QuestieDB quests, your notes; wvt/kb) by the LLM, a few concrete sentences;
 * anything else - a short chat in character (the local LLM; she may be wrong about game facts).
 
+With ``privacy.log_assistant`` every question, what she understood (intent), her answer and its
+sources go to ``assistant.log_file`` (JSON lines), so wrong answers can be found and fixed.
+
 Commands are matched by rules on the Polish text (fast, predictable, nothing invented); the LLM only
-talks and summarises.  Names that Parakeet hears in Polish grammar ("zaproś Artasa", "daj lidera
-Jainie") are matched to the names seen in chat and in the group.
+talks and summarises.  Before that, names Whisper misheard ("Targasa", "gnome Regan", "Kinaj") are
+replaced by the game's spelling from the names of the moment (wvt/lexicon.py: your quests, the people
+and places around you, your loot and bags), and her LLM gets a short picture of your game.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import difflib
+import json
 import logging
 import random
 import re
@@ -48,13 +60,18 @@ import time
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
 from . import protocol
-from .advisor import Advice, CLASS_EN, dungeons_for_level, find_place, where_next
+from .advisor import Advice, CLASS_EN, dungeons_for_level, find_item, find_place, spot_where, where_next
+from .bags import BagBook
 from .chat_insert import build_chat_line
+from .config import resolve_path
 from .kb.world import Player
-from .loot import advise as loot_advise
+from .lexicon import Correction, Lexicon
+from .loot import advise as loot_advise, item_verdict, pickup_tip
+from .planner import Plan, Step, make_plan, skip_sentence
 from .quests import QuestBook, match_quests, spoken_objective
 from .quest_tips import Chains, assess
 from .reminders import (Reminder, Reminders, describe as describe_reminder, parse_note, parse_reminder,
@@ -65,6 +82,10 @@ log = logging.getLogger(__name__)
 
 INVITE_KINDS = ("SAY", "YELL", "WHISPER")
 TALK_KINDS = ("SAY", "YELL", "PARTY", "PARTY_LEADER", "RAID", "RAID_LEADER", "WHISPER", "WHISPER_INFORM")
+# what "co piszą na czacie?" reads: talk plus raid warnings, guild, instance chat and public channels
+READ_KINDS = TALK_KINDS + ("RAID_WARNING", "GUILD", "OFFICER", "INSTANCE_CHAT", "INSTANCE_CHAT_LEADER", "CHANNEL")
+LOOT_KINDS = ("LOOT", "MONEY")  # the player's own loot lines
+NPC_KINDS = ("MONSTER_SAY", "MONSTER_YELL", "MONSTER_WHISPER")  # NPC speech: names for the lexicon only
 CHANNEL_CMDS = {"party": "/p", "say": "/s", "guild": "/g", "raid": "/ra", "yell": "/y"}
 
 
@@ -97,7 +118,7 @@ def _phonetic(s: str) -> str:
     return re.sub(r"(.)\1+", r"\1", s)
 
 
-# Polish case endings Parakeet hears on foreign names: Arthasa, Arthasowi, Arthasem, Jainie, Jainę...
+# Polish case endings speech recognition writes on foreign names: Arthasa, Arthasowi, Arthasem, Jainie, Jainę...
 _ENDINGS = ("owi", "ami", "em", "ie", "om", "a", "e", "u", "y", "i", "o")
 
 
@@ -165,26 +186,44 @@ class ChatLine:
     sender: str  # for WHISPER_INFORM: the player you whispered to
     text: str
     is_self: bool
+    channel: str = ""  # public channels: "Trade", "General", "LookingForGroup"...
 
 
 class ChatLog:
-    """Recent chat lines from the addon (spoken or not).  Kept in memory only, never written to disk."""
+    """Recent chat lines from the addon (spoken or not).  Kept in memory only, never written to disk.
+
+    Public channels and the player's loot lines have deques of their own, so a busy Trade chat or a
+    long farming session never pushes the whispers and invite requests out."""
 
     def __init__(self, max_lines: int = 300):
         self.lines: deque[ChatLine] = deque(maxlen=max_lines)
+        self.channel_lines: deque[ChatLine] = deque(maxlen=200)
+        self.loot_lines: deque[ChatLine] = deque(maxlen=120)
+        self.npc_lines: deque[ChatLine] = deque(maxlen=60)
         self._lock = threading.Lock()
 
     def add_packet(self, pkt: protocol.Packet, now: Optional[float] = None) -> None:
         if pkt.type not in (protocol.TYPE_VOICE, protocol.TYPE_CHAT) or pkt.is_secret or not (pkt.text or "").strip():
             return
-        line = ChatLine(now if now is not None else time.time(), pkt.chat_kind_name, pkt.sender,
-                        pkt.text.strip(), pkt.is_self)
+        kind = pkt.chat_kind_name
+        if kind == "BAG":
+            return  # the bag contents (wvt.bags), not chat
+        line = ChatLine(now if now is not None else time.time(), kind, pkt.sender, pkt.text.strip(), pkt.is_self,
+                        pkt.race if kind == "CHANNEL" else "")  # the addon names the channel in the race field
         with self._lock:
-            self.lines.append(line)
+            target = self.channel_lines if kind == "CHANNEL" else self.loot_lines if kind in LOOT_KINDS else \
+                self.npc_lines if kind in NPC_KINDS else self.lines
+            target.append(line)
 
-    def _snapshot(self) -> list[ChatLine]:
+    def _snapshot(self, kinds: tuple[str, ...] = ()) -> list[ChatLine]:
         with self._lock:
-            return list(self.lines)
+            out = list(self.lines)
+            extra = (list(self.channel_lines) if "CHANNEL" in kinds else []) + \
+                (list(self.loot_lines) if any(k in LOOT_KINDS for k in kinds) else []) + \
+                (list(self.npc_lines) if any(k in NPC_KINDS for k in kinds) else [])
+        if extra:
+            out = sorted(out + extra, key=lambda ln: ln.when)
+        return out
 
     def invite_requests(self, window_s: float, exclude: tuple[str, ...] = (), now: Optional[float] = None) -> list[str]:
         """Who asked for an invite (oldest request first), minus ``exclude`` (group members, already invited)."""
@@ -201,6 +240,18 @@ class ChatLog:
             out.append(line.sender)
         return out
 
+    def last_speaker(self, window_s: float, exclude: tuple[str, ...] = (), now: Optional[float] = None) -> Optional[str]:
+        """The other player who wrote near you or to you last (say, yell, whisper), minus ``exclude``."""
+        now = now if now is not None else time.time()
+        skip = {name_key(n) for n in exclude}
+        for line in reversed(self._snapshot()):
+            if now - line.when > window_s:
+                break
+            key = name_key(line.sender)
+            if not line.is_self and line.kind in INVITE_KINDS and key and key not in skip:
+                return line.sender
+        return None
+
     def whispers(self, n: int = 3, max_age_s: float = 900, now: Optional[float] = None) -> list[ChatLine]:
         now = now if now is not None else time.time()
         got = [ln for ln in self._snapshot() if ln.kind == "WHISPER" and now - ln.when <= max_age_s]
@@ -215,7 +266,7 @@ class ChatLog:
     def recent(self, n: int = 25, kinds: tuple[str, ...] = TALK_KINDS, max_age_s: float = 600,
                now: Optional[float] = None) -> list[ChatLine]:
         now = now if now is not None else time.time()
-        got = [ln for ln in self._snapshot() if ln.kind in kinds and now - ln.when <= max_age_s]
+        got = [ln for ln in self._snapshot(kinds) if ln.kind in kinds and now - ln.when <= max_age_s]
         return got[-n:]
 
     def names(self) -> list[str]:
@@ -238,14 +289,90 @@ class Intent:
 
 
 _GROUP_WORDS = r"(?:ich|wszystkich|chetnych|chetni|tych|tamtych|ludzi|osob\w*|kolesi|gosci|graczy|ekipe|reszte)"
-_INVITE_VERB = r"(?:\w*[sz]apro\w*|\w*[sz]apra\w*|\w*inwajt\w*|\w*invajt\w*|inv|inw|invite)"
+_INVITE_VERB = (r"(?:\w*[sz]apro\w*|\w*[sz]apra\w*|dopros\w*|doprasz\w*|\w*inwajt\w*|\w*invajt\w*|inv|inw"
+                r"|invite)")  # zaproś, zapraszaj, doproś (not "doprowadź"), inwajtuj...
+# "weź go do party", "wciągnij Ann do grupy", "dorzuć ich do raidu": a verb of taking and where to
+_INVITE_PULL = r"(?:wez\w*|wezm\w*|wciagn\w*|wrzuc\w*|dorzuc\w*|dobierz\w*|przyjm\w*|zabierz\w*|sciagn\w*)"
+_INVITE_WHERE = r"do (?:party|grup\w*|druzyn\w*|raid\w*|rajd\w*)"
+# one person named only by a pronoun ("weź go doproś do party"): the one who asked or spoke last
+_ONE_PERSON = {"go", "jego", "niego", "ja", "nia", "jej", "tego", "tamtego", "ta", "te", "tamta", "tamtej",
+               "kolesia", "goscia", "typa", "laske", "ziomka", "ziomala", "gracza", "kolege", "kolezanke", "postac"}
+# a chat channel and a question about it ("co piszą na trade", "przeczytaj czat", "co nowego na gildii")
+_CHAN = (r"(?:czat\w*|chat\w*|trade\w*|tred\w*|tradzie|handlu|handel|kanal\w*|lfg|lfm|gildi\w*|guild\w*"
+         r"|na general\w*|na ogolnym)")
+_ASK = (r"(?:co|pisz\w*|pisal\w*|mow\w*|gada\w*|dzieje|slychac|czytaj\w*|przeczytaj\w*|stresc\w*|streszcz\w*"
+        r"|podsumuj\w*|nowego)")
+# which part of the chat a summary is about
+_FOCUS = (
+    ("lfg", r"\b(lfg|lfm|szuka\w*)\b"),
+    ("trade", r"\b(trade\w*|tred\w*|tradzie|handlu|handel|handlow\w*)\b"),
+    ("general", r"\b(general\w*|ogoln\w*)\b"),
+    ("guild", r"\b(gildi\w*|guild\w*)\b"),
+    ("party", r"\b(party|druzyn\w*|grupie|raid\w*|rajd\w*)\b"),
+    ("say", r"\b(say\w*|sej\w*|obok|wokol)\b"),
+)
+
+
+def _chat_focus(folded: str) -> str:
+    return next((name for name, rx in _FOCUS if re.search(rx, folded)), "")
+
+
+# "gdzie kupię / skąd wezmę / co to jest <item>": answered from the item data when an item is named
+_ITEM_INTENTS = ("quest_where", "find", "chat", "quest_info", "quest_progress", "waypoint")
+_ITEM_ASK = re.compile(r"\b(gdzie|skad|kto|kup\w*|sprzeda\w*|zdobyc|zdobed\w*|dostac|dostane|znajde|znalezc|szukac"
+                       r"|szukam|wypada\w*|dropi\w*|farmi\w*|zebrac|zbierac|nazbierac|zaprowadz\w*|prowadz\w*"
+                       r"|znacznik\w*|co to|czym jest)\b")
+# "czy ten kij, który znalazłem, jest lepszy?": a kind of item and a question about it (not a quest, not shopping)
+_ITEM_NOUN = (r"(?:kij\w*|kostur\w*|lask\w*|miecz\w*|topor\w*|siekier\w*|sztylet\w*|noz|noza|nozem|nozyk\w*|luk|luku"
+              r"|lukiem|kusz\w*|strzelb\w*|rusznic\w*|rozdzk\w*|tarcz\w*|helm\w*|czapk\w*|kaptur\w*|napiersnik\w*"
+              r"|zbroj\w*|szat\w*|kurtk\w*|tunik\w*|spodni\w*|nogawic\w*|portk\w*|but|buty|butow|butach|rekawic\w*"
+              r"|karwasz\w*|bransolet\w*|pas|pasa|pasek|paska|pierscien\w*|naszyjnik\w*|amulet\w*|plaszcz\w*"
+              r"|peleryn\w*|naramiennik\w*|bron\w*|item\w*|przedmiot\w*|rzecz\w*|buzdygan\w*|maczug\w*|bulaw\w*"
+              r"|mlot\w*|talizman\w*|blyskotk\w*|pancerz\w*)")
+_ITEM_Q = (r"(?:lepsz\w*|gorsz\w*|slabsz\w*|mocniejsz\w*|warto|zaloz\w*|zakladac|ubrac|dobr\w*|dla mnie|sprzeda\w*"
+           r"|do czego|co to|co z|uzyw\w*|nosic|oplaca\w*|ulepszeni\w*|upgrade\w*|przyda\w*)")
+# kinds of items by their Polish names: (words, class, subclasses, equip locations)
+_ITEM_KINDS = (
+    (r"\b(kij\w*|kostur\w*|lask\w*)\b", 2, {10}, ()),
+    (r"\b(miecz\w*)\b", 2, {7, 8}, ()),
+    (r"\b(topor\w*|siekier\w*)\b", 2, {0, 1}, ()),
+    (r"\b(sztylet\w*|noz|noza|nozem|nozyk\w*)\b", 2, {15}, ()),
+    (r"\b(luk|luku|lukiem|kusz\w*)\b", 2, {2, 18}, ()),
+    (r"\b(strzelb\w*|rusznic\w*)\b", 2, {3}, ()),
+    (r"\b(rozdzk\w*)\b", 2, {19}, ()),
+    (r"\b(buzdygan\w*|maczug\w*|bulaw\w*|mlot\w*)\b", 2, {4, 5}, ()),
+    (r"\b(tarcz\w*)\b", 4, set(), ("INVTYPE_SHIELD",)),
+    (r"\b(helm\w*|czapk\w*|kaptur\w*)\b", 4, set(), ("INVTYPE_HEAD",)),
+    (r"\b(napiersnik\w*|zbroj\w*|pancerz\w*|szat\w*|kurtk\w*|tunik\w*)\b", 4, set(), ("INVTYPE_CHEST", "INVTYPE_ROBE")),
+    (r"\b(spodni\w*|nogawic\w*|portk\w*)\b", 4, set(), ("INVTYPE_LEGS",)),
+    (r"\b(but|buty|butow|butach)\b", 4, set(), ("INVTYPE_FEET",)),
+    (r"\b(rekawic\w*)\b", 4, set(), ("INVTYPE_HAND",)),
+    (r"\b(karwasz\w*|bransolet\w*)\b", 4, set(), ("INVTYPE_WRIST",)),
+    (r"\b(pas|pasa|pasek|paska)\b", 4, set(), ("INVTYPE_WAIST",)),
+    (r"\b(pierscien\w*)\b", 4, set(), ("INVTYPE_FINGER",)),
+    (r"\b(naszyjnik\w*|amulet\w*)\b", 4, set(), ("INVTYPE_NECK",)),
+    (r"\b(plaszcz\w*|peleryn\w*)\b", 4, set(), ("INVTYPE_CLOAK",)),
+    (r"\b(naramiennik\w*)\b", 4, set(), ("INVTYPE_SHOULDER",)),
+    (r"\b(talizman\w*|blyskotk\w*)\b", 4, set(), ("INVTYPE_TRINKET",)),
+    (r"\b(bron\w*)\b", 2, set(), ()),
+)
+_QUALITY_WORDS = ((r"\bszar\w*\b", 0), (r"\bbial\w*\b", 1), (r"\bzielon\w*\b", 2), (r"\bniebiesk\w*\b", 3),
+                  (r"\b(fiolet\w*|epik\w*|epic\w*)\b", 4))
+# a question that points back at what you were just talking about ("a gdzie go oddać?", "ile za niego expa?")
+_BACK_RE = re.compile(r"\b(go|niego|nim|jego|ten|tego|tym|temu|tamten\w*|tam|to|tamto|on|ona|ono|jej|ja|niej|nia)\b"
+                      r"|^(a|i|no|ok|okej|dobra)\b")
+TOPIC_SECONDS = 900  # a topic (and the conversation) is forgotten after 15 quiet minutes
 _FILLER = {"ej", "hej", "no", "prosze", "mi", "ty", "teraz", "szybko", "do", "party", "grupy", "grupa", "druzyny",
            "raidu", "rajdu", "go", "ja", "ta", "ten", "tego", "te", "pana", "pani", "gracza", "gracz", "postac",
            "postaci", "kolege", "kolezanke", "typa", "laske", "goscia", "wez", "daj", "przekaz", "oddaj", "zrob",
            "lidera", "lider", "liderem", "leadera", "lead", "prowadzenie", "z", "ze", "i", "na", "dla", "jemu", "jej",
-           "mu", "niech", "bedzie"}
+           "mu", "niech", "bedzie", "mozesz", "moglabys", "mozna", "chce", "chcialbym", "chcialabym", "tez",
+           "jeszcze", "dawaj", "pls", "plz"}
 
 _RULES: tuple[tuple[str, str], ...] = (
+    # "a potem?", "co dalej?", "ok, co teraz?" - the next step of the plan (the whole utterance, nothing else)
+    ("plan_next", r"^(?:(?:a|i|no|dobra|ok|okej|super|dzieki|zrobione|gotowe|oddane)\s+)*(?:co|a)?\s*"
+                  r"(?:potem|dalej|nastepne|nastepny|kolejne|kolejny|teraz)$"),
     ("help", r"\b(co umiesz|co potrafisz|w czym (mi )?pomozesz|jakie (masz )?komendy)\b|^pomocy?$"),
     ("stop", r"^(stop|cicho|cisza|przestan\w*|zamknij sie|wystarczy|dosc)\b"),
     ("reminder_list", r"\b(jakie|ile|pokaz\w*|wymien\w*|przeczytaj)\b.*\bprzypomnie\w*\b|^przypomnienia$"),
@@ -254,12 +381,16 @@ _RULES: tuple[tuple[str, str], ...] = (
     ("note_list", r"\b(jakie|co|pokaz\w*|przeczytaj|wymien\w*)\b.*\b(notatk\w*|zanotowal\w*|zapisal\w*)\b"),
     ("note_done", r"\b(usun\w*|skasuj\w*|wyczysc\w*|odhacz\w*|wykresl\w*)\b.*\bnotatk\w*\b|^(zrobione|zalatwione|gotowe)\b"),
     ("note_add", r"^(?:(?:ej|hej|iskra|prosze|i)\s+)*(zanotuj|zapisz|zapamietaj|notatka|dodaj notatke)\w*\b"),
+    ("item_about", rf"^(?!.*\b(quest\w*|kwest\w*|zadani\w*|gdzie|kupi\w*|kupic)\b)"
+                   rf"(?:(?=.*\b{_ITEM_NOUN}\b).*\b{_ITEM_Q}\b|(?:a\s+)?co to (?:jest )?za\b)"),
     ("quest_worth", r"\b(warto|oplaca sie|oplacal\w*|ocen\w*)\b|\blancuch\w*\b|\bco (dalej|potem) (w|po) (tym )?quesc\w*\b"),
     ("stats_reset", r"\b(zresetuj\w*|wyzeruj\w*|resetuj\w*|zeruj\w*)\b.*\b(statystyk\w*|licznik\w*|sesj\w*)\b"),
     ("stats", r"\b(na godzine|na godz|tempo|statystyk\w*|sesj\w*)\b|\bkiedy\b.*\b(level\w*|lewel\w*|poziom\w*|lvl)\b"
               r"|\bile\b.*\b(zarobil\w*|zdobyl\w*|wbil\w*|nabil\w*|uzbieral\w*|wyexpil\w*|zarabiam\w*)\b"),
     ("loot", r"\b(need\w*|nid\w*|greed\w*|grid\w*|gryd\w*)\b|\bco (wlasnie )?(wypadlo|wypadl|dropnelo|dropnal|wylecialo)\b"
-             r"|\bczy (to|ten|ta|te) (jest |sa )?dla mnie\b|\b(brac|wziac|rolowac|rollowac)\b.*\b(to|ten|te|item\w*|przedmiot\w*)\b"),
+             r"|\bczy (to|ten|ta|te) (jest |sa )?dla mnie\b|\b(brac|wziac|rolowac|rollowac)\b.*\b(to|ten|te|item\w*|przedmiot\w*)\b"
+             r"|\bco (ja )?(podnios\w*|zebral\w*|zlootowal\w*|lootowal\w*|zgarn\w*)\b|\bco (mi )?(wpadlo|mi wypadlo|wypadlo mi)\b"
+             r"|\b(moj\w*|ostatni\w*) (loot\w*|lup\w*|drop\w*)\b"),
     ("waypoint_clear", r"\b(usun\w*|wyczysc\w*|skasuj\w*|zdejmij|zabierz|schowaj)\b.*"
                        r"\b(znacznik\w*|pinezk\w*|punkt\w*|waypoint\w*|marker\w*)\b"),
     ("waypoint", r"\b(postaw\w*|ustaw\w*|daj|zrob\w*|dodaj\w*|wstaw\w*|wrzuc\w*)\b.*"
@@ -291,8 +422,12 @@ _RULES: tuple[tuple[str, str], ...] = (
     ("lead", r"\b(daj\w*|przekaz\w*|oddaj\w*|zrob\w*|mianuj\w*|ustaw\w*|awansuj\w*|niech)\b.*"
              r"\b(lider\w*|leader\w*|leada|lead|prowadzeni\w*|dowodzeni\w*)\b"),
     ("kick", r"\b(wyrzuc\w*|wywal\w*|wykop\w*|wypros\w*|kick\w*|kopnij|usun\w*)\b"),
+    # a channel's chat ("co piszą na trade?", "przeczytaj czat", "kto szuka grupy?") - before who_invite
+    ("summary", rf"\b{_ASK}\b.*\b{_CHAN}\b|\b{_CHAN}\b.*\b{_ASK}\b|\bkto\b.*\bszuka\w*\b"
+                r"|\bczy (ktos )?szuka\w* (grup\w*|party|druzyn\w*|tank\w*|heal\w*|ludzi)\b"),
     ("who_invite", r"\b(kto|ile osob|ilu|ile ludzi)\b.*\b(chce|chca|prosi|prosza|pisal\w*|pisze|pisza|czeka\w*)\b"),
-    ("invite", rf"\b{_INVITE_VERB}\b|\bdodaj\w*\b.*\b(party|grup\w*|druzyn\w*)\b|\bzrob\w* (party|grupe|druzyne)\b"),
+    ("invite", rf"\b{_INVITE_VERB}\b|\bdodaj\w*\b.*\b(party|grup\w*|druzyn\w*)\b|\bzrob\w* (party|grupe|druzyne)\b"
+               rf"|\b{_INVITE_PULL}\b.*\b{_INVITE_WHERE}\b"),
     ("whispers", r"\b(szept\w*|kto (do mnie )?pisal|co (mi |on |ona )?(napisal\w*|pisal\w*)|przeczytaj)\b"),
     ("summary", r"\b(stresc\w*|streszcz\w*|podsumuj\w*)\b|\b(o czym|co)\b.*\b(pisza|mowia|gadaja|pisali|mowili|gadali)\b"
                 r"|\b(czat\w*|chat\w*)\b.*\b(dzieje|pisz\w*|mowi\w*)\b|\bco (sie )?dzieje na czacie\b"),
@@ -301,6 +436,12 @@ _RULES: tuple[tuple[str, str], ...] = (
     ("xp", r"\b(ile|jaki\w*|kiedy|ktory|ktorym)\b.*\b(level\w*|lewel\w*|poziom\w*|lvl\w*|exp(?:a|ie|u)?|xp|doswiadczeni\w*)\b"
            r"|\bbrakuje\b.*\b(level\w*|lewel\w*|poziom\w*|lvl\w*|exp(?:a|ie|u)?)\b"),
     ("where", r"\bgdzie (ja )?(jestem|sie znajduje|my jestesmy|teraz jestem)\b|\bjaka to (strefa|lokacja|kraina|mapa)\b"),
+    ("bag_junk", r"\b(co|ktore|jakie)\b.*\b(sprzedac|sprzedam|opchnac|wywalic|wyrzucic)\b|\bsmieci\w*\b"
+                 r"|\bszare (rzeczy|przedmioty|itemy)\b"),
+    ("bag_list", r"\bco\b.*\b(mam|jest|nosze|trzymam|lezy)\b.*\b(plecak\w*|torb\w*|ekwipunk\w*|bagach|bagi|inwentarz\w*)\b"
+                 r"|\b(pokaz\w*|wymien\w*|przejrzyj|przeczytaj)\b.*\b(plecak\w*|torb\w*|ekwipunk\w*)\b"),
+    ("bag_count", r"\bczy (ja )?(jeszcze )?mam\b(?!.*\b(oddac|oddania|zrobic|quest\w*|zadani\w*|czas\w*|miejsc\w*"
+                  r"|kas\w*|zlot\w*|level\w*|poziom\w*|isc|pojsc)\b)"),
     ("bags", r"\b(ile|miejsc\w*|woln\w*|peln\w*|zapchan\w*|slot\w*)\b.*\b(torb\w*|plecak\w*|ekwipunk\w*|bagach|bagi)\b"
              r"|\b(torb\w*|plecak\w*|ekwipunk\w*)\b.*\b(miejsc\w*|woln\w*|peln\w*|zapchan\w*)\b"),
     ("members", r"\b(kto|kogo)\b.*\b(party|grup\w*|druzyn\w*|raid\w*)\b|\bsklad\b"),
@@ -384,11 +525,18 @@ def parse_intent(text: str) -> Intent:
         if kind in ("lead", "kick"):
             spoken = " ".join(w for w in words if w not in _FILLER and not re.match(rx, w))
             return Intent(kind, spoken=spoken)
+        if kind == "summary":
+            return Intent("summary", channel=_chat_focus(t))
         if kind == "invite":
             if re.search(rf"\b{_GROUP_WORDS}\b", t):
                 return Intent("invite_requests")
-            rest = [w for w in words if w not in _FILLER and not re.match(rf"^{_INVITE_VERB}$|^dodaj\w*$", w)]
-            return Intent("invite_name", spoken=" ".join(rest)) if rest else Intent("invite_requests")
+            rest = [w for w in words if w not in _FILLER and w not in _ONE_PERSON
+                    and not re.match(rf"^(?:{_INVITE_VERB}|{_INVITE_PULL}|dodaj\w*)$", w)]
+            if rest:
+                return Intent("invite_name", spoken=" ".join(rest))
+            if any(w in _ONE_PERSON for w in words):
+                return Intent("invite_last")  # "weź go doproś do party"
+            return Intent("invite_requests")
         return Intent(kind)
     return Intent("chat")
 
@@ -401,9 +549,9 @@ PERSONA = (
     "masz cięty humor i własne zdanie – mówisz wprost, kiedy coś jest stratą czasu, a kiedy naprawdę warto. Znasz "
     "gamingowy slang (expić, dropnąć, farmić, tank, heal, inv) i mówisz luźno, ale nie przeklinasz. Kibicujesz "
     "graczowi, cieszysz się z jego sukcesów i śmiejesz się z jego pecha, nigdy złośliwie. Każdą wypowiedź zaczynasz "
-    "inaczej i nie powtarzasz w kółko tych samych słówek. Mówisz po polsku, naturalnie i krótko: jedno, najwyżej "
-    "dwa zdania, bez emotek, list i nawiasów, bo "
-    "twoja odpowiedź zostanie przeczytana na głos. Zwracasz się do gracza per ty. Nie zmyślasz faktów o grze: jeśli "
+    "inaczej i nie powtarzasz w kółko tych samych słówek. Mówisz po polsku, naturalnie: zwykle dwa, trzy zdania, "
+    "a gdy pytanie dotyczy gry, podajesz konkrety (nazwy, miejsca, poziomy) zamiast ogólników. Bez emotek, list "
+    "i nawiasów, bo twoja odpowiedź zostanie przeczytana na głos. Zwracasz się do gracza per ty. Nie zmyślasz faktów o grze: jeśli "
     "nie wiesz czegoś na pewno, przyznaj to z humorem. Polecenia (zaproszenia, szepty, znaczniki, przypomnienia) "
     "wykonuje osobny moduł – ty tylko rozmawiasz.{extra}"
 )
@@ -434,12 +582,25 @@ EVENT_SHOTS = (
 KNOWLEDGE = (
     "\nOdpowiedz na pytanie gracza wyłącznie na podstawie poniższych fragmentów (Warcraft Wiki, baza questów "
     "i notatki gracza; gra to WoW Forever, czyli klasyczny WoW z nowymi strefami i rasą Skyborne). Jeśli fragmenty "
-    "nie zawierają odpowiedzi, powiedz krótko, że tego nie wiesz. Nazwy z gry (questy, NPC, przedmioty, miejsca, "
-    "umiejętności) zostaw po angielsku. Najwyżej dwa krótkie zdania mówione, bez list i bez nawiasów.\n"
+    "nie zawierają odpowiedzi, powiedz to wprost i dodaj, co z nich wiesz, jeśli to pomaga. Nazwy z gry (questy, "
+    "NPC, przedmioty, miejsca, umiejętności) zostaw po angielsku. Odpowiadaj konkretnie, w dwóch do czterech "
+    "zdaniach mówionych: kto, gdzie (strefa, miejsce, współrzędne, jeśli są), na jakim poziomie, co trzeba zrobić. "
+    "Bez list i bez nawiasów.\n"
+)
+PLAN = (
+    "\nGracz pyta, co teraz robić. Niżej plan policzony z jego dziennika zadań, pozycji i bazy questów: trasa w "
+    "kolejności najkrótszego chodzenia (oddanie questa liczy się jako bliżej, bo płaci od razu i otwiera dalszą część "
+    "łańcucha), ocena każdego questa (XP, miejsce w łańcuchu, nagroda) i co odpuścić. Powiedz mu w trzech, czterech "
+    "zdaniach mówionych, co robi najpierw i dlaczego w tej kolejności i co jest najważniejsze (łańcuchy z nagrodą, "
+    "dużo expa). Jeśli plan ma pozycje „Odpuść”, ostatnie zdanie mówi wprost, co sobie odpuścić i dlaczego. "
+    "Trzymaj się kolejności i faktów z planu: nazwy z gry po angielsku, kierunki i odległości tylko z planu, "
+    "zaokrąglone, niczego nie dodawaj.\nPlan:\n"
 )
 SUMMARY = (
-    "Streść po polsku, w jednym lub dwóch krótkich zdaniach mówionych, o czym rozmawiają ludzie na czacie WoW. "
-    "Używaj imion postaci. Bez list, bez cudzysłowów. Jeśli to tylko spam albo nic ważnego, powiedz to krótko."
+    "Streść po polsku, w dwóch, trzech zdaniach mówionych, o czym rozmawiają ludzie na czacie WoW (w nawiasie "
+    "kwadratowym kanał: say, party, guild, trade, general, lookingforgroup...). Używaj imion postaci. Jeśli ktoś "
+    "szuka grupy, tanka albo heala, albo sprzedaje coś ciekawego, powiedz kto i co. Bez list, bez cudzysłowów. "
+    "Jeśli to tylko spam albo nic ważnego, powiedz to krótko."
 )
 
 
@@ -449,8 +610,12 @@ class Assistant:
                  set_voices_enabled: Optional[Callable[[bool], None]] = None,
                  chat_log: Optional["ChatLog"] = None, quests: Optional[QuestBook] = None,
                  world_getter: Callable[[], object] = lambda: None, kb_getter: Callable[[], object] = lambda: None,
-                 instances_getter: Callable[[], list] = lambda: [], reminders_path=None):
+                 instances_getter: Callable[[], list] = lambda: [], reminders_path=None, journal_path=None,
+                 lexicon: Optional[Lexicon] = None, remote_embedder=None):
         self.cfg = cfg
+        self.journal_path = Path(journal_path) if journal_path else None
+        self._journal_lock = threading.Lock()
+        self._sources: list[str] = []  # where the last answer came from (for the journal)
         self.translator = translator
         self.llm = llm
         self.inserter = inserter
@@ -463,7 +628,10 @@ class Assistant:
         self.state: Optional[protocol.GameState] = None
         self.state_at = 0.0
         self._invited: dict[str, float] = {}
-        self._history: deque[dict] = deque(maxlen=6)
+        # the conversation: every question and answer (for her LLM), and what you are talking about (follow-ups)
+        self._history: deque[dict] = deque(maxlen=12)
+        self._topic: Optional[Topic] = None
+        self._plan_shown = ""  # the step of the plan she named last ("co dalej?" goes on from it)
         self._warned_no_voice = False
         self.world_getter = world_getter
         self.kb_getter = kb_getter
@@ -485,6 +653,17 @@ class Assistant:
         self._zone_said: dict[str, float] = {}
         self._bags_warned_at = 0.0
         self._started = time.time()
+        # what you carry: the bag contents, and items with their stats (looted, or wearables from the bag scan)
+        self.bags = BagBook()
+        self._items: dict[str, tuple[Optional[float], protocol.LootItem]] = {}  # name -> (looted at, item)
+        self._items_lock = threading.Lock()
+        self.last_correction = Correction("")
+        user_file = str(cfg.get("lexicon.user_file", "data/slownik.txt") or "")
+        self.lexicon = lexicon if lexicon is not None else Lexicon(
+            cfg, chat_log=self.chat, state_getter=lambda: self.state, quests_getter=lambda: self.quests,
+            world_getter=world_getter, bags_getter=lambda: self.bags, picked_getter=self._picked,
+            embedder_getter=lambda: getattr(self.kb_getter(), "embedder", None),
+            user_file=resolve_path(user_file) if user_file else None, remote=remote_embedder)
 
     def start(self) -> None:
         """Background work of the assistant (the reminder timer)."""
@@ -504,7 +683,8 @@ class Assistant:
                 self.reminders.on_level(pkt.state.level)
             self._state_events(prev, pkt.state)
         elif pkt.type in (protocol.TYPE_VOICE, protocol.TYPE_CHAT):
-            self.chat.add_packet(pkt)
+            if not self.bags.on_packet(pkt):
+                self.chat.add_packet(pkt)
         elif pkt.type in (protocol.TYPE_QUEST, protocol.TYPE_POS, protocol.TYPE_PLAYER, protocol.TYPE_DONE):
             self.quests.on_packet(pkt)
             if pkt.type == protocol.TYPE_QUEST and pkt.quest is not None:
@@ -513,9 +693,33 @@ class Assistant:
             self._on_loot(pkt.loot)
 
     def _on_reminder(self, r: Reminder) -> None:
-        self._respond(say_reminder(r.message, note=r.keep), "", "")
+        self._respond(say_reminder(r.message, note=r.keep), "", "", event="reminder")
+
+    def _remember_item(self, item: protocol.LootItem, looted: bool) -> None:
+        """Keep an item's stats for questions; a bag scan refreshes them but keeps when it was looted."""
+        key = (item.name or "").lower()
+        if not key:
+            return
+        with self._items_lock:
+            old = self._items.pop(key, None)
+            when = time.time() if looted else (old[0] if old else None)
+            self._items[key] = (when, item)
+            while len(self._items) > 60:
+                self._items.pop(next(iter(self._items)))
+
+    def _picked(self) -> list[tuple[float, protocol.LootItem]]:
+        """Looted items with their stats, oldest first (for the lexicon: "twój łup sprzed 5 min")."""
+        with self._items_lock:
+            return [(t, it) for t, it in self._items.values() if t is not None]
 
     def _on_loot(self, item: protocol.LootItem) -> None:
+        if item.from_bag:
+            self._remember_item(item, looted=False)  # a bag scan: never commented on
+            return
+        if item.picked:
+            self._remember_item(item, looted=True)
+            self._on_pickup(item)
+            return
         if item.roll_id in self._loot_rolls:
             return
         self._loot_rolls.append(item.roll_id)
@@ -524,7 +728,16 @@ class Assistant:
         p = self._player()
         adv = loot_advise(item, p.class_id, p.level)
         self._loot.append((time.time(), adv))
-        self._respond(adv.text, "", "")
+        self._respond(adv.text, "", "", event="loot_roll")
+
+    def _on_pickup(self, item: protocol.LootItem) -> None:
+        """You looted something you could wear: a word only when it beats your gear."""
+        if not self.cfg.get("assistant.loot_tips", True):
+            return
+        p = self._player()
+        tip = pickup_tip(item, p.class_id, p.level)
+        if tip:
+            self._respond(tip, "", "", event="pickup")
 
     # ------------------------------------------------------------------ spontaneous comments
     def _v(self, *options: str) -> str:
@@ -538,7 +751,7 @@ class Assistant:
             try:
                 text = fn(*args)
                 if text:
-                    self._respond(text, "", "")
+                    self._respond(text, "", "", event=getattr(fn, "__name__", "comment").lstrip("_"))
             except Exception:
                 log.exception("assistant comment failed")
 
@@ -579,7 +792,8 @@ class Assistant:
             self._bags_warned_at = now
             self._respond(self._v("Torby pełne. Czas odwiedzić vendora i sprzedać te śmieci.",
                                   "Plecak pęka w szwach. Wracaj do miasta, zanim przepadnie ci jakiś drop.",
-                                  "Zero miejsca w torbach. Jeszcze chwila i będziesz wyrzucać łupy na ziemię."), "", "")
+                                  "Zero miejsca w torbach. Jeszcze chwila i będziesz wyrzucać łupy na ziemię."), "", "",
+                          event="bags")
 
     def _quest_events(self, q: protocol.QuestEntry) -> None:
         """A quest that was not in the log before = you just took it."""
@@ -626,6 +840,7 @@ class Assistant:
         order = {"great": 0, "ok": 1, "skip": 2}
         rated.sort(key=lambda aq: order[aq[0].verdict])
         best = rated[0][0]
+        self._set_topic("quest", best.title, best.quest_id)  # "a gdzie to?" right after her comment
         if len(rated) == 1:
             situation = f"Gracz właśnie wziął questa {best.title}."
             facts = best.facts + [f"Ocena: {self._verdict_pl(best.verdict)}."]
@@ -698,26 +913,141 @@ class Assistant:
         return out
 
     # ------------------------------------------------------------------ one request
+    def _correct(self, polish: str) -> Correction:
+        """Misheard names replaced by the game's spelling (wvt/lexicon.py); the text as heard when that fails."""
+        if self.lexicon is None:
+            return Correction(polish)
+        try:
+            return self.lexicon.correct(polish)
+        except Exception:
+            log.exception("lexicon correction failed")
+            return Correction(polish)
+
     def handle(self, polish: str) -> tuple[str, str]:
         """React to one utterance.  Returns (spoken answer, chat line prepared or "")."""
-        intent = parse_intent(polish)
+        t0 = time.perf_counter()
+        corr = self._correct(polish)
+        self.last_correction = corr
+        text = corr.text
+        intent = parse_intent(text)
+        self._sources = []
         try:
-            reply, line = self._dispatch(intent, polish)
+            reply, line = self._dispatch(intent, text)
         except Exception:
             log.exception("assistant failed on intent %s", intent.kind)
             reply, line = "Coś mi się popsuło, spróbuj jeszcze raz.", ""
         status = ""
         if line:
             status = self.inserter.insert(line, self.wow_foreground())
-        self._respond(reply, line, status)
+        if reply:
+            self._remember(text, reply)
+        st = self.state
+        fixed = {"fixed": text, "fixes": [f"{f.heard} -> {f.name}" for f in corr.fixes]} if corr.fixes else {}
+        self._journal({"heard": polish, **fixed,
+                       "intent": intent.kind + (f":{intent.channel}" if intent.channel else ""),
+                       "reply": reply, "line": line, "sources": self._sources,
+                       "ms": round((time.perf_counter() - t0) * 1000),
+                       "zone": st.zone if st else "", "level": st.level if st else 0})
+        self._respond(reply, line, status, event="")
         return reply, line
+
+    # ------------------------------------------------------------------ the conversation and its topic
+    def _remember(self, polish: str, reply: str) -> None:
+        now = time.time()
+        if self._history and now - self._history[-1]["at"] > TOPIC_SECONDS:
+            self._history.clear()  # a new conversation
+        self._history.append({"role": "user", "content": polish, "at": now})
+        self._history.append({"role": "assistant", "content": reply, "at": now})
+
+    def _recent_history(self, n: int = 8) -> list[dict]:
+        """The last questions and answers (any kind, not only small talk) for her LLM."""
+        now = time.time()
+        return [{"role": m["role"], "content": m["content"]} for m in list(self._history)[-n:]
+                if now - m["at"] < TOPIC_SECONDS]
+
+    def _set_topic(self, kind: str, name: str, quest_id: int = 0, advice: Optional[Advice] = None) -> None:
+        if name:
+            self._topic = Topic(kind, name, quest_id, advice)
+
+    def _topic_now(self) -> Optional[Topic]:
+        t = self._topic
+        return t if t is not None and time.time() - t.at < TOPIC_SECONDS else None
+
+    @staticmethod
+    def _back(polish: str) -> bool:
+        return bool(_BACK_RE.search(fold(polish)))
+
+    def _topic_quest(self, quests: Optional[list] = None) -> Optional[protocol.QuestEntry]:
+        """The quest you were talking about, while it is still in your log."""
+        t = self._topic_now()
+        if t is None or t.kind != "quest" or not t.quest_id:
+            return None
+        if quests is None:
+            quests = self.quests.quests() if self.quests.known else []
+        return next((q for q in quests if q.quest_id == t.quest_id), None)
+
+    def _quest_details(self, q: protocol.QuestEntry) -> str:
+        """Everything about one quest, for a longer talk about it."""
+        bits = [f"{q.title} (poziom {q.level})"]
+        objs = ", ".join(spoken_objective(t, d) for d, t in q.objectives)
+        if q.complete:
+            bits.append("gotowy do oddania")
+        elif objs:
+            bits.append(f"cele: {objs}")
+        w = self.quests.where(q)
+        if w is not None:
+            bits.append(f"znacznik celu: {w.polish()}")
+        world = self.world_getter()
+        rec = world.quests.get(q.quest_id) if world is not None else None
+        if rec:
+            if rec.get("txt"):
+                bits.append("opis: " + " ".join(rec["txt"])[:240])
+            giver = next((world.npcs[n]["n"] for n in rec.get("sn") or [] if n in world.npcs), "")
+            if giver:
+                bits.append(f"daje {giver}")
+            spot = world.finisher_spot(q.quest_id, self.quests.pos)
+            if spot is not None:
+                bits.append(f"oddajesz u {spot.name}, {spot_where(world, spot, self.quests.pos)}")
+        a = self._assess(q.quest_id, q.group)
+        if a is not None:
+            bits += a.facts[:4]
+        return "; ".join(bits) + "."
+
+    def _topic_text(self) -> str:
+        t = self._topic_now()
+        if t is None:
+            return ""
+        if t.kind == "quest":
+            q = self._topic_quest()
+            return "Rozmawiacie teraz o queście " + (self._quest_details(q) if q is not None else f"{t.name}.")
+        if t.advice is not None and t.advice.text:
+            return f"Rozmawiacie teraz o: {t.name} ({t.advice.text})"
+        return f"Rozmawiacie teraz o: {t.name}."
+
+    def _journal(self, entry: dict) -> None:
+        """What she heard and said, one JSON line each (privacy.log_assistant); never raises."""
+        if self.journal_path is None:
+            return
+        entry = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), **entry}
+        try:
+            with self._journal_lock:
+                self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.journal_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log.debug("assistant journal not written: %s", exc)
 
     def _dispatch(self, it: Intent, polish: str) -> tuple[str, str]:
         k = it.kind
+        if k in _ITEM_INTENTS and _ITEM_ASK.search(fold(polish)):
+            found = self._item_where(polish)
+            if found is not None:
+                return found
         if k == "help":
-            return ("Zapraszam tych, co piszą inv, czytam szepty i odpisuję, mówię, gdzie iść dalej i stawiam znaczniki "
-                    "na mapie, szukam trenerów i NPC, przypominam, liczę expa na godzinę, doradzam need albo greed "
-                    "i odpowiadam z poradników. Komendy czekają w czacie na twój Enter."), ""
+            return ("Zapraszam tych, co piszą inv, czytam szepty i streszczam czat, także trade i gildię, mówię, gdzie "
+                    "iść dalej i stawiam znaczniki na mapie, szukam trenerów, NPC i przedmiotów, przypominam, liczę "
+                    "expa na godzinę, doradzam need albo greed, mówię, co ci wpadło, i odpowiadam z poradników. "
+                    "Komendy czekają w czacie na twój Enter."), ""
         if k == "reminder_add":
             return self._reminder_add(polish), ""
         if k == "reminder_list":
@@ -763,7 +1093,23 @@ class Assistant:
             self.session.reset()
             return "Zeruję licznik. Liczymy od teraz.", ""
         if k == "loot":
-            return self._loot_answer(), ""
+            return self._loot_answer(polish), ""
+        if k == "item_about":
+            answer = self._item_about(polish)
+            return (answer if answer is not None else (self._knowledge(polish) or self._chat(polish))), ""
+        if k == "bag_list":
+            return self._bag_list(), ""
+        if k == "bag_junk":
+            return self._bag_junk(), ""
+        if k == "bag_count":
+            counted = self._bag_count(polish)
+            if counted:
+                return counted, ""
+            return (self._knowledge(polish) or self._chat(polish)), ""
+        if k == "quest_progress":
+            counted = self._bag_count(polish, quiet=True)  # "ile mam Linen Cloth?" is about the bags
+            if counted:
+                return counted, ""
         if k == "waypoint_clear":
             return "Zdejmuję znacznik, Enter.", "/wvt way clear"
         if k == "waypoint":
@@ -771,7 +1117,9 @@ class Assistant:
         if k == "find":
             return self._lookup(polish)
         if k == "where_next":
-            return self._advice(where_next(self.world_getter(), self.quests, self._player(), self.quests.pos))
+            return self._plan_answer(polish)
+        if k == "plan_next":
+            return self._plan_next(polish)
         if k == "dungeon_level":
             return self._advice(dungeons_for_level(self.instances_getter() or [], self._player().level,
                                                    self.world_getter(), self.quests.pos))
@@ -784,6 +1132,8 @@ class Assistant:
             return self._invite_requests()
         if k == "invite_name":
             return self._invite_name(it.spoken)
+        if k == "invite_last":
+            return self._invite_last()
         if k in ("kick", "lead"):
             return self._member_command(k, it.spoken)
         if k in ("raid", "leave", "ready"):
@@ -798,7 +1148,13 @@ class Assistant:
         if k == "message":
             return self._message(it)
         if k == "summary":
-            return self._summary(), ""
+            return self._summary(it.channel), ""
+        if k == "xp" and self._back(polish):  # "a ile za niego expa?" - the quest you were talking about
+            q = self._topic_quest()
+            a = self._assess(q.quest_id, q.group) if q is not None else None
+            if a is not None:
+                share = f", czyli {round(a.level_share * 100)}% poziomu" if a.level_share else ""
+                return f"Za {q.title} dostaniesz {a.xp} XP{share}.", ""
         if k in ("gold", "xp", "where", "bags", "members"):
             return self._info(k), ""
         if k in ("mute", "unmute"):
@@ -816,6 +1172,10 @@ class Assistant:
             return "Enter i od teraz inni mówią po polsku.", "/wvt lang pl"
         if k == "lang_en":
             return "Enter i wracamy do angielskiego oryginału.", "/wvt lang en"
+        t = self._topic_now()
+        if k == "quest_where" and t is not None and t.kind != "quest" and t.advice is not None \
+                and self._back(polish) and not self.last_correction.found:
+            return self._advice(t.advice)  # "a gdzie to jest?" right after an item or a place
         if k.startswith("quest_"):
             return self._quest_answer(k, polish)
         answer = self._knowledge(polish)
@@ -857,11 +1217,23 @@ class Assistant:
         st = self.state
         return list(dict.fromkeys((st.members if st else []) + self.chat.names()))
 
+    def _invite_one(self, name: str) -> tuple[str, str]:
+        self._invited[name] = time.time()
+        return f"Zapraszam {name.split('-')[0]}. Enter i gotowe.", f"/wvt inv {name}"
+
+    def _invite_last(self) -> tuple[str, str]:
+        """"Weź go doproś do party": the one who asked for an invite last, else the last one who wrote."""
+        exclude = self._exclude()
+        asked = self.chat.invite_requests(self._window(), exclude)
+        name = asked[-1] if asked else self.chat.last_speaker(self._window(), exclude)
+        if not name:
+            return "Kogo mam zaprosić? Nikt spoza grupy nic ostatnio nie pisał.", ""
+        return self._invite_one(name)
+
     def _invite_name(self, spoken: str) -> tuple[str, str]:
         name = match_name(spoken, self._known_names())
         if name:
-            self._invited[name] = time.time()
-            return f"Zapraszam {name.split('-')[0]}. Enter i gotowe.", f"/wvt inv {name}"
+            return self._invite_one(name)
         guess = "".join(w.capitalize() for w in fold(spoken).split()[:1])
         if not guess:
             return "Kogo mam zaprosić?", ""
@@ -938,25 +1310,49 @@ class Assistant:
         line = build_chat_line(cmd, english, int(self.cfg.get("translation.max_chat_chars", 255)))
         return "Gotowe, Enter wysyła.", line
 
-    def _llm_text(self, messages: list[dict], max_tokens: int = 120, temperature: float = 0.8) -> str:
+    def _llm_text(self, messages: list[dict], max_tokens: int = 120, temperature: float = 0.8,
+                  limit: Optional[int] = None, thinking: str = "") -> str:
+        """``thinking``: Gemini's level for this answer ("medium" for a plan); the local model has none."""
         if self.llm is None:
             return ""
+        kw = {"thinking": thinking} if thinking and getattr(self.llm, "supports_thinking", False) else {}
         try:
             text, _ = self.llm.chat(messages, max_tokens=max_tokens, temperature=temperature,
-                                    timeout=float(self.cfg.get("assistant.llm_timeout_s", 8)))
+                                    timeout=float(self.cfg.get("assistant.llm_timeout_s", 8)), **kw)
         except Exception as exc:
             log.info("assistant LLM failed: %s", type(exc).__name__)
             return ""
-        return clean_reply(text, int(self.cfg.get("assistant.max_reply_chars", 240)))
+        return clean_reply(text, limit or int(self.cfg.get("assistant.max_reply_chars", 240)))
 
-    def _summary(self) -> str:
-        lines = self.chat.recent(25)
-        lines = [ln for ln in lines if not ln.is_self]
+    def _long_limit(self) -> int:
+        return int(self.cfg.get("assistant.max_knowledge_chars", 480))
+
+    _FOCUS_KINDS = {"guild": ("GUILD", "OFFICER"), "say": ("SAY", "YELL"),
+                    "party": ("PARTY", "PARTY_LEADER", "RAID", "RAID_LEADER", "RAID_WARNING", "INSTANCE_CHAT",
+                              "INSTANCE_CHAT_LEADER")}
+    _FOCUS_CHANNEL = {"trade": "trade", "general": "general", "lfg": "lookingforgroup"}
+    _FOCUS_PL = {"trade": "na trade", "general": "na general", "guild": "na gildii", "party": "w grupie",
+                 "say": "na say"}
+    _LFG_RE = re.compile(r"\b(lf\d?m|lfg|looking for (a )?(group|tank|heal\w*|dps)|need (a )?(tank|heal\w*|dps))\b",
+                         re.I)
+
+    def _summary(self, focus: str = "") -> str:
+        lines = [ln for ln in self.chat.recent(80, kinds=READ_KINDS) if not ln.is_self]
+        if focus in self._FOCUS_KINDS:
+            lines = [ln for ln in lines if ln.kind in self._FOCUS_KINDS[focus]]
+        elif focus == "lfg":
+            lines = [ln for ln in lines if ln.channel.lower().startswith("lookingforgroup") or self._LFG_RE.search(ln.text)]
+        elif focus in self._FOCUS_CHANNEL:
+            lines = [ln for ln in lines if ln.channel.lower().startswith(self._FOCUS_CHANNEL[focus])]
+        lines = lines[-25:]
         if not lines:
-            return "Cisza na czacie, nikt nic nie pisze."
-        convo = "\n".join(f"[{ln.kind.lower()}] {ln.sender.split('-')[0]}: {ln.text}" for ln in lines)
+            if focus == "lfg":
+                return "W ostatnich minutach nikt nie szukał grupy."
+            return f"Cisza {self._FOCUS_PL.get(focus, 'na czacie')}, nikt nic nie pisze."
+        convo = "\n".join(f"[{(ln.channel or ln.kind).lower()}] {ln.sender.split('-')[0]}: {ln.text}" for ln in lines)
+        self._sources = [f"chat: {len(lines)} lines" + (f" ({focus})" if focus else "")]
         out = self._llm_text([{"role": "system", "content": SUMMARY}, {"role": "user", "content": convo}],
-                             max_tokens=140, temperature=0.3)
+                             max_tokens=220, temperature=0.3, limit=self._long_limit())
         return out or "Nie dałam rady tego streścić."
 
     def _context(self) -> str:
@@ -973,13 +1369,17 @@ class Assistant:
         extra = str(self.cfg.get("assistant.persona_extra", "") or "")
         system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "")
         system += f"\nKontekst z gry: {self._context()}."
+        facts = self._facts(polish)
+        if facts:
+            system += f"\nCo się teraz dzieje w grze (fakty; nazwy z gry podawaj dokładnie tak, po angielsku): {facts}."
+        topic = self._topic_text()
+        if topic:
+            system += "\n" + topic
         shots = [{"role": role, "content": text} for q, a in STYLE_SHOTS
                  for role, text in (("user", q), ("assistant", a))]
-        messages = [{"role": "system", "content": system}, *shots, *self._history, {"role": "user", "content": polish}]
-        out = self._llm_text(messages)
-        if out:
-            self._history.append({"role": "user", "content": polish})
-            self._history.append({"role": "assistant", "content": out})
+        messages = [{"role": "system", "content": system}, *shots, *self._recent_history(),
+                    {"role": "user", "content": polish}]
+        out = self._llm_text(messages, max_tokens=160, limit=self._long_limit() if topic else None)
         return out or "Hm, zawiesiłam się na chwilę. Powtórzysz?"
 
     # ------------------------------------------------------------------ quests
@@ -995,10 +1395,22 @@ class Assistant:
 
     def _pick_quest(self, polish: str, quests: list) -> tuple[Optional[protocol.QuestEntry], bool]:
         """(the quest the question is about, whether it was named).  None: it names something not in the log."""
+        for e in self.last_correction.found:  # named, even if Whisper misheard it (wvt/lexicon.py)
+            if e.source == "questlog":
+                q = next((x for x in quests if x.quest_id == e.ref), None)
+                if q is not None:
+                    return q, True
         english = self._translate(polish, "pl-en")
         scored = match_quests(f"{english} {polish}", quests)
         if scored:
             return scored[0][1], True
+        q = self._quest_by_meaning(polish, quests)  # "ten quest z narzędziami" (Google's vectors only)
+        if q is not None:
+            return q, True
+        if self._back(polish):  # "a gdzie go oddać?" - nothing described: the quest you were talking about
+            q = self._topic_quest(quests)
+            if q is not None:
+                return q, True
         if self._names_something(polish):
             return None, False
         open_quests = [q for q in quests if not q.complete]
@@ -1009,6 +1421,33 @@ class Assistant:
         if near:
             return near[0], False
         return (tracked or open_quests or quests)[0], False
+
+    def _quest_by_meaning(self, polish: str, quests: list) -> Optional[protocol.QuestEntry]:
+        """The quest of your log a description fits, when the vectors are sure (Google's: >= lexicon.quest_min)."""
+        if self.lexicon is None:
+            return None
+        try:
+            hits = self.lexicon.search(polish, k=1, kinds={"quest"}, sources={"questlog"})
+        except Exception:
+            log.exception("quest vector search failed")
+            return None
+        if not hits or not self.lexicon.trusted(hits[0][1], "quest"):
+            return None
+        self._sources.append(f"quest by meaning: {hits[0][0].name} ({hits[0][1]:.2f})")
+        return next((q for q in quests if q.quest_id == hits[0][0].ref), None)
+
+    def _facts(self, polish: str) -> str:
+        """The names of the moment for her LLM ("" when there is nothing or it fails)."""
+        if self.lexicon is None:
+            return ""
+        try:
+            facts = self.lexicon.facts(polish)
+        except Exception:
+            log.exception("lexicon facts failed")
+            return ""
+        if facts:
+            self._sources.append("game context")
+        return facts
 
     @staticmethod
     def _progress(q: protocol.QuestEntry) -> str:
@@ -1061,34 +1500,55 @@ class Assistant:
                 parts.append("W toku: " + "; ".join(shown) + ("; i jeszcze inne." if len(todo) > 3 else "."))
             return " ".join(parts), ""
         if kind == "quest_turnin":
+            if self._back(polish) or self.last_correction.found:  # "a gdzie go oddać?", "gdzie oddać X?"
+                target, named = self._pick_quest(polish, quests)
+                if target is not None and named:
+                    self._set_topic("quest", target.title, target.quest_id)
+                    return self._turnin_text(target)
             if not done:
                 return "Jeszcze nic nie jest skończone. " + (f"Najbliżej końca: {self._progress(todo[0])}." if todo else ""), ""
             near = book.nearest(done)
             out = f"Do oddania masz: {polish_list([q.title for q in done[:4]])}."
             if near:
                 out += f" Najbliżej oddasz {near[0].title}, {near[1].polish()}."
+                self._set_topic("quest", near[0].title, near[0].quest_id)
             return out, (f"/wvt track {near[0].quest_id}" if near and self._waypoints_on() else "")
         if kind == "quest_nearest":
             near = book.nearest(todo) or book.nearest(quests)
             if not near:
                 return "Żaden quest nie ma teraz znacznika na tej mapie.", ""
+            self._set_topic("quest", near[0].title, near[0].quest_id)
             return f"Najbliżej masz {near[0].title}, {near[1].polish()}.", \
                 (f"/wvt track {near[0].quest_id}" if self._waypoints_on() else "")
         target, named = self._pick_quest(polish, quests)
         if target is None:  # asks about something that is not in the quest log
             return self._lookup(polish) if kind == "quest_where" else ((self._knowledge(polish) or self._chat(polish)), "")
+        self._set_topic("quest", target.title, target.quest_id)
         if kind == "quest_where":
             return self._where_text(target), (f"/wvt track {target.quest_id}" if self._waypoints_on() else "")
         if kind == "quest_progress":
             return self._progress(target) + ".", ""
-        # anything else about quests: the LLM, with the quest log as the only facts
+        # anything else about quests: the LLM, with the quest log and everything about this quest as the only facts
         picked = [target] + [q for q in quests if q is not target]
         extra = str(self.cfg.get("assistant.persona_extra", "") or "")
         system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "")
         system += ("\nDziennik zadań gracza (to są jedyne fakty o questach, nie dodawaj niczego od siebie):\n"
-                   + self._quest_facts(picked))
-        out = self._llm_text([{"role": "system", "content": system}, {"role": "user", "content": polish}])
+                   + self._quest_facts(picked) + "\nPytanie dotyczy questa " + self._quest_details(target))
+        out = self._llm_text([{"role": "system", "content": system}, *self._recent_history(),
+                              {"role": "user", "content": polish}], max_tokens=300, limit=self._long_limit())
         return (out or self._progress(target) + "."), ""
+
+    def _turnin_text(self, q: protocol.QuestEntry) -> tuple[str, str]:
+        """Where the quest you were talking about is handed in."""
+        world = self.world_getter()
+        spot = world.finisher_spot(q.quest_id, self.quests.pos) if world is not None else None
+        w = self.quests.where(q) if q.complete else None
+        if spot is not None:
+            where = w.polish() if w is not None else spot_where(world, spot, self.quests.pos)
+            ready = "" if q.complete else " Najpierw dokończ cele: " + self._progress(q).split(": ", 1)[-1] + "."
+            return f"{q.title} oddajesz u {spot.name}, {where}.{ready}", \
+                (f"/wvt track {q.quest_id}" if self._waypoints_on() else "")
+        return self._where_text(q), (f"/wvt track {q.quest_id}" if self._waypoints_on() else "")
 
     # ------------------------------------------------------------------ where next, places, waypoints
     def _player(self) -> Player:
@@ -1100,15 +1560,82 @@ class Assistant:
     def _waypoints_on(self) -> bool:
         return bool(self.cfg.get("assistant.auto_waypoint", True))
 
+    def _line_hint(self, line: str) -> str:
+        if line.startswith("/wvt way"):
+            return " " + self._v("Znacznik czeka na Enter.", "Enter i masz pinezkę na mapie.",
+                                 "Wciśnij Enter, to cię poprowadzę.")
+        if line.startswith("/wvt track"):
+            return " Enter włączy strzałkę."
+        return ""
+
     def _advice(self, adv: Advice) -> tuple[str, str]:
         self._last_advice = adv
+        if adv.quest_id:
+            q = next((x for x in self.quests.quests() if x.quest_id == adv.quest_id), None) if self.quests.known else None
+            self._set_topic("quest", q.title if q is not None else adv.text[:60], adv.quest_id)
+        elif adv.item:
+            self._set_topic("item", adv.item, advice=adv)
+        elif adv.spot is not None:
+            self._set_topic("place", adv.spot.name, advice=adv)
         line = adv.line if self._waypoints_on() else ""
-        if line.startswith("/wvt way"):
-            return adv.text + " " + self._v("Znacznik czeka na Enter.", "Enter i masz pinezkę na mapie.",
-                                             "Wciśnij Enter, to cię poprowadzę."), line
-        if line.startswith("/wvt track"):
-            return adv.text + " Enter włączy strzałkę.", line
-        return adv.text, line
+        return adv.text + self._line_hint(line), line
+
+    # ------------------------------------------------------------------ what to do now: a plan
+    def _make_plan(self) -> Optional[Plan]:
+        world, st = self.world_getter(), self.state
+        try:
+            return make_plan(world, self.quests, self._player(), self.quests.pos, st.xp_max if st else 0,
+                             bool(st and st.in_group), self._chains_for(world) if world is not None else None)
+        except Exception:
+            log.exception("plan failed")
+            return None
+
+    def _show_step(self, step: Step) -> None:
+        """The step she just named: the topic of the talk and what "zaprowadź mnie tam" means."""
+        self._plan_shown = step.title
+        if step.kind == "pickup":
+            adv = Advice(f"{step.label()}, {step.where}", step.line)
+            self._last_advice = adv
+            self._set_topic("place", step.who or step.title, advice=adv)
+        else:
+            qid = step.quest_ids[0] if step.quest_ids else 0
+            self._last_advice = Advice(step.title, step.line, quest_id=qid)
+            self._set_topic("quest", step.title, qid)
+
+    def _plan_answer(self, polish: str) -> tuple[str, str]:
+        """"Co teraz robić?": the route through your quests, what is worth most and what to let go, in her words."""
+        plan = self._make_plan()
+        if plan is None or plan.empty:  # nothing in the log near you: new quests or the zone for your level
+            return self._advice(where_next(self.world_getter(), self.quests, self._player(), self.quests.pos))
+        first = (plan.route or plan.later)[0]
+        self._show_step(first)
+        self._sources = [f"plan: {len(plan.route)} steps, {len(plan.skip)} to let go, {len(plan.later)} later"]
+        extra = str(self.cfg.get("assistant.persona_extra", "") or "")
+        system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "") + PLAN + plan.facts()
+        text = self._llm_text([{"role": "system", "content": system}, *self._recent_history(),
+                               {"role": "user", "content": polish}], max_tokens=400, temperature=0.4,
+                              limit=max(600, self._long_limit()),
+                              thinking=str(self.cfg.get("assistant.plan_thinking", "low")))
+        if text and plan.skip and not any(fold(s.title) in fold(text) for s, _ in plan.skip):
+            # what to let go matters: Gemini left it out 4 times of 4 in the test, so it is added here
+            text = text.rstrip(". ") + ". " + skip_sentence(*plan.skip[0])
+        line = first.line if self._waypoints_on() else ""
+        return (text or plan.text()) + self._line_hint(line), line
+
+    def _plan_next(self, polish: str) -> tuple[str, str]:
+        """"A potem?" / "co dalej?": the next step (the plan is made again: you moved, quests changed)."""
+        plan = self._make_plan()
+        if plan is None or not plan.route or not self._plan_shown:
+            return self._plan_answer(polish)
+        step = next((s for s in plan.route if s.title != self._plan_shown), None)
+        if step is None:
+            return "To już wszystko z tego planu. Zapytaj, co teraz robić, to ułożę nowy.", ""
+        self._show_step(step)
+        text = f"Teraz {step.label()}, {step.where}."
+        if step.verdict == "great" and step.facts:
+            text += " " + step.facts[0]
+        line = step.line if self._waypoints_on() else ""
+        return text + self._line_hint(line), line
 
     def _lookup(self, polish: str) -> tuple[str, str]:
         """'Gdzie jest X?' that is not about the quest log: services, dungeon entrances, NPCs, then the guides."""
@@ -1117,6 +1644,19 @@ class Assistant:
         if adv is not None:
             return self._advice(adv)
         return (self._knowledge(polish, english) or self._chat(polish)), ""
+
+    def _item_where(self, polish: str) -> Optional[tuple[str, str]]:
+        """'Gdzie kupię / skąd wezmę Rhapsody Malt?': who sells it, what drops it - the nearest first."""
+        world = self.world_getter()
+        if world is None or not hasattr(world, "find_item_in"):
+            return None
+        adv = find_item(world, polish, self._player(), self.quests.pos)
+        if adv is None:
+            return None
+        if self.quests.known and any(fold(q.title) == fold(adv.item) for q in self.quests.quests()):
+            return None  # "Beer Basted Boar Ribs" the quest, not the dish
+        self._sources = [f"item: {adv.item}"]
+        return self._advice(adv)
 
     _POINTERS = {"to", "tam", "tego", "ten", "te", "ta", "tu", "tutaj", "go", "ja", "je", "mi", "mnie", "na", "mapie",
                  "znacznik", "znacznika", "punkt", "pinezke", "prosze", "ej", "iskra", "postaw", "ustaw", "daj", "zrob",
@@ -1166,10 +1706,18 @@ class Assistant:
         target = None
         if self.quests.known:
             quests = self.quests.quests()
-            english = self._translate(polish, "pl-en")
-            scored = match_quests(f"{english} {polish}", quests)
-            if scored:
+            named = next((e.ref for e in self.last_correction.found if e.source == "questlog"), None)
+            scored = [] if named else match_quests(f"{self._translate(polish, 'pl-en')} {polish}", quests)
+            meant = None if named or scored else self._quest_by_meaning(polish, quests)
+            topic = self._topic_quest(quests) if self._back(polish) else None
+            if named:
+                target = named
+            elif scored:
                 target = scored[0][1].quest_id
+            elif meant is not None:
+                target = meant.quest_id
+            elif topic is not None:
+                target = topic.quest_id
             elif self._last_accepted and time.time() - self._last_accepted[0] < 900:
                 target = self._last_accepted[1]
             else:
@@ -1180,15 +1728,234 @@ class Assistant:
         a = self._assess(target)
         if a is None:
             return "Tego questa nie mam w bazie, więc nie ocenię. Pewnie coś nowego z Forever."
+        self._set_topic("quest", a.title, target)
         situation = f"Gracz pyta, czy warto robić questa {a.title}."
-        return self._persona_line(situation, a.facts + [f"Ocena: {self._verdict_pl(a.verdict)}."], f"{a.title}: {a.text()}")
+        facts = a.facts + [f"Ocena: {self._verdict_pl(a.verdict)}."]
+        world = self.world_getter()
+        if a.chain is not None and a.chain.length > 1 and world is not None:  # "co jest na końcu tego łańcucha?"
+            facts.append("Questy łańcucha po kolei: " + " → ".join(world.quests[i]["n"] for i in a.chain.ids
+                                                                   if i in world.quests) + ".")
+        return self._persona_line(situation, facts, f"{a.title}: {a.text()}")
 
-    def _loot_answer(self) -> str:
+    _MINE_RE = re.compile(r"\b(podnios|zebral|zlootowal|lootowal|zgarn|wpadlo|mi wypadlo|wypadlo mi|moj|ostatni)")
+
+    def _loot_answer(self, polish: str = "") -> str:
+        """A roll that just started (need or greed), otherwise what you looted in the last minutes."""
         now = time.time()
         recent = [adv for t, adv in self._loot if now - t < 180]
-        if not recent:
-            return "Nic ostatnio nie wypadło do losowania."
-        return " ".join(a.text for a in recent[-3:])
+        mine = bool(self._MINE_RE.search(fold(polish)))
+        if recent and not mine:
+            return " ".join(a.text for a in recent[-3:])
+        picked = self._pickups_text()
+        if picked:
+            return picked
+        return "W ostatnim kwadransie nic ci nie wpadło." if mine else "Nic ostatnio nie wypadło do losowania."
+
+    _MONEY_RE = re.compile(r"(\d+)\s+(gold|silver|copper)", re.I)
+    _LOOT_ITEM_RE = re.compile(r"\[([^\]]+)\](?:x(\d+))?")
+
+    def _pickups_text(self, max_age_s: float = 900) -> str:
+        counts: dict[str, int] = {}
+        copper = 0
+        for ln in self.chat.recent(80, kinds=LOOT_KINDS, max_age_s=max_age_s):
+            if ln.kind == "MONEY":
+                copper += sum(int(n) * {"gold": 10000, "silver": 100, "copper": 1}[u.lower()]
+                              for n, u in self._MONEY_RE.findall(ln.text))
+                continue
+            for name, n in self._LOOT_ITEM_RE.findall(ln.text):
+                counts[name] = counts.get(name, 0) + int(n or 1)
+        if not counts and not copper:
+            return ""
+        parts = [f"{n} {plural(n, 'sztuka', 'sztuki', 'sztuk')} {name}" if n > 1 else name
+                 for name, n in list(counts.items())[-8:]]
+        text = f"W ostatnich {round(max_age_s / 60)} minutach wpadło ci: {polish_list(parts)}." if parts else ""
+        if copper:
+            g, rest = divmod(copper, 10000)
+            s, c = divmod(rest, 100)
+            money = polish_list([x for x in (f"{g} złota" if g else "", f"{s} srebra" if s else "",
+                                              f"{c} miedzi" if c else "") if x])
+            text = (text + f" Do tego {money} z łupów.") if text else \
+                f"W ostatnich {round(max_age_s / 60)} minutach wpadło ci {money} z łupów."
+        return text.strip()
+
+    # ------------------------------------------------------------------ what you carry
+    def _own_items(self) -> list["OwnItem"]:
+        """Everything you carry or just looted, by name: stats from loot / the bag scan, counts from the bags."""
+        out: dict[str, OwnItem] = {}
+        with self._items_lock:
+            stats = dict(self._items)
+        for key, (when, it) in stats.items():
+            out[key] = OwnItem(it.name, it.class_id, it.subclass_id, it.equip_loc, it.quality, it.count, loot=it,
+                               looted_at=when)
+        for b in self.bags.items:
+            o = out.get(b.name.lower())
+            if o is not None:
+                o.bag, o.count = b, b.count
+            else:
+                out[b.name.lower()] = OwnItem(b.name, b.class_id, b.subclass_id, b.equip_loc, b.quality, b.count,
+                                              bag=b)
+        world = self.world_getter()
+        for ln in self.chat.recent(80, kinds=LOOT_KINDS, max_age_s=1800):
+            for name, _ in self._LOOT_ITEM_RE.findall(ln.text):
+                o = out.get(name.lower())
+                if o is None:
+                    rec = None
+                    if world is not None and hasattr(world, "_item_names"):
+                        ids = world._item_names.get(fold(name)) or []
+                        rec = world.items.get(ids[0]) if ids else None
+                    out[name.lower()] = OwnItem(name, rec.get("c", -1) if rec else -1, rec.get("sc", -1) if rec else -1,
+                                                "", -1, 1, looted_at=ln.when)
+                elif o.looted_at is None:
+                    o.looted_at = ln.when
+        return list(out.values())
+
+    _GENERIC_ITEM = re.compile(r"\b(rzecz\w*|przedmiot\w*|item\w*|bron\w*|cos)\b")
+
+    def _find_own(self, text: str) -> tuple[list["OwnItem"], bool, bool]:
+        """(the items the question is about, best first; whether one was named; whether the first one is surely
+        it: named, its kind said ("kij"), "ta rzecz" (the newest loot) or Google's vectors sure of it)."""
+        own = self._own_items()
+        folded = fold(text)
+        if not own:  # nothing known yet: say so only when it is clearly about an item
+            return [], False, bool(self._GENERIC_ITEM.search(folded) or any(re.search(rx, folded)
+                                                                            for rx, *_ in _ITEM_KINDS))
+        found = {fold(e.name) for e in self.last_correction.found if e.kind in ("item", "word")}
+        named = [o for o in own if fold(o.name) in found or (len(o.name) >= 4 and fold(o.name) in folded)]
+        if named:
+            return named, True, True
+        cands = own
+        sure = bool(self._GENERIC_ITEM.search(folded))
+        for rx, cls, subs, locs in _ITEM_KINDS:
+            if re.search(rx, folded):
+                sure = True
+                cands = [o for o in cands if (o.class_id == cls and (not subs or o.subclass_id in subs)
+                                              and (not locs or o.equip_loc in locs))]
+                break
+        for rx, q in _QUALITY_WORDS:
+            if re.search(rx, folded):
+                cands = [o for o in cands if o.quality == q] or cands
+                break
+        if len(cands) > 1 or not sure:
+            order: dict[str, int] = {}
+            trusted = False
+            if self.lexicon is not None:
+                hits = self.lexicon.search(text, k=12, kinds={"item"}, sources={"loot", "bag"})
+                order = {fold(e.name): i for i, (e, _) in enumerate(hits)}
+                trusted = bool(hits) and self.lexicon.trusted(hits[0][1], "item")
+            if trusted:  # Google's vectors know "co to za ząb?" (11 of 12 right in the bench)
+                cands.sort(key=lambda o: (order.get(fold(o.name), 99), -(o.looted_at or 0)))
+                sure = True
+            else:  # the local e5 only breaks ties: the newest loot first ("ten kij, który znalazłem")
+                cands.sort(key=lambda o: (-(o.looted_at or 0), order.get(fold(o.name), 99)))
+        return cands, False, sure
+
+    def _item_about(self, text: str) -> Optional[str]:
+        """None: not clearly about one of your items ("co to za miejsce?") - her LLM answers from the facts."""
+        cands, named, sure = self._find_own(text)
+        if not sure:
+            return None
+        if not cands:
+            if not self.bags.known and not self._items:
+                return "Jeszcze nie widzę twoich toreb ani łupów. Daj mi chwilę po zalogowaniu albo zrób /reload."
+            return "Nie widzę takiego przedmiotu w twoich łupach ani w torbach."
+        o = cands[0]
+        p = self._player()
+        answer = item_verdict(o.loot, p.class_id, p.level) if o.loot is not None else self._item_plain(o)
+        same = (o.class_id, o.subclass_id, o.equip_loc)  # "masz też" only for items of the same kind
+        others = [c.name for c in cands[1:] if c.name != o.name and (c.class_id, c.subclass_id, c.equip_loc) == same][:2]
+        if others and not named:
+            answer += f" Jeśli chodziło ci o inny, masz też {polish_list(others)}."
+        self._sources = [f"own item: {o.name}" + (" (stats)" if o.loot is not None else "")]
+        self._set_topic("item", o.name)
+        return answer
+
+    def _item_plain(self, o: "OwnItem") -> str:
+        """An item without stats: what it is for."""
+        world = self.world_getter()
+        if world is not None and self.quests.known:
+            for q in self.quests.quests():
+                rec = world.quests.get(q.quest_id) or {}
+                names = [world.items.get(r[0], {}).get("n", "") for r in rec.get("loot") or [] if r]
+                names += [re.sub(r"^\s*\d+\s*/\s*\d+\s+", "", t) for _, t in q.objectives]
+                if any(fold(n) == fold(o.name) for n in names if n):
+                    return f"{o.name} jest do questa {q.title}."
+        if o.quality == 0:
+            return f"{o.name} to szary śmieć. Sprzedaj u najbliższego vendora."
+        if o.class_id == 0:
+            return f"{o.name} jest do zjedzenia albo wypicia, najlepiej po walce."
+        if o.class_id == 7:
+            return f"{o.name} to materiał do rzemiosła. Przyda się w zawodzie albo sprzedasz go na aukcji."
+        if o.class_id == 12:
+            return f"{o.name} to przedmiot do questa."
+        return f"To {o.name}. Nie mam jego statystyk, więc nie porównam."
+
+    @staticmethod
+    def _count_text(it) -> str:
+        return f"{it.count} {it.name}" if it.count > 1 else it.name
+
+    def _bags_unknown(self) -> str:
+        return "Jeszcze nie widzę twoich toreb. Daj mi chwilę po zalogowaniu albo zrób /reload."
+
+    def _bag_list(self) -> str:
+        if not self.bags.known:
+            return self._bags_unknown()
+        items = self.bags.items
+        if not items:
+            return "Torby masz puste."
+        objectives = {fold(e.name) for e in self.lexicon.entries() if e.source == "objective"} \
+            if self.lexicon is not None else set()
+        quest = [it for it in items if fold(it.name) in objectives or it.class_id == 12]
+        gear = [it for it in items if it.equip_loc and it.quality >= 1 and it not in quest]
+        junk = [it for it in items if it.junk and it not in quest]
+        rest = sorted((it for it in items if it not in quest and it not in gear and it not in junk),
+                      key=lambda it: (-it.quality, -it.count))
+        n = len(items)
+        parts = [f"W torbach masz {n} {plural(n, 'rzecz', 'rzeczy', 'rzeczy')}."]
+        if quest:
+            parts.append("Do questów: " + polish_list([self._count_text(i) for i in quest[:4]]) + ".")
+        if gear:
+            parts.append("Do założenia: " + polish_list([i.name for i in gear[:3]]) + ".")
+        if rest:
+            parts.append("Poza tym " + polish_list([self._count_text(i) for i in rest[:5]]) + ".")
+        if junk:
+            parts.append(f"I {len(junk)} {plural(len(junk), 'szary śmieć', 'szare śmieci', 'szarych śmieci')} do sprzedania.")
+        self._sources = [f"bags: {n} items"]
+        return " ".join(parts)
+
+    def _bag_junk(self) -> str:
+        if not self.bags.known:
+            return self._bags_unknown()
+        junk = self.bags.junk()
+        if not junk:
+            return "Nie masz szarych śmieci, czysto."
+        n = sum(it.count for it in junk)
+        more = " I jeszcze inne." if len(junk) > 5 else ""
+        return (f"Do sprzedania masz {n} {plural(n, 'szary śmieć', 'szare śmieci', 'szarych śmieci')}: "
+                f"{polish_list([self._count_text(i) for i in junk[:5]])}.{more}")
+
+    def _bag_count(self, text: str, quiet: bool = False) -> str:
+        """"Czy mam Rhapsody Malt?" / "ile mam Linen Cloth?" from the bags; "" when no item of yours is named
+        (``quiet``: also when the item is a quest objective - the quest log answers that better)."""
+        if not self.bags.known:
+            return "" if quiet else self._bags_unknown()
+        folded = fold(text)
+        items = self.bags.items
+        found = [e for e in self.last_correction.found if e.kind == "item"]
+        if quiet and any(e.source in ("objective", "questlog") for e in found):
+            return ""
+        target = next((e.name for e in found), None) or \
+            next((it.name for it in items if len(it.name) >= 4 and fold(it.name) in folded), None)
+        if target is None and not quiet and self.lexicon is not None:  # "ile mam materiału?" (Google's vectors)
+            hits = self.lexicon.search(text, k=1, kinds={"item"}, sources={"bag"})
+            if hits and self.lexicon.trusted(hits[0][1], "item"):
+                target = hits[0][0].name
+        if target is None:
+            return ""  # her LLM answers it: the facts list your bags
+        n = self.bags.count(target)
+        self._sources = [f"bags: {target}"]
+        if n:
+            return f"Masz {n} {plural(n, 'sztukę', 'sztuki', 'sztuk')} {target}." if n > 1 else f"Masz {target}, jedną sztukę."
+        return f"Nie masz {target} w torbach."
 
     # ------------------------------------------------------------------ guides (local knowledge base)
     _ABILITY_RE = re.compile(r"\b(umiejetn\w*|skill\w*|spell\w*|czar\w*|zaklec\w*|talent\w*|trener\w*|naucz\w*|zdolnosc\w*|rotacj\w*)\b")
@@ -1237,9 +2004,14 @@ class Assistant:
         extra = str(self.cfg.get("assistant.persona_extra", "") or "")
         system = PERSONA.format(name=self.name, extra=(" " + extra) if extra else "") + KNOWLEDGE
         who = self._context() + (f", klasa {CLASS_EN[p.class_id]}" if p.class_id in CLASS_EN else "")
-        system += f"Gracz: {who}.\nFragmenty:\n{context}"
-        out = self._llm_text([{"role": "system", "content": system}, {"role": "user", "content": polish}],
-                             max_tokens=170, temperature=0.3)
+        facts = self._facts(polish)
+        topic = self._topic_text()
+        system += f"Gracz: {who}.\n" + (f"W grze teraz: {facts}.\n" if facts else "") + \
+            (f"{topic}\n" if topic else "") + f"Fragmenty:\n{context}"
+        out = self._llm_text([{"role": "system", "content": system}, *self._recent_history(),
+                              {"role": "user", "content": polish}], max_tokens=300, temperature=0.3,
+                             limit=self._long_limit())
+        self._sources += [h.title + (f" > {h.section}" if h.section else "") for h in hits[:4]]
         log.info("knowledge answer from %s", ", ".join(h.title for h in hits[:3]))
         return out
 
@@ -1269,7 +2041,12 @@ class Assistant:
         return f"W party masz {polish_list(others)}." if others else "Jesteś w grupie, ale nie widzę imion."
 
     # ------------------------------------------------------------------ output
-    def _respond(self, reply: str, line: str, insert_status: str) -> None:
+    def _respond(self, reply: str, line: str, insert_status: str, event: str = "comment") -> None:
+        """Show and speak an answer; ``event`` names a spontaneous one for the journal ("" = a question)."""
+        if event and (reply or line):
+            self._journal({"event": event, "reply": reply, "line": line})
+        if event and reply:  # her own comment is part of the talk ("a co jest na końcu?" right after it)
+            self._history.append({"role": "assistant", "content": reply, "at": time.time()})
         footer = ""
         if line:
             footer = {"inserted": "W czacie – Enter wykonuje, Esc anuluje",
@@ -1291,6 +2068,32 @@ class Assistant:
                 log.info("assistant has no voice yet (assistant.voice_id or ElevenLabs missing) - text only")
             return
         voice.say(text, voice_id, "pl", float(self.cfg.get("assistant.volume", 1.0)), speaker=self.name)
+
+
+@dataclass
+class Topic:
+    """What you and she are talking about, so "a gdzie to?", "ile za niego expa?" need no name."""
+
+    kind: str  # quest | item | place
+    name: str
+    quest_id: int = 0
+    advice: Optional[Advice] = None
+    at: float = field(default_factory=time.time)
+
+
+@dataclass
+class OwnItem:
+    """An item you carry or just looted, put together from loot (stats), the bags (count) and loot lines."""
+
+    name: str
+    class_id: int
+    subclass_id: int
+    equip_loc: str
+    quality: int
+    count: int = 1
+    loot: Optional[protocol.LootItem] = None  # with stats: looted, or a wearable from the bag scan
+    bag: object = None  # wvt.bags.BagItem
+    looted_at: Optional[float] = None
 
 
 _EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF☀-➿]")

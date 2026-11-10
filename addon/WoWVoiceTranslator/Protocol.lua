@@ -36,6 +36,9 @@ P.FACTION_NONE, P.FACTION_ALLIANCE, P.FACTION_HORDE = 0, 1, 2
 P.MAX_DONE_IDS = 154 -- (MAX_BYTES - 11 - 2) / 3
 P.TYPE_LOOT = 11 -- an item somebody can roll on (assistant: need or greed)
 P.LFLAG_BOP, P.LFLAG_NEED, P.LFLAG_GREED, P.LFLAG_DE = 1, 2, 4, 8
+P.LFLAG_PICKED = 16 -- not a roll: an item the player just looted (rollID 0)
+P.LFLAG_BAG = 32 -- not a roll: a wearable item in the bags (its stats for questions; the app never comments)
+P.KIND_BAG = 26 -- TYPE_CHAT of this kind: a part of the bag contents (race = "sync:part/parts")
 P.MAX_LOOT_NAME_BYTES = 64
 P.MAX_WORN_NAME_BYTES = 40
 P.MAX_LOOT_STATS = 12

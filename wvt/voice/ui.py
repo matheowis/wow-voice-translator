@@ -110,7 +110,7 @@ class VoiceTab(QWidget):
         self.budget.setValue(int(v.get("daily_char_budget", 30000)))
         self.budget.setSuffix(" znaków/dzień (0 = bez limitu)")
         form.addRow("Limit ElevenLabs:", self.budget)
-        self.own = QCheckBox("w trybie EN moja postać powtarza moje wiadomości swoim głosem")
+        self.own = QCheckBox("moja postać powtarza moje wiadomości swoim głosem (EN po angielsku, PL po polsku)")
         self.own.setChecked(bool(v.get("speak_own_messages", True)))
         form.addRow(self.own)
         row = QHBoxLayout()

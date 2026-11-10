@@ -47,6 +47,7 @@ function CheckInteractDistance(unit, idx)
   return t ~= nil and t[idx] == true
 end
 C_ChatInfo = { CanPlayerSpeakLanguage = function(id) return mock.languages[id] ~= false end }
+function InCombatLockdown() return mock.combat == true end
 function IsShiftKeyDown() return false end
 
 -- any frame/region method the tests do not care about is a no-op
@@ -350,6 +351,13 @@ def test_say_distance_falls_back_to_ranges_and_nameplates(voice):
     pkt = voice_packet(g)
     assert pkt.distance == pytest.approx(20.0) and pkt.dist_method == P.DIST_RANGE
     driver_tick(mock, 0.3)
+    mock.combat = True  # the interaction ranges are protected in combat: not even asked
+    fire(mock, "CHAT_MSG_SAY", *say_args("in combat", "Fizz", "Player-1-GNOME"))
+    driver_tick(mock)
+    pkt = voice_packet(g)
+    assert pkt.distance == pytest.approx(35.0) and pkt.dist_method == P.DIST_NAMEPLATE
+    mock.combat = False
+    driver_tick(mock, 0.3)
     fire(mock, "CHAT_MSG_SAY", *say_args("who am I?", "Ghost", "Player-1-UNSEEN"))
     driver_tick(mock)
     pkt = voice_packet(g)
@@ -370,7 +378,7 @@ def test_party_in_polish_mode_has_no_distance(voice):
     assert pkt.distance is None and pkt.dist_method == P.DIST_NONE
 
 
-def test_own_message_is_spoken_in_english_mode_only(voice):
+def test_own_message_is_spoken_in_both_modes(voice):
     _, g, mock, add_player, slash = voice
     slash("say on")
     add_player("Player-1-ME", "Me", "NightElf", 3)
@@ -378,12 +386,14 @@ def test_own_message_is_spoken_in_english_mode_only(voice):
     driver_tick(mock)
     pkt = voice_packet(g)
     assert pkt.is_self and pkt.distance == 0 and pkt.dist_method == P.DIST_SELF and pkt.race == "NightElf"
+    assert not pkt.lang_pl
     driver_tick(mock, 0.3)  # packet expires, queue empty -> grid hidden
     assert voice_packet(g) is None
-    slash("lang pl")
+    slash("lang pl")  # Polish mode: your character repeats your line in Polish
     fire(mock, "CHAT_MSG_SAY", *say_args("Hello again!", "Me", "Player-1-ME"))
     driver_tick(mock)
-    assert voice_packet(g) is None
+    pkt = voice_packet(g)
+    assert pkt.is_self and pkt.lang_pl and pkt.text == "Hello again!"
 
 
 def test_other_faction_language_and_secret_text_are_skipped(voice):
@@ -786,3 +796,125 @@ def test_a_loot_roll_is_described_with_the_worn_item(world_addon):
     assert it.can_need and it.can_greed and not it.bop and (it.item_level, it.min_level) == (24, 19)
     assert it.stats == {"agi": 6.0, "sta": 4.0, "armor": 62.0}
     assert it.equipped == [P.WornItem(15, 2, "Rough Leather Gloves", {"agi": 1.0, "armor": 40.0})]
+
+
+LOOT_TEXT_MOCK = r"""
+LOOT_ITEM_SELF = "You receive loot: %s."
+LOOT_ITEM_SELF_MULTIPLE = "You receive loot: %sx%d."
+LOOT_ITEM_PUSHED_SELF = "You receive item: %s."
+local instant, info = C_Item.GetItemInfoInstant, C_Item.GetItemInfo
+C_Item.GetItemInfoInstant = function(link)
+  if link:find("2589") then return 2589, "Tradeskill", "Cloth", "", 1, 7, 5 end
+  return instant(link)
+end
+C_Item.GetItemInfo = function(link)
+  if link:find("2589") then return "Linen Cloth", link, 1, 5, 0 end
+  return info(link)
+end
+"""
+
+
+def test_own_loot_reaches_the_assistant_and_wearable_items_are_compared(world_addon):
+    rt, g, mock, _ = world_addon
+    rt.execute(LOOT_MOCK)
+    rt.execute(LOOT_TEXT_MOCK)
+    gloves = "|cff1eff00|Hitem:15000::::::::|h[Gloves of the Monkey]|h|r"
+    fire(mock, "CHAT_MSG_LOOT", *say_args(f"You receive loot: {gloves}.", "Me", "Player-1-ME"))
+    fire(mock, "CHAT_MSG_LOOT", *say_args("Bob receives loot: |Hitem:2589|h[Linen Cloth]|h.", "Bob", "Player-1-BOB"))
+    fire(mock, "CHAT_MSG_LOOT", *say_args("You receive loot: |cffffffff|Hitem:2589|h[Linen Cloth]|h|rx2.", "Me",
+                                          "Player-1-ME"))
+    fire(mock, "CHAT_MSG_MONEY", *say_args("You loot 5 Silver, 3 Copper", "", ""))
+    seen = _collect(g, mock, 4)
+    lines = [(p.chat_kind_name, p.text) for p in seen if p.type == P.TYPE_CHAT]
+    assert lines == [("LOOT", "You receive loot: [Gloves of the Monkey]."),
+                     ("LOOT", "You receive loot: [Linen Cloth]x2."), ("MONEY", "You loot 5 Silver, 3 Copper")]
+    assert all(p.is_self and p.no_speak for p in seen if p.type == P.TYPE_CHAT)
+    picked = [p.loot for p in seen if p.type == P.TYPE_LOOT]
+    assert len(picked) == 1  # cloth is not worn, Bob's loot is not ours
+    it = picked[0]
+    assert it.picked and it.roll_id == 0 and it.name == "Gloves of the Monkey" and it.stats["agi"] == 6.0
+    assert it.equipped == [P.WornItem(15, 2, "Rough Leather Gloves", {"agi": 1.0, "armor": 40.0})]
+
+
+def channel_args(text, sender, guid, base="Trade - City", name="2. Trade - City"):
+    # CHAT_MSG_CHANNEL payload: text, playerName, languageName, channelName, playerName2, specialFlags,
+    # zoneChannelID, channelIndex, channelBaseName, languageID, lineID, guid
+    return (text, sender, "Common", name, "", "", 0, 2, base, 7, 123, guid)
+
+
+def test_public_channels_reach_the_assistant_last_and_name_the_channel(assistant):
+    _, g, mock, _, _ = assistant
+    for i in range(14):
+        fire(mock, "CHAT_MSG_CHANNEL", *channel_args(f"WTS Linen Cloth {i}", f"Seller{i}", f"Player-1-S{i}"))
+    fire(mock, "CHAT_MSG_CHANNEL", *channel_args("LFM Deadmines need heal", "Tank", "Player-1-T",
+                                                 base="LookingForGroup", name="4. LookingForGroup"))
+    fire(mock, "CHAT_MSG_GUILD", *say_args("grats on 20!", "Kai", "Player-1-KAI"))
+    fire(mock, "CHAT_MSG_WHISPER", *say_args("inv pls", "Bob", "Player-1-BOB", 0))
+    seen = _collect(g, mock, 4)
+    chat = [p for p in seen if p.type == P.TYPE_CHAT]
+    # guild and whisper first: a busy Trade chat waits until nothing else does
+    assert [p.chat_kind_name for p in chat[:2]] == ["GUILD", "WHISPER"]
+    chan = [p for p in chat if p.chat_kind_name == "CHANNEL"]
+    assert len(chan) == 10  # only the newest lines are kept
+    assert (chan[0].race, chan[0].text) == ("Trade", "WTS Linen Cloth 5")
+    assert (chan[-1].race, chan[-1].text, chan[-1].sender) == ("LookingForGroup", "LFM Deadmines need heal", "Tank")
+    assert all(p.no_speak for p in chan) and voice_packet(g) is None
+
+
+# --------------------------------------------------------------------------- bags and NPC speech (names of the moment)
+
+BAG_MOCK = r"""
+local mock = WVT_MOCK
+mock.bag = {}
+mock.bag[1] = { itemID = 2589, stackCount = 5, hyperlink = "|cffffffff|Hitem:2589|h[Linen Cloth]|h|r" }
+mock.bag[2] = { itemID = 15000, stackCount = 1, hyperlink = "|cff1eff00|Hitem:15000::::::::|h[Gloves of the Monkey]|h|r" }
+mock.bag[3] = { itemID = 2589, stackCount = 3, hyperlink = "|cffffffff|Hitem:2589|h[Linen Cloth]|h|r" }
+C_Container = {
+  GetContainerNumSlots = function(bag) return bag == 0 and 4 or 0 end,
+  GetContainerNumFreeSlots = function(bag) return bag == 0 and 1 or 0 end,
+  GetContainerItemInfo = function(bag, slot) if bag == 0 then return mock.bag[slot] end end,
+}
+"""
+
+
+def test_the_bags_reach_the_app_with_the_stats_of_what_you_could_wear(world_addon):
+    from wvt.bags import BagBook
+
+    rt, g, mock, slash = world_addon
+    rt.execute(LOOT_MOCK)
+    rt.execute(LOOT_TEXT_MOCK)
+    rt.execute(BAG_MOCK)
+    seen = _collect(g, mock, 8)
+    book = BagBook()
+    parts = [p for p in seen if p.type == P.TYPE_CHAT and p.chat_kind == P.KIND_BAG]
+    assert parts and all(book.on_packet(p) for p in parts) and book.known
+    assert all(p.no_speak for p in parts)
+    assert [(i.item_id, i.name, i.count, i.class_id) for i in book.items] == [
+        (2589, "Linen Cloth", 8, 7), (15000, "Gloves of the Monkey", 1, 4)]
+    assert book.items[1].equip_loc == "INVTYPE_HAND" and book.items[1].quality == 2
+    worn = [p.loot for p in seen if p.type == P.TYPE_LOOT]
+    assert len(worn) == 1 and worn[0].from_bag and not worn[0].picked and worn[0].name == "Gloves of the Monkey"
+    assert worn[0].equipped[0].name == "Rough Leather Gloves" and worn[0].stats["agi"] == 6.0
+    # the cloth is sold: the new contents go again, the gloves' stats do not
+    rt.execute("WVT_MOCK.bag[1] = nil; WVT_MOCK.bag[3] = nil")
+    fire(mock, "BAG_UPDATE_DELAYED")
+    again = _collect(g, mock, 4)
+    book = BagBook()
+    for p in again:
+        if p.type == P.TYPE_CHAT and p.chat_kind == P.KIND_BAG:
+            book.on_packet(p)
+    assert [i.name for i in book.items] == ["Gloves of the Monkey"]
+    assert not [p for p in again if p.type == P.TYPE_LOOT]
+    slash("questy")
+    assert "w torbach 1 rzeczy" in str(list(mock.prints.values())[-1])
+
+
+def test_npc_speech_reaches_the_app_after_everything_else(assistant):
+    _, g, mock, _, _ = assistant
+    fire(mock, "CHAT_MSG_MONSTER_SAY", "Ask Innkeeper Belm for a mug.", "Ragnar Thunderbrew", "Common", "", "", "",
+         0, 0, "", 7, 124, "Creature-0-1-2-3-1267-0000")
+    fire(mock, "CHAT_MSG_WHISPER", *say_args("inv pls", "Bob", "Player-1-BOB", 0))
+    chat = [p for p in _collect(g, mock, 2) if p.type == P.TYPE_CHAT]
+    assert [p.chat_kind_name for p in chat] == ["WHISPER", "MONSTER_SAY"]
+    npc = chat[1]
+    assert (npc.sender, npc.text) == ("Ragnar Thunderbrew", "Ask Innkeeper Belm for a mug.") and npc.no_speak

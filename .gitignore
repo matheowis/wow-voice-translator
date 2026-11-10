@@ -17,3 +17,8 @@ tests/audio/
 
 # local voice data: ElevenLabs voice ids of your account, player assignments, usage counts
 /data/
+
+# your own recordings and video editing (gigabytes, never in the repo)
+/youtube/
+*.mkv
+*.mp4

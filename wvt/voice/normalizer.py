@@ -89,9 +89,10 @@ class TTSNormalizer:
         self.cache = LRU(int(cfg.get("cache_size", 500)))
 
     # ------------------------------------------------------------------ public
-    def respell_pl(self, text: str) -> str:
-        """Polish voice mode: game anglicisms spelled as Polish players say them (pulluj -> puluj)."""
-        out = self._clean(text)
+    def respell_pl(self, text: str, max_chars: Optional[int] = None) -> str:
+        """Polish voice mode: game anglicisms spelled as Polish players say them (pulluj -> puluj).
+        ``max_chars``: the assistant's own limit (her answers run longer than chat lines)."""
+        out = self._clean(text, max_chars)
         for pattern, spoken in self.rules["pl_respell"]:
             out = pattern.sub(lambda m: spoken.capitalize() if m.group(0)[0].isupper() else spoken, out)
         return out
@@ -146,12 +147,13 @@ class TTSNormalizer:
         return out, out != text, ambiguous
 
     # ------------------------------------------------------------------ internals
-    def _clean(self, text: str) -> str:
+    def _clean(self, text: str, max_chars: Optional[int] = None) -> str:
         t = _URL_RE.sub("link", text or "")
         t = _BRACKETS_RE.sub("", t)
         t = " ".join(t.split())
-        if len(t) > self.max_chars:
-            cut = t[: self.max_chars]
+        limit = int(max_chars or self.max_chars)
+        if len(t) > limit:
+            cut = t[:limit]
             t = cut[: cut.rfind(" ")] if " " in cut[40:] else cut
         return t
 

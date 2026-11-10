@@ -20,8 +20,8 @@ Można dodać kolejne kanały (raid, guild, instance, yell, reply) albo boczne p
 ```
  ┌──────────── Twój PC (wszystko lokalnie) ─────────────────────────────────────────┐
  │                                                                                    │
- │  [Caps Lock]──► mikrofon ──► Parakeet TDT 0.6B v3 ──► LLM (llama.cpp, GPU) ──┐     │
- │   (hook LL)      (RAM)        STT, polski              PL → EN               │     │
+ │  [Caps Lock]──► mikrofon ──► Whisper v3-turbo (GPU) ► LLM (llama.cpp, GPU) ──┐     │
+ │   (hook LL)      (RAM)        STT, polski + nazwy      PL → EN               │     │
  │                                                                              ▼     │
  │                         schowek + klawisz „/” + Ctrl+V ──► pole czatu WoW: /p …    │
  │                                                       (Ty naciskasz Enter)         │
@@ -89,6 +89,31 @@ Zwykłe polskie zdania wychodzą bezbłędnie; WER podbijają angielskie nazwy c
 
 **Cała ścieżka push‑to‑talk** (w grze, 7.11.2026): puszczenie klawisza → tekst w polu czatu 0,56–0,82 s, z czego STT ~0,1 s, tłumaczenie ~0,2 s, a wklejenie do czatu ~0,3 s (opóźnienia między klawiszami, `insert.key_delay_ms`). Krótkie wiadomości ze słownika slangu (np. samo „ty”, „mb”, „wc”) tłumaczą się natychmiast, bez modelu.
 
+**STT od 9.11.2026: Whisper large-v3-turbo** (`onnx-community/whisper-large-v3-turbo`, MIT, fp16 na CUDA przez onnx-asr, `language="pl"` przy każdym wywołaniu). Pomiar na 88 prawdziwych nagraniach użytkownika z mikrofonu RØDE PodMic (mowa potoczna, do 30 s, ta sama obróbka co w aplikacji: wzmocnienie, przycięcie ciszy; wzorzec: transkrypcje ElevenLabs Scribe, bez „yy”):
+
+| Model | Błędne słowa | Czas (mediana; krótkie kwestie) | Pamięć |
+|---|---|---|---|
+| **Whisper large-v3-turbo fp16, CUDA** (domyślny) | **11,1%** | 0,23 s; 0,09 s | ~2,5 GB VRAM |
+| Parakeet TDT 0.6B v3 fp32, CUDA (poprzedni) | 12,4% | – (pomiar zaburzony przez działającą aplikację) | ~3,7 GB VRAM |
+| Parakeet int8, CPU (zapas) | 18,1% | 0,56 s; 0,18 s | 1,2 GB RAM |
+
+Wcześniejszy pomiar w projekcie Gothica na 85 nagraniach dał 10,4% / 12,0% / 17,5%, więc wyniki się zgadzają. Modele dotrenowane na polskim (FastConformer NVIDII 33,7%, Parakeet od OpenVoiceOS 14,3%) i Canary-1B-v2 (15,5%) przegrały, bo uczono je na czytanym tekście. Whisper na CPU potrzebuje ~10 s na kwestię, więc na procesorze zawsze działa Parakeet. Kolejność prób (`wvt/stt.py`):
+1. Whisper fp16 na GPU, gdy po załadowaniu LLM zostaje `gpu_need_mb` (2600) + `vram_reserve_mb` (2500) wolnej pamięci.
+2. Parakeet na GPU, gdy nie ma plików Whispera, a jest miejsce (3800 + 2500).
+3. Parakeet int8 na CPU.
+
+Po załadowaniu na GPU aplikacja sprawdza, że sesje onnxruntime naprawdę mają `CUDAExecutionProvider`, bo onnxruntime po cichu liczyłby na CPU. Wynik Whispera składający się tylko z typowej halucynacji („Dziękuję.”, „Dziękuję za uwagę.”, „Napisy stworzone przez społeczność Amara.org”, „Thanks for watching!”…, `stt.drop_phrases`) jest odrzucany: Whisper pisze je na oddech albo szum. Uwaga: samo „Dziękuję.” albo „Do zobaczenia.” też odpadnie, więc lepiej mówić „dzięki” czy „na razie” albo usunąć te frazy z listy. Whisper pisze liczby cyframi („100 sztuk złota”), co tłumaczenie i reguły asystentki obsługują.
+
+**Wspólny STT dla innych programów** (`wvt/stt_server.py`, `stt.server_port`, domyślnie 39283). Usługa mowy Gothica (`gothic2_openDialog/voicechat`) pyta `http://127.0.0.1:39283/health` i gdy dostanie `ok`, wysyła nagrania tutaj zamiast ładować drugiego Whispera (dwie kopie to ~5 GB VRAM). `GET /health` → `{"ok", "model", "device"}`, przy czym `ok` jest prawdą dopiero po załadowaniu. `POST /stt` z WAV PCM 16-bit mono 16 kHz (przyciętym i wzmocnionym przez wołającego, bez naszego progu ciszy) → `{"text", "ms"}`, błędy 4xx/5xx `{"error"}`. Usługa słucha tylko na 127.0.0.1 i przyjmuje tylko zapytania z nagłówkiem Host 127.0.0.1/localhost (ochrona przed DNS rebinding). Port jest na wyłączność (`SO_EXCLUSIVEADDRUSE`): domyślne `SO_REUSEADDR` serwera HTTP Pythona pozwalało na Windows zająć ten sam port drugiemu programowi, co wyłapał test. Rozpoznania idą po jednym, pod tym samym zamkiem co push-to-talk, więc wołanie z Gothica zajmuje klawisze WoW najwyżej na jedną kwestię (~0,2 s). Nic o nagraniach ani tekście nie trafia do logu. Opcjonalne `?prompt=<tekst w URL-encoding>` przekazuje Whisperowi nazwy, które ma pisać poprawnie (np. imiona postaci, z którymi gracz rozmawia), najważniejsze na końcu, z tą samą ochroną przed zmyślaniem co w aplikacji (niżej).
+
+**Asystentka na Gemini** (`assistant.llm: "gemini"`, `wvt/gemini.py`, klucz `GOOGLE_AI_API_KEY` w `.env`). Tylko Iskra rozmawia przez Google Gemini 3.8 Flash (`gemini-3.8-flash`, stabilny od 2.09.2026), a tłumaczenia czatu, głosy i budowanie bazy zostają na lokalnym modelu. Zapytania idą przez REST `generateContent` bez SDK:
+- myślenie na `low`, najniższym poziomie, bo 3.8 Flash nie pozwala go wyłączyć;
+- bez temperatury, bo Gemini 3.6+ ją ignoruje i ma zacząć zwracać błąd 400;
+- duży `maxOutputTokens`, bo limit obejmuje też tokeny myślenia;
+- klucz w nagłówku `x-goog-api-key`, nigdy w adresie i nigdy w logu.
+
+Pomiar 9.11 (prompty Iskry): rozmowa 3,1 s, odpowiedź z bazy 2,8 s, streszczenie czatu 2,2 s, 0 tokenów myślenia. Model lokalny odpowiada w 0,3–0,8 s, ale wyraźnie słabiej. Każdy błąd Gemini (limit, brak sieci, zły klucz, pusta odpowiedź) kosztuje tylko tę jedną odpowiedź, którą wtedy daje lokalny model. Po limicie (429) Gemini odpoczywa minutę, po wyczerpaniu dziennego limitu godzinę, a po złym kluczu, braku środków albo braku dostępu 30 minut. Cena (płatny klucz, do 31.12.2026): 0,75 USD za 1 mln tokenów wejścia i 3,75 USD za 1 mln wyjścia. Darmowy klucz ma podobno ok. 20 zapytań dziennie, a Google może używać tych danych do ulepszania swoich produktów.
+
 **VRAM łącznie**: pulpit/przeglądarka ~4,1 GB + LLM 3,8 GB + Parakeet na GPU 3,7 GB ≈ 11,6 GB; WoW Forever zużywał w teście ok. 2,7 GB → ~14,3 z 16 GB. Dlatego `stt.device: "auto"` stawia STT na GPU tylko wtedy, gdy po załadowaniu LLM zostaje ≥ 6,3 GB wolnej pamięci (3,8 GB na STT + 2,5 GB zapasu dla gry); inaczej używa CPU int8 (+80 ms, 0 VRAM).
 
 **Czas startu** (pomiary z `logs/wvt.log`): model tłumaczący 13–43 s, gdy plik jest w pamięci podręcznej Windows, i 153 s przy pierwszym starcie z dysku USB pracującego w trybie USB 2.0 (~35 MB/s); rozpoznawanie mowy na GPU 70–86 s. Ładowanie jest raz na uruchomienie aplikacji – potem modele zostają w pamięci, dopóki aplikacja działa w tle.
@@ -149,7 +174,7 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
 - **Runda 3, nauczona na Twoich ocenach.** Głosy z oceną 1–3 dostały ręcznie napisane postacie (`wvt/voice/briefs.py`): nieumarli z rozdartym, cierpiącym gardłem, elfy w wieku ok. 25 lat, gnomy bystre zamiast piszczących („smerf”), mężczyźni zawsze z podanym wiekiem i rejestrem. Zniknęły słowa, które psuły głosy: „nosowy” (każda rasa brzmiała jak gnom), „oddechowy” i „młody” u mężczyzn (wychodziła kobieta albo dziecko), „eteryczny/echo” (dziwny dźwięk). Każdy podgląd ocenia sędzia (`wvt/voice/judge.py`): płeć słyszalną w głosie (środek głosów ocenionych na 4–5, mężczyźni kontra kobiety; na rundzie 2 sam wskazał wszystkie głosy opisane jako „baba”, „dziewczyna?” czy „facet”), wyraźność (Parakeet przepisuje kwestię, za wysoki WER odpada), dopasowanie do rasy (bliżej dobrych głosów tej rasy niż innych ras) i odmienność w puli.
 - **Runda 4: piątka jest ostateczna, reszta dostaje kandydatów.** Ocena 5 zamyka głos (`locked` w `voice_profiles`, obok ostatniej oceny `rating`) i `wvt.voice.design` już go nie ruszy, nawet z `--replace` czy `--only`. Postać (rasa + płeć) z pięcioma zamkniętymi głosami jest zamknięta. Pule, w których jakiś głos ma ocenę 1–4, dostają kandydatów: `python -m wvt.voice.candidates make --samples-dir <folder z próbkami>` tworzy po jednym głosie na każdą postać z `CANDIDATE_BRIEFS` (`wvt/voice/briefs.py`). Każdy podgląd sprawdza ten sam sędzia, a głosy mają się różnić od zamkniętych głosów puli i od siebie nawzajem. Kandydata nie słychać w grze, dopóki nie wygra miejsca. `python -m wvt.voice.candidates apply --ratings <eksport ocen>` zapisuje oceny, zamyka piątki i wstawia najlepiej ocenionych kandydatów na otwarte miejsca: najpierw tam, gdzie ocena jest najniższa, i tylko gdy kandydat ma wyższą ocenę niż głos, który zastępuje. Kandydat z piątką od razu się zamyka, a postacie graczy z wymienionego głosu przechodzą na nowy. `python -m wvt.voice.candidates status` pokazuje stan wszystkich pul, a lista kandydatów jest w `data/voice_candidates.json`. Wnioski z ocen kobiet w rundzie 3: wiek 60+ oraz barwy chrapliwe, popękane, „żwirowe”, nosowe i śpiewne wychodziły dziwnie i nienaturalnie. Wszystkie kobiety z piątką to dorosłe (25–45 lat) o czystym, naturalnym głosie, z charakterem w akcencie, tempie i nastawieniu. Wysokość głosu (F0) nie odróżnia głosów lubianych od nielubianych.
 - MongoDB, baza `wow_voice_translator`: `voice_profiles` (unikalne rasa + płeć + slot oraz `voiceId`) i `player_voices` (unikalne realm + nazwa). Przypisanie: istniejące → slot wybrany deterministycznie z SHA‑256 (`realm|nazwa|rasa|płeć`) → zapis atomowy (`$setOnInsert`). Postać przypisana przy nieznanej rasie/płci jest raz przenoszona do właściwej puli, chyba że ma `manuallyOverridden: true`. Ręczna zmiana: w `player_voices` ustaw `voiceId` i `manuallyOverridden: true`. Bez MongoDB to samo trafia do plików w `data/` (poza repozytorium).
-- Treść czatu nie jest nigdzie zapisywana (chyba że włączysz `privacy.log_texts`).
+- Treść czatu nie jest nigdzie zapisywana (chyba że włączysz `privacy.log_texts`; `privacy.log_assistant` zapisuje tylko Twoje pytania do asystentki i jej odpowiedzi).
 
 - **Runda 5.** Pula „nieznana rasa” zniknęła (prośba z 8.11): postać, której rasy gra nie poda, mówi głosem z puli `voice.unknown_race_pool` (domyślnie Human) swojej płci i raz przechodzi do puli swojej rasy, gdy rasa się wyjaśni. Kandydaci dla otwartych miejsc Hordy i Skyborne: trollice opisane wyglądem („tall, lanky jungle troll woman with tusks”) i z kwestiami bez wypisanego dialektu, jak zostawiona matrona; nieumarli (prośba: „zombi, rozjebany głos, trochę zza światów”) z gnijącym, bulgoczącym gardłem, a część z pustym, grobowym pogłosem – tylko u nich dozwolonym. `python -m wvt.voice.candidates prune` odrzuca kandydatów, którzy brzmią jak zamknięty głos swojej puli (podobieństwo ≥ 0,72) albo jak inny kandydat (≥ 0,78; odpada ten bardziej „środkowy”), a kandydaci zamkniętych postaci, których nie oceniłeś, dostają status `unused`.
 
@@ -162,7 +187,7 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
 
 ## Asystentka głosowa (`wvt/assistant.py`)
 
-- Osobny kanał push-to-talk `assistant` (domyślnie mysz 5; starsze `config.json` dostają ten klawisz raz, przy starcie). Nagranie → Parakeet → polski tekst trafia do asystentki zamiast do tłumacza.
+- Osobny kanał push-to-talk `assistant` (domyślnie mysz 5; starsze `config.json` dostają ten klawisz raz, przy starcie). Nagranie → Whisper (z podpowiedzią nazw chwili) → polski tekst z poprawionymi nazwami trafia do asystentki zamiast do tłumacza.
 - **Polecenia rozpoznają reguły** na polskim tekście bez ogonków (`parse_intent`): zaproś ich / zaproś X / wyrzuć X / daj lidera X / zrób raid / opuść grupę / ready check / kto chce inv / co mi napisał / odpisz mu że… / napisz na party że… / streść czat / ile mam złota / ile do levelu / gdzie jestem / ile miejsca w torbach / kto jest w party / wycisz–włącz głosy / przełącz na polski–angielski / cicho / co umiesz. Reguły wymagają sensu polecenia, nie samego słowa: „czy mogę zrobić Deadmines na 18 levelu?” to zwykła rozmowa, nie pytanie o doświadczenie. Imiona usłyszane po polsku („Artasa”, „Jainie”, „Bolkowi”) są dopasowywane fonetycznie, po odcięciu końcówek przypadków, do imion z czatu i z grupy (`match_name`).
 - **Prośby o zaproszenie** (`is_invite_request`): „inv”, „inv me/pls”, „can I get an invite”, „inv to party” na /say i /yell, a w szepcie także „+” i „1”; ważne 5 minut (`assistant.invite_window_s`). Zaprasza tylko tyle osób, ile mieści się w party (resztę wymienia), pomija członków grupy i już zaproszonych.
 - **Akcje** to zawsze jedna linia w polu czatu, wykonywana Twoim Enterem: `/wvt inv A B`, `/wvt kick A`, `/wvt lead A`, `/wvt raid`, `/wvt leave`, `/wvt ready`, `/w Imię …`, `/p …`, `/wvt lang pl`, `/wvt say off`… Addon woła zwykłe API grupy (`C_PartyInfo.InviteUnit` itd.). W WoW Forever (zasady Midnight) wyrzucanie, lider, raid i ready check mają flagę `HasRestrictions`: w walce, podczas bossa, w M+ i meczu PvP addon ich nie wykona – sprawdza `C_RestrictedActions.IsAddOnRestrictionActive` i mówi to po polsku. Zapraszanie (`InviteUnit`) takich ograniczeń nie ma.
@@ -198,7 +223,84 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
   - „przy aukcji”/„AH” – stolice oraz Booty Bay, Gadgetzan i Everlook.
   Notatki („zanotuj…”) zostają, aż je odhaczysz („usuń notatkę o mieczu” usuwa notatki zawierające „miecz…”, „zrobione” – wszystkie). Notatka wspominająca AH, sprzedaż, wystawianie albo konkretne miasto przypomina się tam najwyżej co 30 minut.
 - **Charakter** (`PERSONA`, `STYLE_SHOTS`, `EVENT_SHOTS`). Opis postaci plus przykłady stylu, bo mały model naśladuje przykłady lepiej niż opis. Bez listy przekleństw, z prośbą o różne początki zdań: pierwsza wersja z „kurde” w opisie dawała „kurde” w prawie każdym zdaniu. Komentarze do zdarzeń pisze model z faktów (`_persona_line`). Jeśli w tekście pojawi się liczba spoza faktów, zostaje zwykły, sprawdzony szablon. Przy awansie nazwy nowych umiejętności są dopisywane, gdy model je pominie. Proste odpowiedzi szablonowe mają kilka wersji do losowania (`_v`). `assistant.flavor: false` wyłącza losowanie i model w komentarzach, czego używają testy.
+- **Kanały czatu dla asystentki** (zgłoszenie 9.11: „Iskra nie ma dostępu do czatu”). Do 9.11 dodatek przekazywał jej tylko /say, /yell, szepty, party i raid, więc w mieście, gdzie wszystko dzieje się na Trade i General, mówiła „cisza na czacie”. Teraz dochodzą raid warning, gildia, oficerowie, czat instancji i kanały publiczne (`CHAT_MSG_CHANNEL`). Kanał publiczny ma w pakiecie `TYPE_CHAT` swoją krótką nazwę w polu rasy („2. Trade - City” → „Trade”), bo linii, której nikt nie czyta na głos, rasa niepotrzebna. Kanały publiczne idą osobną kolejką (najnowsze 10) i dopiero wtedy, gdy nie czeka nic innego: linie do przeczytania, czat, stan, łup, pozycja i questy mają pierwszeństwo, więc zatłoczony Trade niczego nie zatrzyma. W aplikacji kanały i łup mają własne bufory (200 i 120 linii), więc nie wypychają szeptów i próśb o inv. „Co piszą na trade / na gildii / kto szuka grupy?” streszcza wybrany kanał; „kto szuka grupy” bierze LookingForGroup i ogłoszenia „LFM/LFG/need heal” z innych kanałów.
+- **Twój łup** (zgłoszenie 9.11: „nie wie, co podnoszę”). `CHAT_MSG_LOOT` i `CHAT_MSG_MONEY` idą jako `TYPE_CHAT` rodzaju LOOT (24) i MONEY (25). Własny łup rozpoznaje początek linii wzięty z napisów klienta (`LOOT_ITEM_SELF` „You receive loot: ” i pokrewne), więc działa w każdym języku klienta, a cudzy łup w grupie jest pomijany. Przedmiot do założenia (jakość od „common”) idzie dodatkowo jako `TYPE_LOOT` z flagą `LFLAG_PICKED` (16, numer losowania 0) razem z tym, co nosisz w tym slocie. Iskra porównuje go tymi samymi wagami co need/greed i odzywa się tylko przy ulepszeniu („Nowy łup: … Lepsze niż …: plus 5 zręczności. Załóż.”, `assistant.loot_tips`). „Co mi wpadło?” zlicza łup i pieniądze z ostatnich 15 minut.
+- **Przedmioty** (zgłoszenie 9.11: Rhapsody Malt). Dane świata miały sprzedawców i dropy przedmiotów z questów, ale pytanie trafiało do dziennika („gdzie znajdę…”) albo do swobodnej rozmowy („gdzie kupić…”), a model odpowiadał mgliście. Teraz pytanie z „gdzie / skąd / kto sprzedaje / kupić / wypada…” i nazwą przedmiotu (dokładnie albo w przybliżeniu, np. „rapsody malt”) dostaje odpowiedź z danych: najbliższy sprzedawca przyjaznej frakcji, potem inni, moby z poziomem albo skrzynie i quest, do którego przedmiot jest potrzebny, a Enter stawia znacznik. Zdublowane nazwy questów (wersje dla frakcji) padają raz. Wyszukiwanie trwa 3–8 ms, a przy pytaniach bez przedmiotu 40–65 ms (dopasowanie przybliżone po 5,5 tys. nazwach).
+- **Dłuższe odpowiedzi** (zgłoszenie 9.11: „mało wylewna”). Opis postaci mówi teraz „zwykle dwa, trzy zdania, a przy pytaniach o grę konkrety (nazwy, miejsca, poziomy)”, odpowiedzi z bazy mają „dwa do czterech zdań: kto, gdzie, na jakim poziomie, co zrobić” i limit `assistant.max_knowledge_chars` (480 znaków) zamiast 240, a streszczenia czatu dwa, trzy zdania.
+- **Dziennik rozmów z asystentką** (`privacy.log_assistant`, plik `assistant.log_file`). Każde pytanie to jedna linia JSON: czas, co usłyszała, rozpoznane polecenie (np. `summary:trade`), odpowiedź, linia do czatu, źródła (strony bazy, „item: Rhapsody Malt”, liczba linii czatu), czas odpowiedzi, strefa i poziom. Komentarze i ostrzeżenia, które mówi sama, mają pole `event`. Służy do poprawiania złych odpowiedzi; domyślnie wyłączony.
+- **Własna wiadomość w trybie PL.** Do 9.11 Twoja postać w trybie PL milczała. Przy testach na sobie wyglądało to na awarię, więc teraz powtarza Twoją linię po polsku. Tłumacz pamięta polski oryginał tego, co powiedziałeś klawiszem (`Translator.remember`), więc to Twoje słowa i bez dodatkowego wywołania modelu. Wpisany ręcznie angielski tekst jest tłumaczony zwykłą drogą. Wyłącza to ten sam przełącznik, co w trybie EN (`voice.speak_own_messages`).
 - **Wzmocnienie mikrofonu** (`audio.input_gain`). Przed wykryciem mowy działa stałe wzmocnienie `audio.input_gain_db`, a gdy `audio.auto_gain` jest włączone, także automatyczne. Automat podnosi najgłośniejsze ramki (95. percentyl RMS) do 0,05, najwyżej o 30 dB, ale tak, żeby szum (10. percentyl) nie przekroczył połowy progu ciszy, więc cisza zostaje ciszą. Po przycięciu ciszy normalizacja doprowadza mowę do RMS 0,08 (najwyżej ×16), a zamiast twardego obcinania działa miękki limiter (tanh powyżej 0,9). Log zapisuje dla każdej wypowiedzi poziom w dBFS i zastosowane wzmocnienie. RØDE PodMic USB z bramką szumów miał podłogę szumu −97 dBFS, więc wzmacnianie nic tu nie kosztuje.
+- **Nazwy z gry, które teraz się liczą** (`wvt/lexicon.py`; zgłoszenie 9.11: „często pytam o questa, a STT źle łapie nazwę”). `Lexicon` składa na żądanie, najwyżej co 2 s, listę nazw z tego, co i tak przychodzi z dodatku, i z danych świata. Każda nazwa ma rodzaj (quest, NPC, potwór, przedmiot, miejsce, gracz, słowo), źródło, wagę i krótki polski opis. Źródła:
+  - questy z dziennika (waga 1,0), z celami i opisem z QuestieDB;
+  - NPC, którzy dają i przyjmują te questy (0,8), oraz przedmioty i potwory z ich celów (0,85);
+  - strefa i podstrefa (0,9);
+  - grupa (0,95), szepty (0,85), party, gildia i say (0,6–0,8), kanały publiczne (0,35); waga maleje o połowę co 10 minut;
+  - NPC, którzy właśnie mówili, i znane nazwy z ich kwestii (0,75);
+  - łupy (0,85, połowa po 30 min) i torby (0,7, szare śmieci 0,4);
+  - NPC i potwory w promieniu 300 jardów, najbliższe pierwsze (najwyżej 30, waga rośnie z bliskością);
+  - Twoje słowa z `data/slownik.txt` (1,0);
+  - stały zestaw słów graczy: quest, questa, heal, tank, priv, inv…
+
+  Nazwy są użyte na cztery sposoby:
+  1. **Podpowiedź dla Whispera.** 60 najważniejszych nazw z wiodącym „Rozmowa w World of Warcraft.”, najważniejsze na końcu, najbliżej mowy. Trafia jako tokeny „poprzedniego tekstu” (`<|startofprev|>` przed `<|startoftranscript|>`). onnx-asr tego nie umie, więc `install_whisper_prompting` podmienia `recognize_batch` modelu na wersję z `prompt_ids` i `max_new_tokens`. Tokeny liczy `tokenizer.json` modelu (pakiet `tokenizers`, już w `.venv`), przycięte do `stt.prompt_max_tokens` (200) od początku. Parakeet podpowiedzi nie dostaje.
+  2. **Poprawianie po brzmieniu.** `sound_key` sprowadza polską i angielską pisownię do jednego klucza:
+     - polskie litery i dwuznaki: sz/sh, cz/ch, rz/ż, w/v/ł;
+     - angielskie zbitki: th→t, ph→f, ee/ea→i, eye/aj→ei, cu+samogłoska→kw („Cuesta”=„questa”);
+     - nieme gn/kn na początku i ubezdźwięcznienie na końcu.
+
+     Nazwy dostają też drugi klucz w czytaniu angielskim (kh→k, ch→cz, j→dż), bo „Kharanos” Polak powie „Karanos”. Fragmenty do 5 słów (bez przechodzenia przez interpunkcję) są porównywane z kandydatami z indeksu bigramów: podobieństwo to średnia z całego klucza i samych spółgłosek (`difflib`), a polskie końcówki są odcinane („Grelina Whitebearda”). Progi zależą od długości klucza: do 4 znaków tylko dokładnie, 5–7 znaków 0,86, 8–11 znaków 0,80, dłuższe 0,76. Fragment pisany małą literą, albo wielką tylko dlatego, że zaczyna zdanie, musi mieć co najmniej 0,92. Linie wysyłane na czat (`strict`) potrzebują o 0,04 więcej niż pytania do Iskry. Częste polskie słowa nigdy nie są poprawiane („kwestia” to nie „questy”).
+  3. **Mały indeks wektorowy.** Gdy Iskra rozmawia przez Gemini, wektory liczy Google (`gemini-embedding-2`, `wvt/gemini.py: GeminiEmbedder`). Zadanie jest zapisane w tekście: `task: search result | query: …` dla pytania i `title: … | text: …` dla nazwy. Każda nazwa jest liczona raz, a pytanie i nowe nazwy idą jednym zapytaniem, ok. 350 ms. Bez klucza, bez sieci albo po limicie działa lokalny e5-small z bazy wiedzy, a Google ma przerwę jak przy rozmowie (`REST_AFTER`).
+
+     Pomiar 10.11 na 76 nazwach z gry w Dun Morogh (12 questów, 13 rzeczy w torbach, ludzie, NPC):
+
+     | model | rzecz trafiona pierwsza | quest trafiony pierwszy | pogawędka a dobra odpowiedź |
+     |---|---|---|---|
+     | multilingual-e5-small | 8 z 12 (MRR 0,76) | 5 z 10 (MRR 0,65) | 0,82 wobec 0,83: żaden próg nie działa |
+     | gemini-embedding-2 | 11 z 12 (MRR 0,96) | 10 z 10 (MRR 1,00) | 0,61 wobec 0,72–0,76: jeden próg rozdziela wszystko |
+     | gemini-embedding-001 | 12 z 12 | 10 z 10 | 0,60 wobec 0,71–0,74 |
+
+     Pytania testowe to 12 polskich opisów rzeczy („co to za ząb?”, „ta peleryna z koziego futra”), 10 opisów questów („quest z trollami”, „podmienić beczkę w browarze”) i 8 zdań pogawędki. Najsłabsza dobra odpowiedź Google miała 0,674 (rzeczy) i 0,708 (questy), a najmocniejsza pogawędka 0,628 i 0,659, stąd progi `lexicon.item_min` 0,65 i `lexicon.quest_min` 0,69. Na wynikach działa tylko Google (`Lexicon.trusted`): opis rzeczy bez nazwy i rodzaju, quest po opisie („ten quest z narzędziami” → Tools for Steelgrill, 0,80), „ile mam materiału?” i podpowiedź dla modelu („Pytanie pasuje do: …”). Przy e5 wektory tylko rozstrzygają remisy po rodzaju przedmiotu i świeżości łupu. Każda nazwa pamięta wszystkie swoje źródła („Crag Boar Rib”: cel questa i torby), więc szukanie wśród Twoich rzeczy widzi też rzeczy do questów.
+  4. **Modele językowe.** Tłumacz dostaje w poleceniu do 20 nazw, najpierw te z wypowiedzi, z prośbą, żeby pisał je dokładnie tak, nawet źle usłyszane albo z polską końcówką, i żadnej nie dodawał. Iskra dostaje krótki obraz gry (`facts`): questy z niespełnionymi celami, NPC w pobliżu, łupy, zawartość toreb i ludzi. Rozmowę i odpowiedzi z bazy wiedzy (także przez Gemini) prowadzi z tym obrazem.
+
+  **Pomiar** 9.11, RTX 5080, fp16. Materiał: 28 polskich zdań z nazwami z Dun Morogh, przeczytanych dwoma głosami ElevenLabs (56 nagrań, 82 nazwy), oraz 96 nagrań z Gothica (do 30 s, wzorzec ElevenLabs Scribe) jako zwykła mowa bez nazw z WoW. Kontekst: 49 nazw plus 16 słów graczy.
+
+  | | nazwy dobrze (z 82) | błędne słowa, notatki z Gothica | czas |
+  |---|---|---|---|
+  | sam Whisper | 52 (63%) | 11,1% | 86 ms |
+  | Whisper + poprawianie | 82 (100%) | | |
+  | Whisper z podpowiedzią | 64 (78%) | | 91 ms |
+  | z podpowiedzią + poprawianie | 81 (99%) | 10,4% (`strict`) | |
+
+  Inne formy podpowiedzi (sama lista, lista pogrupowana na questy, postacie i miejsca) dały 62–63 nazwy. Poprawianie trwa ok. 11 ms na zdanie. Na 113 notatkach z Gothica (4 697 słów) i 9 podchwytliwych zdaniach („Siedzę na tarasie”, „Mam kwestię”, „Ragnarok to dobry film”) nic nie zostało błędnie poprawione.
+
+  **Ochrona przed zmyślaniem.** Na ciszy i szumie Whisper z podpowiedzią recytuje podpowiedź: „Tannok Frosthammer, Tannok Frosthammer…”, „D-Fatty, D-Fatty…”. Bez podpowiedzi pisze „Dziękuję.”, co odrzucała już lista halucynacji. Teraz:
+  - długość wyniku jest ograniczona do 16 + 10 tokenów na sekundę nagrania;
+  - wynik, który powtarza frazę trzy razy z rzędu, ma więcej niż 6 + 6 słów na sekundę albo składa się głównie z nazw podpowiedzi, jest rozpoznawany jeszcze raz bez podpowiedzi;
+  - wynik bez żadnego słowa dłuższego niż litera („D-”) jest odrzucany.
+
+  W pomiarze cisza i szum dały pusty wynik, a w zwykłej mowie ponownego rozpoznania nie było ani razu.
+- **Temat rozmowy i jej przebieg** (prośba 10.11: „możliwe, że o jednym queście będziemy dłużej rozmawiać”).
+  - Każde pytanie i odpowiedź (także jej komentarze, np. po wzięciu questa) trafiają do historii, ostatnie 8 wiadomości z 15 minut. Model dostaje ją przy rozmowie, odpowiedziach z bazy wiedzy, pytaniach o quest i planie, a po 15 minutach ciszy historia znika.
+  - Temat to quest, przedmiot albo miejsce, o którym była ostatnia odpowiedź.
+  - Pytanie bez nazwy, ale z „go/to/ten/tam/niego…” albo zaczynające się od „a…” („a gdzie go oddać?”, „a ile za niego expa?”, „o co w nim chodzi?”) dotyczy tematu. Wcześniej sprawdzane jest, czy pytanie nie nazywa albo nie opisuje innego questa („ten quest z narzędziami”).
+  - Przy temacie-queście model dostaje wszystko o nim: cele, znacznik, opis z QuestieDB, kto daje i gdzie się oddaje, ocenę z `quest_tips` i questy łańcucha po kolei.
+- **Co teraz robić** (`wvt/planner.py`; prośba 10.11: „przemyśleć, gdzie mam najbliżej, w jakiej kolejności, quest chain, co ważne, czy czegoś nie odpuścić”).
+  - Kroki to questy do oddania (znacznik gry albo NPC, który je odbiera), cele otwartych questów (znacznik następnego celu) i do trzech questodawców w promieniu 900 jardów z questami, które możesz wziąć.
+  - Każdy quest dostaje ocenę `quest_tips.assess`: XP jako część poziomu, miejsce w łańcuchu i XP do końca, nagroda do założenia, dungeon, elity.
+  - Trasa jest zachłanna, od najbliższego. Odległość oddania liczy się ×0,6, bo płaci od razu i otwiera dalszy łańcuch, questa ocenionego „warto” ×0,8, a questodawcy ×0,9. Najwyżej 5 kroków.
+  - „Odpuść” trafia do osobnej listy: quest z oceną „szkoda czasu” (szary, poniżej kilku procent poziomu, nic na końcu) albo quest na grupę, gdy grasz solo. Questy na innych mapach idą do listy „na później”.
+  - Plan idzie do modelu z poleceniem: 3–4 zdania, kolejność i fakty tylko z planu, na koniec, co odpuścić. W teście Gemini 4 razy na 4 pominęło zdanie o odpuszczaniu, więc gdy brakuje go w odpowiedzi, dopisuje je aplikacja.
+  - Myślenie Gemini dla planu: `assistant.plan_thinking`. Pomiar: `low` 4,3–4,5 s, `medium` 12,0–12,7 s, a plany wyszły równie dobre, bo trasę, łańcuchy i odpuszczanie liczy kod. Domyślnie `low`.
+  - Bez modelu jest zwykły tekst planu. Bez questów w pobliżu działa dawne `where_next` (strefa na Twój poziom).
+  - „A potem?” / „co dalej?” (całe zdanie) liczy plan od nowa i podaje pierwszy krok inny niż ten, który już podała, ze strzałką albo znacznikiem.
+- **Torby** (`wvt/bags.py`; prośba 9.11: „czy ten kij, który znalazłem…”). Dodatek przegląda torby 0–4 (`C_Container.GetContainerItemInfo`) przy `BAG_UPDATE_DELAYED` (najwyżej co 3 s) i całe co 5 minut, pierwszy raz 5 s po wejściu do gry, gdy nazwy przedmiotów są już w pamięci klienta. Przedmiot, którego nazwy klient jeszcze nie zna, wywołuje ponowny przegląd. Zawartość idzie jako `TYPE_CHAT` rodzaju BAG (26): pole rasy to „sync:część/części”, tekst to linie `itemID⇥ilość⇥jakość⇥klasa⇥podklasa⇥slot⇥nazwa`, tyle linii, ile zmieści się w ~380 bajtach. Stosy tego samego przedmiotu są sumowane. Aplikacja podmienia listę dopiero po przyjściu wszystkich części. Każdy przedmiot do założenia idzie raz jako `TYPE_LOOT` z flagą `LFLAG_BAG` (32), ze statystykami i tym, co nosisz w tym slocie, ponownie po 5 minutach albo po zmianie ekwipunku (`PLAYER_EQUIPMENT_CHANGED`). Iskra go nie komentuje, zapamiętuje go tylko do pytań. Torby i ich części idą najpóźniej z pakietów asystentki, przed kanałami publicznymi. Iskra odpowiada na:
+  - „czy ten kij, który znalazłem, jest lepszy?” (`item_about`): przedmiot z łupów i toreb po nazwie, rodzaju i kolorze, najnowszy łup najpierw, porównany przez `loot.item_verdict`. To te same wagi co need/greed, ale odpowiedź jest zawsze: lepsze o…, prawie to samo albo słabsze o…. Przedmiot bez statystyk dostaje opis: do questa X, szary śmieć do sprzedania, do zjedzenia, materiał;
+  - „co mam w plecaku?”: do questów, do założenia, reszta, szare;
+  - „co mogę sprzedać?”;
+  - „czy mam…” / „ile mam…”: z toreb, a cel questa z dziennika.
+
+  `/wvt questy` pokazuje też, ile rzeczy dodatek widzi w torbach.
+- **Mowa NPC.** `CHAT_MSG_MONSTER_SAY`, `_YELL` i `_WHISPER` idą do aplikacji jako `TYPE_CHAT` z imieniem NPC jako nadawcą. Say i yell idą kolejką kanałów publicznych (na końcu), szept do Ciebie zwykłą kolejką. Aplikacja trzyma je osobno (60 linii), więc nie mieszają się z czatem graczy ani z imionami do zapraszania. Służą tylko słownikowi chwili.
 
 | Klucz | Domyślnie | Opis |
 |---|---|---|
@@ -213,6 +315,9 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
 | `assistant.zone_tips` | true | słowo o strefie przy wejściu |
 | `assistant.level_tips` | true | awans: nowe umiejętności u trenera |
 | `assistant.bag_tips` | true | pełne torby |
+| `assistant.loot_tips` | true | podniesiony przedmiot lepszy od noszonego: mówi to |
+| `assistant.max_knowledge_chars` | 480 | limit długości odpowiedzi z bazy i streszczeń czatu |
+| `assistant.log_file` | `logs/assistant.jsonl` | dziennik rozmów (gdy `privacy.log_assistant`) |
 | `audio.auto_gain` | true | automatyczne wzmocnienie cichej mowy |
 
 ## Konfiguracja (`config.json`, tworzony przy pierwszym starcie)
@@ -227,17 +332,35 @@ App:  zrzut obu siatek → filtry (kanał, własne, powtórki, zasięg, limit) �
 | `audio.device` | `null` | nazwa/indeks mikrofonu, `null` = domyślny w Windows |
 | `audio.silence_rms_threshold` | `0.006` | poniżej = cisza (nic nie jest tłumaczone) |
 | `audio.mic_always_open` | `true` | strumień otwarty cały czas → 0,3 s „pre‑roll”, pierwsza sylaba nie ginie |
-| `stt.device` | `auto` | `auto` (GPU, jeśli zostaje `stt.vram_reserve_mb` zapasu dla gry, inaczej CPU int8) / `cuda` / `cpu` |
+| `stt.model_dir`, `stt.model_name` | Whisper large-v3-turbo | model STT; `stt.cpu_fallback` – zapas (Parakeet), `stt.language` – `pl` |
+| `stt.device` | `auto` | `auto` (GPU, jeśli zostaje `stt.vram_reserve_mb` zapasu dla gry, inaczej zapasowy model na CPU int8) / `cuda` / `cpu` |
+| `stt.drop_phrases` | `null` | frazy odrzucane jako halucynacje Whispera (`null` = lista domyślna) |
+| `stt.server_port` | `39283` | wspólny STT dla innych programów na tym komputerze (127.0.0.1); `0` wyłącza |
+| `stt.prompt_max_tokens` | `200` | długość podpowiedzi dla Whispera (nazwy chwili), przycinana od początku |
+| `lexicon.enabled` | `true` | nazwy z gry, które teraz się liczą (`wvt/lexicon.py`); `false` wyłącza wszystko poniżej |
+| `lexicon.whisper_prompt`, `lexicon.prompt_terms` | `true`, `60` | podpowiedź dla Whispera i ile nazw w niej; `lexicon.prompt_lead` – zdanie na początku |
+| `lexicon.correct` | `true` | poprawianie źle usłyszanych nazw przed Iskrą i tłumaczem |
+| `lexicon.vector` | `true` | wyszukiwanie nazw po znaczeniu („co to za ząb?”, „quest z trollami”) |
+| `lexicon.embedder` | `auto` | czyje wektory: `auto` = Google, gdy Iskra rozmawia przez Gemini (ten sam klucz), inaczej lokalny e5; `google` / `local` |
+| `lexicon.embedder_model` | `gemini-embedding-2` | model wektorów Google (`gemini-embedding-001` też działa) |
+| `lexicon.item_min`, `lexicon.quest_min` | `0.65`, `0.69` | od jakiego wyniku Google rzecz albo quest z opisu uznaje się za znaleziony |
+| `assistant.plan_thinking` | `low` | ile Gemini myśli nad planem „co teraz robić” (`low` / `medium` / `high`) |
+| `lexicon.translate_names` | `20` | ile nazw dostaje tłumacz w poleceniu (`0` = żadnych) |
+| `lexicon.nearby_yards`, `lexicon.nearby_max` | `300`, `30` | NPC i potwory w pobliżu brane do nazw |
+| `lexicon.user_file` | `data/slownik.txt` | Twoje słowa, jedno w wierszu („Nazwa = co to jest”) |
+| `assistant.llm` | `local` | `gemini` – Iskra rozmawia przez Google Gemini (klucz `GOOGLE_AI_API_KEY` w `.env`), reszta zostaje lokalnie |
+| `gemini.model`, `gemini.thinking_level` | `gemini-3.8-flash`, `low` | model i poziom myślenia (`low` / `medium` / `high`); `gemini.timeout_s` 15 |
 | `llm.model_path` | Nemotron 3.5 Bolt E4B | plik GGUF; `llm.mode: "external"` + `llm.base_url` = własny serwer OpenAI‑compatible |
 | `hover.enabled` | `true` | tłumaczenie po najechaniu |
 | `privacy.log_texts` | `false` | czy zapisywać treść wypowiedzi/tłumaczeń w `logs/wvt.log` |
+| `privacy.log_assistant` | `false` | czy zapisywać pytania do asystentki i jej odpowiedzi w `logs/assistant.jsonl` |
 | `voice.enabled` | `true` | wyłącznik głosów po stronie aplikacji (kanały wybiera się w grze) |
 | `voice.model_id` | `eleven_v4_turbo` | model ElevenLabs; klucz w `.env` (`ELEVENLABS_API_KEY`) |
 | `voice.distance_curve` | 0–5 jd 100 %, 10 → 75 %, 15 → 50 %, 20 → 25 %, 30 → 0 % | głośność `/say` od odległości (interpolacja) |
 | `voice.unknown_distance` | `play_quiet` | `play_normal` / `play_quiet` (`quiet_gain` 0,35) / `mute` |
 | `voice.volume_say`, `voice.volume_party` | `1.0`, `0.9` | głośność kanałów |
 | `voice.daily_char_budget` | `30000` | znaków dziennie do ElevenLabs (0 = bez limitu) |
-| `voice.speak_own_messages` | `true` | tryb EN: Twoja postać powtarza Twoją wiadomość |
+| `voice.speak_own_messages` | `true` | Twoja postać powtarza Twoją wiadomość (EN po angielsku, PL po polsku) |
 | `voice.store.*` | lokalny MongoDB | `MONGODB_URI` w `.env` zmienia serwer; bez MongoDB pliki w `data/` |
 | `normalizer.mode` | `hybrid` | `off` / `rules` / `hybrid`; `normalizer.timeout_ms` 500 |
 
@@ -278,7 +401,9 @@ Bez gry można przetestować całą ścieżkę najechania: `python -m wvt.devsim
 ## Licencje modeli
 
 Modele i llama.cpp pobiera instalator – nie ma ich w repozytorium.
+- Whisper large-v3-turbo – OpenAI, MIT (eksport ONNX: onnx-community/whisper-large-v3-turbo, rewizja 360ebcde, pliki fp16 sprawdzone SHA‑256 z Hugging Face).
 - Parakeet TDT 0.6B v3 – NVIDIA, CC‑BY‑4.0 (eksport ONNX: istupakov/parakeet-tdt-0.6b-v3-onnx, uruchamiany przez onnx-asr + onnxruntime‑gpu; NeMo na Windows odrzucony jako ciężki i słabo wspierany).
+- Google Gemini 3.8 Flash (opcjonalnie, tylko asystentka) – usługa Google na warunkach Twojego klucza Gemini API.
 - NVIDIA Nemotron 3.5 Bolt E4B – OpenMDW‑1.1 (bazuje na Gemma‑4‑E4B, Apache 2.0).
 - NVIDIA Nemotron 3 Nano 4B (opcjonalny) – NVIDIA Nemotron Open Model License.
 - llama.cpp – MIT.
@@ -293,7 +418,9 @@ wvt/                        aplikacja (app.py GUI+tray, pipeline.py PTT, hotkeys
                             llm.py, translator.py, chat_insert.py, signal_reader.py, overlay.py, protocol.py,
                             assistant.py – asystentka głosowa, advisor.py – dokąd iść / gdzie co jest,
                             reminders.py (czas, poziom, miejsce, notatki), session_stats.py, loot.py –
-                            need/greed, quest_tips.py – łańcuchy i czy warto)
+                            need/greed, quest_tips.py – łańcuchy i czy warto, lexicon.py – nazwy chwili:
+                            podpowiedź Whispera, poprawianie, wektory; bags.py – torby; planner.py – co teraz
+                            robić; gemini.py – Gemini dla Iskry i wektory Google)
 wvt/kb/                     baza wiedzy: luadata (parser Lua), questie + questie_tables (QuestieDB),
                             wiki (Warcraft Wiki), world (questy/NPC/współrzędne), docs (fragmenty),
                             translate_pl (questy po polsku),

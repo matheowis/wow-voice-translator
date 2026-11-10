@@ -31,6 +31,15 @@ TYPE_QUEST packets (one per quest in the quest log: objectives, progress, the ga
 the next objective), TYPE_POS packets (where the player stands, so the app can tell the direction
 and distance to a quest marker at the moment you ask), TYPE_PLAYER (class, race, faction) and
 TYPE_DONE (the ids of completed quests, in parts, so the assistant knows which quests are left).
+TYPE_CHAT lines of public channels (General, Trade, LookingForGroup...) carry the channel's short
+name in the race field, which is otherwise empty for lines nobody hears; the player's own loot
+and money lines arrive as TYPE_CHAT of kind LOOT / MONEY, and a looted item that can be worn also
+as TYPE_LOOT with LFLAG_PICKED (roll id 0) so the assistant can tell whether it is an upgrade.
+NPC speech (MONSTER_SAY / YELL / WHISPER) arrives as TYPE_CHAT with the NPC's name as the sender.
+The contents of the bags arrive as TYPE_CHAT of kind BAG: the race field says "sync:part/parts", the
+text has one item per line, "itemID<TAB>count<TAB>quality<TAB>classID<TAB>subclassID<TAB>equipLoc
+index<TAB>name"; a wearable item in the bags also comes once as TYPE_LOOT with LFLAG_BAG (its stats
+and what you wear in that slot, never commented on).
 
 This module is the single source of truth; ``addon/WoWVoiceTranslator/Protocol.lua``
 implements the same encoder and ``tests/test_protocol.py`` runs the Lua code through
@@ -108,6 +117,8 @@ MAX_DONE_IDS = (MAX_BYTES - DONE_FIXED_BYTES - 2) // 3  # 154 per packet
 
 # TYPE_LOOT
 LFLAG_BOP, LFLAG_NEED, LFLAG_GREED, LFLAG_DE = 1, 2, 4, 8  # binds on pickup / the game offers need, greed, disenchant
+LFLAG_PICKED = 16  # not a roll: an item the player just looted (assistant: is it better than what you wear?)
+LFLAG_BAG = 32  # not a roll: a wearable item found in the bags (its stats, for questions; never commented on)
 MAX_LOOT_NAME_BYTES = 64
 MAX_WORN_NAME_BYTES = 40
 MAX_LOOT_STATS = 12
@@ -175,7 +186,11 @@ CHAT_KINDS = {
     21: "MONSTER_YELL",
     22: "MONSTER_WHISPER",
     23: "COMMUNITIES_CHANNEL",
+    24: "LOOT",  # "You receive loot: [Linen Cloth]x2." - only the player's own loot
+    25: "MONEY",  # "You loot 5 Silver, 3 Copper."
+    26: "BAG",  # a part of the bag contents (not chat): see the module docstring
 }
+KIND_BAG = 26
 
 
 @dataclass
@@ -388,6 +403,16 @@ class LootItem:
     @property
     def can_greed(self) -> bool:
         return bool(self.flags & LFLAG_GREED)
+
+    @property
+    def picked(self) -> bool:
+        """Not a roll: the player has just looted this item (roll_id is 0)."""
+        return bool(self.flags & LFLAG_PICKED)
+
+    @property
+    def from_bag(self) -> bool:
+        """Not a roll: a wearable item the bag scan found (roll_id is 0); its stats are kept for questions."""
+        return bool(self.flags & LFLAG_BAG)
 
 
 def _encode_stats(stats: dict[str, float]) -> bytes:

@@ -5,7 +5,7 @@ import time
 import pytest
 
 from wvt import protocol as P
-from wvt.assistant import Assistant, ChatLog, clean_reply, is_invite_request, match_name, parse_intent
+from wvt.assistant import Assistant, ChatLog, READ_KINDS, clean_reply, is_invite_request, match_name, parse_intent
 
 
 @pytest.mark.parametrize("text,kind", [
@@ -13,6 +13,11 @@ from wvt.assistant import Assistant, ChatLog, clean_reply, is_invite_request, ma
     ("Zaproś ich wszystkich", "invite_requests"),
     ("zinwajtuj tych co piszą inv", "invite_requests"),
     ("zaproś Artasa", "invite_name"),
+    ("weź go doproś do party", "invite_last"),  # a user's bug report
+    ("możesz go zaprosić?", "invite_last"),
+    ("doproś Artasa", "invite_name"),
+    ("wciągnij ich do grupy", "invite_requests"),
+    ("doprowadź mnie do trenera", "waypoint"),  # "dopro..." but not an invite
     ("wyrzuć Bolka", "kick"),
     ("wyproś go z grupy", "kick"),
     ("daj lidera Jainie", "lead"),
@@ -24,6 +29,12 @@ from wvt.assistant import Assistant, ChatLog, clean_reply, is_invite_request, ma
     ("odpisz mu że zaraz będę", "message"),
     ("streść czat", "summary"),
     ("co oni piszą?", "summary"),
+    ("przeczytaj czat", "summary"),
+    ("co piszą na trade?", "summary"),
+    ("co słychać na gildii", "summary"),
+    ("kto szuka grupy?", "summary"),
+    ("co mi wpadło?", "loot"),
+    ("co podniosłem", "loot"),
     ("ile mam złota?", "gold"),
     ("ile mi brakuje do levelu", "xp"),
     ("gdzie jestem?", "where"),
@@ -133,11 +144,12 @@ class Cfg(dict):
         return super().get(dotted, default)
 
 
-def make_assistant(voice_id="voice-iskra"):
+def make_assistant(voice_id="voice-iskra", **kw):
     cfg = Cfg({"assistant.name": "Iskra", "assistant.voice_id": voice_id, "assistant.invite_window_s": 300,
-               "assistant.flavor": False})  # one fixed phrasing, no LLM for spontaneous comments
+               "assistant.flavor": False,  # one fixed phrasing, no LLM for spontaneous comments
+               "lexicon.user_file": ""})  # never the player's own data/slownik.txt
     ins, ui, voice, llm = FakeInserter(), FakeUI(), FakeVoice(), FakeLLM()
-    a = Assistant(cfg, FakeTranslator(), llm, ins, ui, lambda: True, voice_getter=lambda: voice)
+    a = Assistant(cfg, FakeTranslator(), llm, ins, ui, lambda: True, voice_getter=lambda: voice, **kw)
     return a, ins, ui, voice, llm
 
 
@@ -173,6 +185,20 @@ def test_old_requests_are_forgotten():
     a.chat.add_packet(chat_pkt("Ann", "inv me"), now=time.time() - 400)
     reply, line = a.handle("zaproś chętnych")
     assert line == "" and "Nikt nie prosił" in reply
+
+
+def test_him_is_who_asked_for_an_invite_or_spoke_last():
+    a, *_ = make_assistant()
+    reply, line = a.handle("weź go doproś do party")
+    assert line == "" and "Kogo" in reply  # nobody wrote anything yet
+    a.on_packet(chat_pkt("Ann", "hi there"))
+    a.on_packet(chat_pkt("Bob", "nice weather", kind=10))  # a whisper
+    reply, line = a.handle("weź go doproś do party")
+    assert line == "/wvt inv Bob" and "Zapraszam Bob" in reply
+    a.on_packet(chat_pkt("Cid", "inv me"))
+    a.on_packet(chat_pkt("Dan", "lol"))
+    assert a.handle("możesz go zaprosić?")[1] == "/wvt inv Cid"  # who asked beats who spoke
+    assert a.handle("weź go do party")[1] == "/wvt inv Dan"  # Bob and Cid are invited already
 
 
 def test_named_invite_kick_and_lead_check_the_group():
@@ -370,10 +396,15 @@ def kb_assistant():
 
 
 def test_where_next_and_places_prepare_a_waypoint():
-    a, ins, *_ = kb_assistant()
-    reply, line = a.handle("gdzie mam się teraz udać?")
-    assert reply.startswith("U Gryan's Aide weźmiesz 2 questy") and reply.endswith("Znacznik czeka na Enter.")
+    a, ins, ui, voice, llm = kb_assistant()
+    reply, line = a.handle("gdzie mam się teraz udać?")  # a plan: her LLM says it, from the computed route
+    assert reply == llm.answer + " Nie bierz Mage Lesson od Gryan's Aide: mało expa i nic ciekawego na końcu. " \
+        "Znacznik czeka na Enter."  # what to let go is said even when her LLM leaves it out
+    assert "Trasa" in llm.calls[-1][0]["content"] and "weź u Gryan's Aide" in llm.calls[-1][0]["content"]
     assert line == "/wvt way 1436 56.0 47.0 Gryan's Aide" and ins.lines[-1] == line
+    a.llm = None  # without a model: the plan in plain words
+    reply, line = a.handle("gdzie mam się teraz udać?")
+    assert reply.startswith("Najpierw weź u Gryan's Aide:") and line == "/wvt way 1436 56.0 47.0 Gryan's Aide"
     reply, line = a.handle("gdzie jest najbliższy mistrz lotów?")
     assert reply.startswith("Najbliżej masz Thor") and line.endswith("Thor")
     reply, line = a.handle("zaznacz to na mapie")  # "it": the last place she named
@@ -493,3 +524,257 @@ def test_a_taken_quest_gets_a_verdict_and_can_be_asked_about():
     said = [t for t, *_ in voice.said if t.startswith("Report to Gryan")]
     assert len(said) == 1 and said[0].endswith("Może nie hit, ale exp to exp.")
     assert a.handle("czy warto robić ten quest?")[0] == said[0]
+
+
+# --------------------------------------------------------------------------- chat channels, loot, items, journal
+
+def channel_pkt(sender, text, channel, kind=14):
+    return P.Packet(type=P.TYPE_CHAT, seq=0, chat_kind=kind, sender=sender, text=text, race=channel)
+
+
+def test_chat_focus_names_the_channel():
+    assert parse_intent("co piszą na trade?").channel == "trade"
+    assert parse_intent("co słychać na gildii").channel == "guild"
+    assert parse_intent("kto szuka grupy?").channel == "lfg"
+    assert parse_intent("streść czat").channel == ""
+
+
+def test_summary_reads_public_channels_and_can_focus_on_one():
+    a, ins, ui, voice, llm = make_assistant()
+    a.on_packet(channel_pkt("Seller", "WTS Linen Cloth cheap", "Trade"))
+    a.on_packet(channel_pkt("Tank", "LFM Deadmines need heal", "LookingForGroup"))
+    a.on_packet(channel_pkt("Bob", "anyone up for Hogger?", "General"))
+    a.on_packet(chat_pkt("Ann", "hello there"))  # /say
+    a.handle("co piszą na trade?")
+    convo = llm.calls[-1][-1]["content"]
+    assert convo == "[trade] Seller: WTS Linen Cloth cheap"
+    a.handle("kto szuka grupy?")
+    assert llm.calls[-1][-1]["content"] == "[lookingforgroup] Tank: LFM Deadmines need heal"
+    a.handle("streść czat")
+    everything = llm.calls[-1][-1]["content"]
+    assert "[general] Bob" in everything and "[say] Ann" in everything and "[trade] Seller" in everything
+    assert a.handle("co słychać na gildii?")[0] == "Cisza na gildii, nikt nic nie pisze."
+
+
+def test_a_busy_channel_does_not_push_out_whispers():
+    log = ChatLog()
+    log.add_packet(chat_pkt("Bob", "inv pls", kind=10))
+    for i in range(500):
+        log.add_packet(channel_pkt(f"S{i}", f"WTS stuff {i}", "Trade"))
+    assert [ln.text for ln in log.whispers()] == ["inv pls"]
+    assert len(log.recent(1000, kinds=("CHANNEL",), max_age_s=60)) == 200
+
+
+def loot_line(text, kind=24):
+    return P.Packet(type=P.TYPE_CHAT, seq=0, flags=P.VFLAG_SELF, chat_kind=kind, sender="Mati", text=text)
+
+
+def test_what_you_looted_is_counted_and_an_upgrade_gets_a_word():
+    a, ins, ui, voice, llm = make_assistant()
+    for text in ("You receive loot: [Linen Cloth]x2.", "You receive loot: [Linen Cloth].",
+                 "You receive loot: [Gloves of the Monkey]."):
+        a.on_packet(loot_line(text))
+    a.on_packet(loot_line("You loot 1 Gold, 5 Silver, 3 Copper", kind=25))
+    reply, _ = a.handle("co mi wpadło?")
+    assert reply == ("W ostatnich 15 minutach wpadło ci: 3 sztuki Linen Cloth i Gloves of the Monkey. "
+                     "Do tego 1 złota, 5 srebra i 3 miedzi z łupów.")
+    # a rogue on level 20 loots gloves better than the ones he wears
+    a.on_packet(P.Packet(type=P.TYPE_PLAYER, seq=1, player=P.PlayerInfo(class_id=4, race_id=1, faction=1, sex=2)))
+    a.on_packet(state_pkt(level=20, name="Mati"))
+    worn = [P.WornItem(15, 2, "Rough Leather Gloves", {"agi": 1, "armor": 40})]
+    gloves = P.LootItem(roll_id=0, flags=P.LFLAG_PICKED, quality=2, item_level=24, min_level=19, class_id=4,
+                        subclass_id=2, equip_loc="INVTYPE_HAND", name="Gloves of the Monkey",
+                        stats={"agi": 6, "sta": 4, "armor": 62}, equipped=worn)
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=2, loot=gloves))
+    assert voice.said[-1][0].startswith("Nowy łup: Gloves of the Monkey. Lepsze niż Rough Leather Gloves: plus 5")
+    assert voice.said[-1][0].endswith("Załóż.")
+    said = len(voice.said)
+    worse = P.LootItem(roll_id=0, flags=P.LFLAG_PICKED, quality=1, class_id=4, subclass_id=2, equip_loc="INVTYPE_HAND",
+                       name="Ragged Gloves", stats={"armor": 10}, equipped=worn)
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=3, loot=worse))
+    assert len(voice.said) == said  # not an upgrade: nothing to say
+
+
+def test_items_are_answered_from_the_world_data():
+    from tests.test_advisor import item_world
+
+    a, ins, ui, voice, llm = make_assistant(world_getter=item_world)
+    reply, line = a.handle("gdzie kupić rhapsody malt?")
+    assert reply.startswith("Rhapsody Malt kupisz u Innkeeper Belm, Innkeeper, w Dun Morogh, 47, 52.")
+    assert line == "/wvt way 1426 47.4 52.5 Rhapsody Malt: Innkeeper Belm" and not llm.calls
+
+
+def test_the_journal_keeps_questions_answers_and_comments(tmp_path):
+    import json
+
+    path = tmp_path / "logs" / "assistant.jsonl"
+    a, ins, ui, voice, llm = make_assistant(journal_path=path)
+    a.on_packet(state_pkt(level=12, zone="Westfall", gold=3, name="Mati"))
+    a.handle("ile mam złota?")
+    a.handle("jak się masz?")
+    a._respond("Torby pełne.", "", "", event="bags")
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [r.get("intent", r.get("event")) for r in rows] == ["gold", "chat", "bags"]
+    assert rows[0]["heard"] == "ile mam złota?" and rows[0]["reply"].startswith("Masz 3 złota")
+    assert rows[0]["zone"] == "Westfall" and rows[0]["level"] == 12
+    assert rows[1]["reply"] == llm.answer and rows[2]["reply"] == "Torby pełne."
+    b, *_ = make_assistant()  # without a path nothing is written anywhere
+    b.handle("ile mam złota?")
+
+
+# --------------------------------------------------------------------------- the names of the moment, what you carry
+
+def bag_pkt(sync, part, parts, *lines):
+    return P.Packet(type=P.TYPE_CHAT, seq=0, chat_kind=P.KIND_BAG, race=f"{sync}:{part}/{parts}", text="\n".join(lines))
+
+
+def carrying_assistant():
+    a, ins, ui, voice, llm = make_assistant()
+    a.on_packet(P.Packet(type=P.TYPE_PLAYER, seq=1, player=P.PlayerInfo(class_id=8, race_id=7, faction=1, sex=2)))
+    a.on_packet(state_pkt(level=10, name="Mati"))
+    staff = P.LootItem(flags=P.LFLAG_PICKED, quality=2, item_level=12, min_level=8, class_id=2, subclass_id=10,
+                       equip_loc="INVTYPE_2HWEAPON", name="Gnarled Short Staff", stats={"int": 4, "spi": 3, "dps": 5.1},
+                       equipped=[P.WornItem(5, 10, "Worn Staff", {"int": 1, "dps": 3.0})])
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=2, loot=staff))
+    mittens = P.LootItem(flags=P.LFLAG_BAG, quality=1, class_id=4, subclass_id=1, equip_loc="INVTYPE_HAND",
+                         name="Wooly Mittens", stats={"armor": 8},
+                         equipped=[P.WornItem(10, 1, "Silk Gloves", {"int": 3, "armor": 9})])
+    a.on_packet(P.Packet(type=P.TYPE_LOOT, seq=3, loot=mittens))
+    a.on_packet(bag_pkt(1, 1, 1, "2589\t12\t1\t7\t5\t0\tLinen Cloth", "2894\t1\t1\t0\t0\t0\tRhapsody Malt",
+                        "4000\t1\t2\t2\t10\t17\tGnarled Short Staff", "4100\t1\t1\t4\t1\t11\tWooly Mittens",
+                        "3300\t3\t0\t15\t0\t0\tBroken Tooth", "3301\t1\t0\t15\t0\t0\tChipped Claw"))
+    return a, voice, llm
+
+
+@pytest.mark.parametrize("text, kind", [
+    ("czy ten kij, który znalazłem, jest lepszy?", "item_about"),
+    ("a te rękawice są dobre dla mnie?", "item_about"),
+    ("czy warto zachować ten miecz?", "item_about"),
+    ("gdzie kupię lepszy miecz?", "chat"),  # shopping, not your bags
+    ("czy warto robić ten quest?", "quest_worth"),
+    ("co mam w plecaku?", "bag_list"),
+    ("co mogę sprzedać?", "bag_junk"),
+    ("czy mam rhapsody malt?", "bag_count"),
+    ("czy mam coś do oddania?", "quest_turnin"),
+    ("ile mam wolnych miejsc w torbach?", "bags"),
+])
+def test_questions_about_what_you_carry_become_intents(text, kind):
+    assert parse_intent(text).kind == kind
+
+
+def test_the_staff_you_found_is_compared_with_what_you_wear():
+    a, voice, llm = carrying_assistant()
+    assert not any("Wooly Mittens" in t for t, *_ in voice.said)  # the bag scan itself is never commented on
+    reply, line = a.handle("czy ten kij, który znalazłem, jest lepszy?")
+    assert reply == "Gnarled Short Staff, kostur. Lepsze niż Worn Staff: plus 3 intelektu i plus 3 ducha. Załóż."
+    assert line == "" and not llm.calls
+    reply, _ = a.handle("a te rękawice są dobre?")  # a wearable from the bag scan: stats, never commented on
+    assert reply.startswith("Wooly Mittens, rękawice, materiał. Nie ma statystyk, które przydają się magowi.")
+    assert a.handle("czy ten miecz jest lepszy?")[0] == "Nie widzę takiego przedmiotu w twoich łupach ani w torbach."
+
+
+def test_the_bags_are_listed_counted_and_the_junk_named():
+    a, voice, llm = carrying_assistant()
+    assert a.handle("co mam w plecaku?")[0] == (
+        "W torbach masz 6 rzeczy. Do założenia: Gnarled Short Staff i Wooly Mittens. Poza tym 12 Linen Cloth "
+        "i Rhapsody Malt. I 2 szare śmieci do sprzedania.")
+    assert a.handle("co mogę sprzedać?")[0] == "Do sprzedania masz 4 szare śmieci: 3 Broken Tooth i Chipped Claw."
+    assert a.handle("czy mam rhapsody malt?")[0] == "Masz Rhapsody Malt, jedną sztukę."
+    assert a.handle("ile mam linen cloth?")[0] == "Masz 12 sztuk Linen Cloth."
+    b, *_ = make_assistant()
+    assert b.handle("co mam w plecaku?")[0].startswith("Jeszcze nie widzę twoich toreb.")
+
+
+def test_a_misheard_quest_name_still_finds_the_quest(tmp_path):
+    import json
+
+    path = tmp_path / "assistant.jsonl"
+    a, ins, ui, voice, llm = make_assistant(journal_path=path)
+    a.on_packet(quest_pkt(sync=1, index=1, total=1, quest_id=384, level=7, title="Beer Basted Boar Ribs",
+                          zone="Dun Morogh", objectives=[(False, "2/6 Crag Boar Rib"), (False, "0/1 Rhapsody Malt")]))
+    reply, _ = a.handle("ile mi zostało do Beer Bastard Bore Ribs?")
+    assert reply == "Beer Basted Boar Ribs: Crag Boar Rib 2 z 6, Rhapsody Malt 0 z 1."
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+    assert row["heard"] == "ile mi zostało do Beer Bastard Bore Ribs?"
+    assert row["fixed"] == "ile mi zostało do Beer Basted Boar Ribs?"
+    assert row["fixes"] == ["Beer Bastard Bore Ribs -> Beer Basted Boar Ribs"]
+    assert a.last_correction.changed
+
+
+def test_her_llm_gets_a_picture_of_the_game():
+    a, voice, llm = carrying_assistant()
+    a.on_packet(chat_pkt("Thargas-Realm", "inv pls", kind=10))
+    a.handle("jak się masz?")
+    system = llm.calls[-1][0]["content"]
+    assert "Co się teraz dzieje w grze" in system and "Gnarled Short Staff" in system and "Thargas" in system
+
+
+def test_bag_lines_are_not_chat():
+    a, *_ = make_assistant()
+    a.on_packet(bag_pkt(2, 1, 1, "2589\t12\t1\t7\t5\t0\tLinen Cloth"))
+    assert a.bags.known and a.chat.recent(10, kinds=READ_KINDS) == []
+
+
+# --------------------------------------------------------------------------- the topic of the talk and the plan
+
+def talk_assistant(llm=None):
+    from tests.test_planner import book, plan_world
+
+    a, ins, ui, voice, fake = make_assistant()
+    if llm is not None:
+        a.llm = llm
+    w = plan_world()
+    a.world_getter = lambda: w
+    a.quests = book()
+    a.on_packet(state_pkt(level=10, xp=0, xp_max=7000, name="Mati"))
+    a.on_packet(P.Packet(type=P.TYPE_PLAYER, seq=1, player=P.PlayerInfo(1, 3, P.FACTION_ALLIANCE, 2)))
+    return a, ins, a.llm
+
+
+def test_follow_up_questions_are_about_the_quest_you_talk_about():
+    a, ins, llm = talk_assistant()
+    reply, _ = a.handle("czy warto robić Beer Bastard Bore Ribs?")  # misheard, put right, now the topic
+    assert reply.startswith("Beer Basted Boar Ribs:")
+    assert a.handle("a ile za niego expa?")[0] == "Za Beer Basted Boar Ribs dostaniesz 630 XP, czyli 9% poziomu."
+    reply, line = a.handle("a gdzie go oddać?")
+    assert reply == "Beer Basted Boar Ribs oddajesz u Ragnar Thunderbrew, około 80 jardów na wschód."
+    assert line == "/wvt track 384"
+    a.handle("ile mi zostało do The Boar Hunter?")  # a new topic
+    reply, line = a.handle("a gdzie to jest?")
+    assert reply.startswith("The Boar Hunter: około 400 jardów na wschód") and line == "/wvt track 183"
+
+
+def test_her_llm_sees_the_conversation_and_its_topic():
+    a, ins, llm = talk_assistant()
+    a.handle("czy warto robić The Boar Hunter?")
+    a.handle("o czym jest ten quest?")  # free question about the quest: the LLM with all about it
+    system = llm.calls[-1][0]["content"]
+    assert "Pytanie dotyczy questa The Boar Hunter (poziom 8)" in system and "1. z 2 questów w łańcuchu" in system
+    assert [m["role"] for m in llm.calls[-1][1:]] == ["user", "assistant", "user"]  # the earlier question too
+    a.handle("opowiedz mi coś")  # small talk still knows what you were talking about
+    assert "Rozmawiacie teraz o queście The Boar Hunter" in llm.calls[-1][0]["content"]
+
+
+class ThinkingLLM(FakeLLM):
+    supports_thinking = True
+
+    def chat(self, messages, max_tokens=120, temperature=0.0, stop=None, timeout=None, thinking=None):
+        self.thinking = thinking
+        return super().chat(messages, max_tokens, temperature, stop, timeout)
+
+
+def test_what_now_is_a_plan_and_what_next_goes_on():
+    a, ins, llm = talk_assistant(ThinkingLLM("Najpierw oddaj żeberka u Ragnara, potem dziki na wschodzie."))
+    reply, line = a.handle("co teraz robić?")
+    assert reply == ("Najpierw oddaj żeberka u Ragnara, potem dziki na wschodzie. Odpuść Old Errand: jest już szary, "
+                     "poniżej 1% poziomu. Enter włączy strzałkę.")  # she left out what to let go: added
+    assert line == "/wvt track 384" and llm.thinking == "low"  # assistant.plan_thinking
+    system = llm.calls[-1][0]["content"]
+    assert "1. oddaj Beer Basted Boar Ribs u Ragnar Thunderbrew" in system
+    assert "Odpuść: Old Errand – jest już szary" in system and "Na później (inna mapa): Far Away" in system
+    reply, line = a.handle("a potem?")
+    assert reply.startswith("Teraz The Boar Hunter (Small Crag Boar 4 z 12), około 400 jardów na wschód.")
+    assert line == "/wvt track 183"
+    assert a.handle("a gdzie to jest?")[1] == "/wvt track 183"  # the step is the topic now
+    assert parse_intent("co dalej?").kind == "plan_next" and parse_intent("ok, a potem?").kind == "plan_next"
+    assert parse_intent("co dalej w tym łańcuchu?").kind == "quest_worth"

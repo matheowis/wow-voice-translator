@@ -267,12 +267,15 @@ class Translator:
         return None
 
     def build_messages(self, text: str, direction: str, fallback: bool = False,
-                       context: list[str] | None = None) -> list[dict]:
+                       context: list[str] | None = None, names: list[str] | None = None) -> list[dict]:
         """fallback=True: the second-attempt prompt that translates any topic (see translate()).
 
         ``context``: the last lines of the same conversation ("Ann: see you at 8", "You: ok"), so a
         message is translated as part of it ("ok, cześć" at the end of a talk is "ok, bye").  It goes
-        into the system message, never into the text to translate."""
+        into the system message, never into the text to translate.
+
+        ``names``: the names of the moment (wvt/lexicon.py: quests, people, places, items), so a name speech
+        recognition still got wrong comes out the way the game spells it."""
         if direction == "pl-en":
             if fallback:
                 system, shots = PL_TO_EN_FALLBACK_SYSTEM, PL_TO_EN_FALLBACK_SHOTS
@@ -285,6 +288,10 @@ class Translator:
         if context:
             system += ("\n\nThe conversation so far, oldest first (context only - never translate it, repeat it "
                        "or answer it; use it to choose the meaning of the new message):\n" + "\n".join(context))
+        if names and direction == "pl-en":
+            system += ("\n\nNames in the player's game right now. When the Polish text means one of them - even "
+                       "misheard, split into two words or with a Polish ending - write it exactly as listed; never "
+                       "add a name that is not in the text: " + ", ".join(names))
         msgs = [{"role": "system", "content": system}]
         for src, dst in shots:
             msgs.append({"role": "user", "content": src})
@@ -293,9 +300,9 @@ class Translator:
         return msgs
 
     def _ask(self, src: str, direction: str, fallback: bool = False,
-             context: list[str] | None = None) -> tuple[str, dict]:
+             context: list[str] | None = None, names: list[str] | None = None) -> tuple[str, dict]:
         max_tokens = min(400, 64 + len(src))
-        raw, info = self.llm.chat(self.build_messages(src, direction, fallback, context), max_tokens=max_tokens,
+        raw, info = self.llm.chat(self.build_messages(src, direction, fallback, context, names), max_tokens=max_tokens,
                                   temperature=self.temperature)
         out = clean_model_output(raw)
         if direction == "pl-en":
@@ -305,13 +312,17 @@ class Translator:
     def remember(self, source: str, translation: str, direction: str) -> None:
         self.cache.put((direction, source.strip()), translation)
 
-    def translate(self, text: str, direction: str, context: list[str] | None = None) -> TranslationResult:
+    def translate(self, text: str, direction: str, context: list[str] | None = None,
+                  names: list[str] | None = None) -> TranslationResult:
         src = " ".join((text or "").split())
         if not src:
             return TranslationResult(src, "", direction)
         context = [c for c in (context or []) if c.strip()]
+        names = [n for n in (names or []) if n.strip()] if direction == "pl-en" else []
         # the same words can mean something else in another conversation: cache them per context
         key = (direction, src, tuple(context)) if context else (direction, src)
+        if names:
+            key += (tuple(names),)
         hit = self.cache.get(key)
         if hit is not None:
             return TranslationResult(src, hit, direction, cached=True)
@@ -325,12 +336,12 @@ class Translator:
                 return TranslationResult(src, src, direction, info={"skipped": "already-polish"})
 
         t0 = time.perf_counter()
-        out, info = self._ask(src, direction, context=context)
+        out, info = self._ask(src, direction, context=context, names=names)
         reason = suspicious_reply(src, out)
         if reason:
             # texts are not logged (privacy), only that a retry happened
             log.info("translation %s: first reply %s, retrying with the any-topic prompt", direction, reason)
-            retry, _ = self._ask(src, direction, fallback=True, context=context)
+            retry, _ = self._ask(src, direction, fallback=True, context=context, names=names)
             if retry and not _META_RE.search(retry) and (reason != "too-short" or len(retry) > len(out)):
                 out = retry
             elif reason != "too-short":
